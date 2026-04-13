@@ -1,0 +1,35 @@
+[package]
+name = "vector-editor"
+description = "SVG/vector editor — Inkscape replacement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../../crates/vector-geom" }
+vector-scene = { path = "../../crates/vector-scene" }
+vector-svg = { path = "../../crates/vector-svg" }
+vector-text = { path = "../../crates/vector-text" }
+vector-tess = { path = "../../crates/vector-tess" }
+vector-render = { path = "../../crates/vector-render" }
+vector-ops = { path = "../../crates/vector-ops" }
+vector-tools = { path = "../../crates/vector-tools" }
+
+# Rendering + windowing
+wgpu = { workspace = true }
+winit = { workspace = true }
+pollster = { workspace = true }
+
+# GUI
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+egui-phosphor = { workspace = true }
+
+# File dialog
+rfd = { workspace = true }
+
+# Utilities
+log = { workspace = true }
+env_logger = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "vector-scene"
+description = "Scene graph: nodes, stable IDs, references, transform cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../vector-geom" }
+slotmap = { workspace = true }
+serde = { workspace = true }

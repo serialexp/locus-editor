@@ -1,0 +1,15 @@
+[package]
+name = "vector-render"
+description = "wgpu rendering pipeline for the vector scene"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../vector-geom" }
+vector-scene = { path = "../vector-scene" }
+vector-tess = { path = "../vector-tess" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }

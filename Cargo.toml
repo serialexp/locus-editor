@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "crates/vector-geom",
+    "crates/vector-scene",
+    "crates/vector-svg",
+    "crates/vector-text",
+    "crates/vector-tess",
+    "crates/vector-render",
+    "crates/vector-ops",
+    "crates/vector-tools",
+    "bin/vector-editor",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["Bart"]
+
+[workspace.dependencies]
+# Math
+kurbo = "0.11"
+nalgebra = "0.33"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# SVG
+usvg = "0.47"
+
+# Text
+rustybuzz = "0.20"
+ttf-parser = "0.24"
+
+# Tessellation
+lyon_tessellation = "1.0"
+lyon_geom = "1.0"
+
+# Rendering
+wgpu = "29"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+# GUI (egui 0.34 matches wgpu 29 + winit 0.30)
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = { version = "0.34", default-features = false, features = ["x11", "clipboard"] }
+egui-phosphor = "0.12"
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2.0"
+slotmap = { version = "1.0", features = ["serde"] }
+
+# File dialog
+rfd = "0.15"

@@ -1,0 +1,14 @@
+[package]
+name = "vector-tess"
+description = "Path tessellation: segments to GPU vertex buffers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../vector-geom" }
+lyon_tessellation = { workspace = true }
+lyon_geom = { workspace = true }
+bytemuck = { workspace = true }
+wgpu = { workspace = true }

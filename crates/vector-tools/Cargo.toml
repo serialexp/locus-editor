@@ -1,0 +1,13 @@
+[package]
+name = "vector-tools"
+description = "Interactive editor tools: selection, pen, shapes, node editing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../vector-geom" }
+vector-scene = { path = "../vector-scene" }
+vector-ops = { path = "../vector-ops" }
+egui-phosphor = { workspace = true }

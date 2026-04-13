@@ -1,0 +1,11 @@
+[package]
+name = "vector-ops"
+description = "Editing commands and undo/redo over the scene graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../vector-geom" }
+vector-scene = { path = "../vector-scene" }

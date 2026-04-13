@@ -1,0 +1,13 @@
+[package]
+name = "vector-svg"
+description = "SVG import/export with geometric round-trip fidelity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../vector-geom" }
+vector-scene = { path = "../vector-scene" }
+usvg = { workspace = true }
+log = { workspace = true }
