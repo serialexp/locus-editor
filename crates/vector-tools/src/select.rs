@@ -551,7 +551,7 @@ impl SelectState {
     /// removed. For a selected SubpathStart, the first segment is removed
     /// and the start point moves to its endpoint. Subpaths left with no
     /// segments are removed; paths left with no subpaths are removed.
-    fn delete_selected_vertices(&mut self, scene: &mut Scene) -> bool {
+    pub fn delete_selected_vertices(&mut self, scene: &mut Scene) -> bool {
         if self.selected.is_empty() {
             return false;
         }

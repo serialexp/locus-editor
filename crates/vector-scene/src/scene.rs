@@ -74,15 +74,38 @@ impl Scene {
         self.parents.get(id).copied()
     }
 
-    /// Insert a new node as a child of `parent`. Returns the new node's ID.
+    /// Insert a new node as a child of `parent` (appended at the end).
+    /// Returns the new node's ID.
     pub fn insert(&mut self, parent: NodeId, node: Node) -> Option<NodeId> {
+        self.insert_at(parent, node, None)
+    }
+
+    /// Insert a new node as a child of `parent` at a specific index.
+    /// If `index` is `None`, the node is appended at the end.
+    pub fn insert_at(
+        &mut self,
+        parent: NodeId,
+        node: Node,
+        index: Option<usize>,
+    ) -> Option<NodeId> {
         if !self.nodes.contains_key(parent) {
             return None;
         }
         let id = self.nodes.insert(node);
-        self.nodes[parent].children.push(id);
+        let children = &mut self.nodes[parent].children;
+        match index {
+            Some(idx) => children.insert(idx.min(children.len()), id),
+            None => children.push(id),
+        }
         self.parents.insert(id, parent);
         Some(id)
+    }
+
+    /// Returns the index of `id` within its parent's children list.
+    pub fn child_index(&self, id: NodeId) -> Option<usize> {
+        let parent_id = self.parents.get(id).copied()?;
+        let parent = self.nodes.get(parent_id)?;
+        parent.children.iter().position(|c| *c == id)
     }
 
     /// Remove a node and all its descendants. Returns the removed nodes.
@@ -183,8 +206,164 @@ impl Scene {
     }
 }
 
+/// A snapshot of a node and all its descendants, stored as an owned tree
+/// of `Node` values (no `NodeId` references). Used for undo of subtree
+/// deletion — the entire subtree can be re-inserted with fresh IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSnapshot {
+    /// The node itself (with `children` vec cleared — child info is in `children` below).
+    pub node: Node,
+    /// Recursive snapshots of each child, in order.
+    pub children: Vec<NodeSnapshot>,
+}
+
+impl Scene {
+    /// Capture a recursive snapshot of the subtree rooted at `id`.
+    pub fn snapshot_subtree(&self, id: NodeId) -> Option<NodeSnapshot> {
+        let node = self.nodes.get(id)?;
+        let child_snapshots: Vec<NodeSnapshot> = node
+            .children
+            .iter()
+            .filter_map(|child_id| self.snapshot_subtree(*child_id))
+            .collect();
+        let mut node_clone = node.clone();
+        node_clone.children.clear(); // children are stored in the snapshot tree
+        Some(NodeSnapshot {
+            node: node_clone,
+            children: child_snapshots,
+        })
+    }
+
+    /// Re-insert a previously-captured subtree as a child of `parent` at `index`.
+    /// Returns the new root `NodeId` of the re-inserted subtree.
+    pub fn insert_subtree(
+        &mut self,
+        parent: NodeId,
+        index: usize,
+        snapshot: NodeSnapshot,
+    ) -> Option<NodeId> {
+        let root_id = self.insert_at(parent, snapshot.node, Some(index))?;
+        for child_snap in snapshot.children {
+            // Children are appended in order (None = append)
+            self.insert_subtree_recursive(root_id, child_snap);
+        }
+        Some(root_id)
+    }
+
+    fn insert_subtree_recursive(&mut self, parent: NodeId, snapshot: NodeSnapshot) {
+        if let Some(id) = self.insert(parent, snapshot.node) {
+            for child_snap in snapshot.children {
+                self.insert_subtree_recursive(id, child_snap);
+            }
+        }
+    }
+}
+
 impl Default for Scene {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vector_geom::{Path, Point, Segment, SubPath};
+
+    fn make_test_path() -> Path {
+        let mut path = Path::new();
+        path.subpaths.push(SubPath {
+            start: Point::new(0.0, 0.0),
+            segments: vec![Segment::Line {
+                to: Point::new(100.0, 100.0),
+            }],
+            closed: false,
+        });
+        path
+    }
+
+    #[test]
+    fn insert_at_specific_index() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+
+        let a = scene
+            .insert(root, Node::path("a", make_test_path()))
+            .unwrap();
+        let b = scene
+            .insert(root, Node::path("b", make_test_path()))
+            .unwrap();
+
+        // Insert c at index 1 (between a and b). Root children are [defs, a, b].
+        let c = scene
+            .insert_at(root, Node::path("c", make_test_path()), Some(1))
+            .unwrap();
+
+        let root_node = scene.get(root).unwrap();
+        // Children should be: defs, c, a, b
+        assert_eq!(root_node.children[1], c);
+        assert_eq!(root_node.children[2], a);
+        assert_eq!(root_node.children[3], b);
+    }
+
+    #[test]
+    fn child_index_returns_correct_position() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+
+        let a = scene
+            .insert(root, Node::path("a", make_test_path()))
+            .unwrap();
+        let b = scene
+            .insert(root, Node::path("b", make_test_path()))
+            .unwrap();
+
+        // defs is at 0, a at 1, b at 2.
+        assert_eq!(scene.child_index(a), Some(1));
+        assert_eq!(scene.child_index(b), Some(2));
+        assert_eq!(scene.child_index(scene.defs()), Some(0));
+    }
+
+    #[test]
+    fn snapshot_and_reinsert_subtree() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+
+        let group = scene.insert(root, Node::group("g")).unwrap();
+        let _child_a = scene
+            .insert(group, Node::path("a", make_test_path()))
+            .unwrap();
+        let _child_b = scene
+            .insert(group, Node::path("b", make_test_path()))
+            .unwrap();
+
+        // Snapshot the group subtree.
+        let snapshot = scene.snapshot_subtree(group).unwrap();
+        assert_eq!(snapshot.node.label, "g");
+        assert_eq!(snapshot.children.len(), 2);
+        assert_eq!(snapshot.children[0].node.label, "a");
+        assert_eq!(snapshot.children[1].node.label, "b");
+
+        // Remove the group.
+        let parent = scene.parent(group).unwrap();
+        let index = scene.child_index(group).unwrap();
+        scene.remove(group);
+
+        // The group and its children should be gone.
+        assert!(scene.get(group).is_none());
+
+        // Re-insert from snapshot.
+        let new_group = scene.insert_subtree(parent, index, snapshot).unwrap();
+        let new_node = scene.get(new_group).unwrap();
+        assert_eq!(new_node.label, "g");
+        assert_eq!(new_node.children.len(), 2);
+
+        // Children should be path nodes with correct labels.
+        let child_labels: Vec<&str> = new_node
+            .children
+            .iter()
+            .map(|&id| scene.get(id).unwrap().label.as_str())
+            .collect();
+        assert_eq!(child_labels, vec!["a", "b"]);
     }
 }

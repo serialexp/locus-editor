@@ -6,9 +6,10 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-use vector_ops::History;
+use vector_geom::Path;
+use vector_ops::{Command, History};
 use vector_render::Renderer;
-use vector_scene::Scene;
+use vector_scene::{NodeData, NodeId, Scene};
 use vector_tools::{PenAction, PenState, SelectState, ShapeDrawState, ToolType};
 
 /// Camera state for canvas pan/zoom.
@@ -99,8 +100,7 @@ struct GpuState {
 /// disjoint borrows from `GpuState`.
 struct EditorState {
     scene: Scene,
-    // TODO: wire up undo/redo commands through this history.
-    _history: History,
+    history: History,
     active_tool: ToolType,
     select_state: SelectState,
     shape_draw: ShapeDrawState,
@@ -118,13 +118,16 @@ struct EditorState {
     pending_zoom_to_fit: bool,
     /// For double-click detection: time + screen position of the last left press.
     last_left_press: Option<(Instant, [f32; 2])>,
+    /// Snapshots of path data captured at the start of a vertex drag,
+    /// so we can record undo commands when the drag finishes.
+    drag_path_snapshots: Vec<(NodeId, Path)>,
 }
 
 impl Default for EditorState {
     fn default() -> Self {
         Self {
             scene: Scene::new(),
-            _history: History::new(),
+            history: History::new(),
             active_tool: ToolType::default(),
             select_state: SelectState::default(),
             shape_draw: ShapeDrawState::default(),
@@ -136,6 +139,7 @@ impl Default for EditorState {
             is_left_down: false,
             pending_zoom_to_fit: false,
             last_left_press: None,
+            drag_path_snapshots: Vec::new(),
         }
     }
 }
@@ -155,6 +159,9 @@ impl EditorState {
                 renderer.mark_dirty();
             }
             PenAction::Finished(node_id) => {
+                // Record undo: the pen tool created this node,
+                // so undoing means deleting it.
+                self.history.record_undo(Command::Delete { id: node_id });
                 self.select_state.selected_nodes.clear();
                 self.select_state.selected_nodes.push(node_id);
                 self.active_tool = ToolType::Select;
@@ -165,6 +172,155 @@ impl EditorState {
                 renderer.mark_dirty();
             }
         }
+    }
+
+    /// Snapshot the path data of all nodes that have selected vertices,
+    /// storing them in `drag_path_snapshots` for undo when the drag ends.
+    fn snapshot_selected_vertex_paths(&mut self) {
+        self.drag_path_snapshots.clear();
+        // Collect unique node IDs from the selected vertices.
+        let mut seen = Vec::new();
+        for vr in &self.select_state.selected {
+            if !seen.contains(&vr.node) {
+                seen.push(vr.node);
+            }
+        }
+        for node_id in seen {
+            if let Some(node) = self.scene.get(node_id)
+                && let NodeData::Path { ref path, .. } = node.data
+            {
+                self.drag_path_snapshots.push((node_id, path.clone()));
+            }
+        }
+    }
+
+    /// Record undo commands for any path data that changed since the last
+    /// snapshot. Called when a vertex drag ends.
+    fn record_vertex_drag_undo(&mut self) {
+        if self.drag_path_snapshots.is_empty() {
+            return;
+        }
+        let snapshots = std::mem::take(&mut self.drag_path_snapshots);
+        let cmds: Vec<Command> = snapshots
+            .into_iter()
+            .map(|(id, path)| Command::SetPathData { id, path })
+            .collect();
+        if cmds.len() == 1 {
+            self.history.record_undo(cmds.into_iter().next().unwrap());
+        } else if !cmds.is_empty() {
+            self.history.record_undo(Command::Batch(cmds));
+        }
+    }
+
+    /// Snapshot the path data of a single node, for undo of edge insert or
+    /// vertex deletion.
+    fn snapshot_path(&self, node_id: NodeId) -> Option<Path> {
+        let node = self.scene.get(node_id)?;
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
+        Some(path.clone())
+    }
+
+    /// Delete the current selection with proper undo recording.
+    /// Returns `true` if anything was deleted.
+    fn delete_with_undo(&mut self) -> bool {
+        if !self.select_state.selected.is_empty() {
+            // Vertex deletion: snapshot affected nodes before modifying.
+            let mut affected: Vec<NodeId> = Vec::new();
+            for vr in &self.select_state.selected {
+                if !affected.contains(&vr.node) {
+                    affected.push(vr.node);
+                }
+            }
+
+            // Snapshot each affected node: its path data, parent, and child
+            // index — in case delete_selected_vertices fully removes it.
+            struct NodeInfo {
+                id: NodeId,
+                path: Path,
+                parent: NodeId,
+                index: usize,
+                snapshot: vector_scene::NodeSnapshot,
+            }
+            let infos: Vec<NodeInfo> = affected
+                .iter()
+                .filter_map(|&id| {
+                    let path = self.snapshot_path(id)?;
+                    let parent = self.scene.parent(id)?;
+                    let index = self.scene.child_index(id).unwrap_or(0);
+                    let snapshot = self.scene.snapshot_subtree(id)?;
+                    Some(NodeInfo {
+                        id,
+                        path,
+                        parent,
+                        index,
+                        snapshot,
+                    })
+                })
+                .collect();
+
+            let result = self.select_state.delete_selected_vertices(&mut self.scene);
+
+            if result {
+                let mut cmds = Vec::new();
+                for info in infos {
+                    if self.scene.get(info.id).is_some() {
+                        // Node still exists — undo restores old path data.
+                        cmds.push(Command::SetPathData {
+                            id: info.id,
+                            path: info.path,
+                        });
+                    } else {
+                        // Node was fully removed — undo re-inserts the subtree.
+                        cmds.push(Command::InsertSubtree {
+                            parent: info.parent,
+                            index: info.index,
+                            snapshot: Box::new(info.snapshot),
+                        });
+                    }
+                }
+                if cmds.len() == 1 {
+                    self.history.record_undo(cmds.into_iter().next().unwrap());
+                } else if !cmds.is_empty() {
+                    self.history.record_undo(Command::Batch(cmds));
+                }
+            }
+            result
+        } else if !self.select_state.selected_nodes.is_empty() {
+            // Object deletion: use Command::Delete through history.execute().
+            let nodes: Vec<NodeId> = self.select_state.selected_nodes.drain(..).collect();
+            let cmds: Vec<Command> = nodes.into_iter().map(|id| Command::Delete { id }).collect();
+            let cmd = if cmds.len() == 1 {
+                cmds.into_iter().next().unwrap()
+            } else {
+                Command::Batch(cmds)
+            };
+            self.history.execute(cmd, &mut self.scene);
+            self.select_state.selected.clear();
+            self.select_state.hovered = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Perform undo: apply the top undo command to the scene.
+    fn undo(&mut self) {
+        self.history.undo(&mut self.scene);
+        // Clear selection — node IDs may have changed.
+        self.select_state.selected_nodes.clear();
+        self.select_state.selected.clear();
+        self.select_state.hovered = None;
+    }
+
+    /// Perform redo: apply the top redo command to the scene.
+    fn redo(&mut self) {
+        self.history.redo(&mut self.scene);
+        // Clear selection — node IDs may have changed.
+        self.select_state.selected_nodes.clear();
+        self.select_state.selected.clear();
+        self.select_state.hovered = None;
     }
 
     /// Update the mouse cursor icon based on tool, hover state, and panning.
@@ -393,6 +549,7 @@ impl ApplicationHandler for App {
                         Ok(data) => match vector_svg::import_svg(&data) {
                             Ok(scene) => {
                                 self.state.scene = scene;
+                                self.state.history = History::new();
                                 self.state.select_state = SelectState::default();
                                 self.state.pending_zoom_to_fit = true;
                                 if let Some(gpu) = &mut self.gpu {
@@ -458,15 +615,26 @@ impl ApplicationHandler for App {
                                                     self.state.camera.zoom as f64,
                                                     &self.state.select_state.selected_nodes,
                                                 )
-                                                && let Some(vr) = SelectState::insert_point_on_edge(
+                                            {
+                                                // Snapshot path before splitting for undo.
+                                                let old_path = self.state.snapshot_path(hit.node);
+                                                if let Some(vr) = SelectState::insert_point_on_edge(
                                                     &mut self.state.scene,
                                                     &hit,
-                                                )
-                                            {
-                                                self.state.select_state.selected.clear();
-                                                self.state.select_state.selected.push(vr);
-                                                gpu.renderer.mark_dirty();
-                                                handled = true;
+                                                ) {
+                                                    if let Some(path) = old_path {
+                                                        self.state.history.record_undo(
+                                                            Command::SetPathData {
+                                                                id: hit.node,
+                                                                path,
+                                                            },
+                                                        );
+                                                    }
+                                                    self.state.select_state.selected.clear();
+                                                    self.state.select_state.selected.push(vr);
+                                                    gpu.renderer.mark_dirty();
+                                                    handled = true;
+                                                }
                                             }
 
                                             if !handled {
@@ -478,6 +646,11 @@ impl ApplicationHandler for App {
                                                     shift,
                                                     self.state.camera.zoom as f64,
                                                 );
+                                                // If on_press started a vertex drag,
+                                                // snapshot the paths for undo.
+                                                if self.state.select_state.is_dragging_vertices() {
+                                                    self.state.snapshot_selected_vertex_paths();
+                                                }
                                             }
                                         }
                                         ToolType::Pen => {
@@ -504,6 +677,11 @@ impl ApplicationHandler for App {
                                 self.state.is_left_down = false;
                                 match self.state.active_tool {
                                     ToolType::Select => {
+                                        // If we were dragging vertices, record
+                                        // the undo command before ending the drag.
+                                        if self.state.select_state.is_dragging_vertices() {
+                                            self.state.record_vertex_drag_undo();
+                                        }
                                         self.state.select_state.on_release();
                                     }
                                     ToolType::Pen => {
@@ -526,6 +704,11 @@ impl ApplicationHandler for App {
                                         if let Some(node_id) =
                                             self.state.shape_draw.on_release(&mut self.state.scene)
                                         {
+                                            // Record undo: the shape was just created,
+                                            // so undoing means deleting it.
+                                            self.state
+                                                .history
+                                                .record_undo(Command::Delete { id: node_id });
                                             // Auto-select the new shape and switch to Select
                                             self.state.select_state.selected_nodes.clear();
                                             self.state.select_state.selected_nodes.push(node_id);
@@ -633,7 +816,42 @@ impl ApplicationHandler for App {
                     && key_event.state == ElementState::Pressed
                 {
                     use winit::keyboard::{Key, NamedKey};
+                    let modifiers = gpu.egui_ctx.input(|i| i.modifiers);
+                    let ctrl = modifiers.ctrl || modifiers.mac_cmd;
+
                     match &key_event.logical_key {
+                        // Undo: Ctrl+Z (no shift)
+                        Key::Character(c)
+                            if (c.as_str() == "z" || c.as_str() == "Z")
+                                && ctrl
+                                && !modifiers.shift =>
+                        {
+                            // Don't undo while a tool is actively building.
+                            if !self.state.pen_state.is_building()
+                                && !self.state.shape_draw.is_drawing()
+                                && self.state.history.can_undo()
+                            {
+                                self.state.undo();
+                                gpu.renderer.mark_dirty();
+                                gpu.window.request_redraw();
+                            }
+                        }
+                        // Redo: Ctrl+Shift+Z or Ctrl+Y
+                        Key::Character(c)
+                            if ((c.as_str() == "z" || c.as_str() == "Z") && modifiers.shift
+                                || (c.as_str() == "y" || c.as_str() == "Y")
+                                    && !modifiers.shift)
+                                && ctrl =>
+                        {
+                            if !self.state.pen_state.is_building()
+                                && !self.state.shape_draw.is_drawing()
+                                && self.state.history.can_redo()
+                            {
+                                self.state.redo();
+                                gpu.renderer.mark_dirty();
+                                gpu.window.request_redraw();
+                            }
+                        }
                         Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
                             if self.state.active_tool == ToolType::Pen
                                 && self.state.pen_state.is_building()
@@ -645,14 +863,12 @@ impl ApplicationHandler for App {
                             }
                         }
                         Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
-                            if self.state.active_tool == ToolType::Select
-                                && self
-                                    .state
-                                    .select_state
-                                    .delete_selection(&mut self.state.scene)
-                            {
-                                gpu.renderer.mark_dirty();
-                                gpu.window.request_redraw();
+                            if self.state.active_tool == ToolType::Select {
+                                let deleted = self.state.delete_with_undo();
+                                if deleted {
+                                    gpu.renderer.mark_dirty();
+                                    gpu.window.request_redraw();
+                                }
                             }
                         }
                         _ => {}
@@ -672,13 +888,6 @@ impl App {
 }
 
 fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
-    let scene = &mut state.scene;
-    let active_tool = &mut state.active_tool;
-    let camera = &mut state.camera;
-    let select_state = &mut state.select_state;
-    let pen_state = &mut state.pen_state;
-    let pending_zoom_to_fit = &mut state.pending_zoom_to_fit;
-    let canvas_rect = &mut state.canvas_rect;
     let output = match gpu.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(t) => t,
         wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
@@ -697,35 +906,27 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     // any egui Ui, which lets is_pointer_over_egui() return false for it.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     gpu.egui_ctx.begin_pass(raw_input);
-    let reorder = run_ui(
-        &gpu.egui_ctx,
-        active_tool,
-        scene,
-        select_state,
-        pen_state,
-        &mut gpu.renderer,
-        pending_zoom_to_fit,
-    );
+    let reorder = run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
 
     // Capture the canvas rect (area not covered by egui panels) before ending the pass.
     #[expect(deprecated)] // content_rect may not exist in this egui version yet
     let avail = gpu.egui_ctx.available_rect();
-    *canvas_rect = [avail.min.x, avail.min.y, avail.width(), avail.height()];
+    state.canvas_rect = [avail.min.x, avail.min.y, avail.width(), avail.height()];
 
     let full_output = gpu.egui_ctx.end_pass();
 
     // Apply any reorder from the structure panel (before renderer.prepare).
     if let Some((node_id, new_parent, index)) = reorder
-        && scene.reparent(node_id, new_parent, index)
+        && state.scene.reparent(node_id, new_parent, index)
     {
         gpu.renderer.mark_dirty();
     }
 
     // Handle pending zoom-to-fit (e.g. after loading an SVG).
-    if *pending_zoom_to_fit {
-        *pending_zoom_to_fit = false;
-        let bounds = scene.content_bounds();
-        camera.zoom_to_fit(bounds, *canvas_rect);
+    if state.pending_zoom_to_fit {
+        state.pending_zoom_to_fit = false;
+        let bounds = state.scene.content_bounds();
+        state.camera.zoom_to_fit(bounds, state.canvas_rect);
     }
 
     gpu.egui_state
@@ -763,11 +964,11 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     gpu.renderer.set_camera(
         gpu.surface_config.width as f32,
         gpu.surface_config.height as f32,
-        camera.pan,
-        camera.zoom,
+        state.camera.pan,
+        state.camera.zoom,
     );
     gpu.renderer
-        .prepare(&gpu.device, &gpu.queue, scene, select_state);
+        .prepare(&gpu.device, &gpu.queue, &state.scene, &state.select_state);
 
     // Create render pass — forget_lifetime() decouples the pass from the encoder
     // borrow, which is required by egui-wgpu 0.31's render() expecting RenderPass<'static>.
@@ -826,19 +1027,19 @@ type ReorderCommand = Option<(vector_scene::NodeId, vector_scene::NodeId, usize)
 ///
 /// Returns an optional reorder command from the structure panel drag-and-drop.
 #[expect(deprecated)] // Panel::show is deprecated in 0.34 but needed for top-level panels
-fn run_ui(
-    ctx: &egui::Context,
-    active_tool: &mut ToolType,
-    scene: &mut Scene,
-    selection: &mut SelectState,
-    pen_state: &mut PenState,
-    renderer: &mut Renderer,
-    pending_zoom_to_fit: &mut bool,
-) -> ReorderCommand {
+fn run_ui(ctx: &egui::Context, state: &mut EditorState, renderer: &mut Renderer) -> ReorderCommand {
+    let scene = &mut state.scene;
+    let history = &mut state.history;
+    let active_tool = &mut state.active_tool;
+    let selection = &mut state.select_state;
+    let pen_state = &mut state.pen_state;
+    let pending_zoom_to_fit = &mut state.pending_zoom_to_fit;
     let mut dump_requested = false;
     let mut reorder_cmd: ReorderCommand = None;
     let mut open_requested = false;
     let mut save_requested = false;
+    let mut undo_requested = false;
+    let mut redo_requested = false;
 
     let menu_resp = egui::Panel::top("menu_bar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
@@ -853,12 +1054,18 @@ fn run_ui(
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.button("Undo").clicked() {
-                    // TODO
+                if ui
+                    .add_enabled(history.can_undo(), egui::Button::new("Undo  Ctrl+Z"))
+                    .clicked()
+                {
+                    undo_requested = true;
                     ui.close();
                 }
-                if ui.button("Redo").clicked() {
-                    // TODO
+                if ui
+                    .add_enabled(history.can_redo(), egui::Button::new("Redo  Ctrl+Shift+Z"))
+                    .clicked()
+                {
+                    redo_requested = true;
                     ui.close();
                 }
             });
@@ -887,6 +1094,7 @@ fn run_ui(
                             let action = pen_state.finish(scene, false);
                             match action {
                                 PenAction::Finished(node_id) => {
+                                    history.record_undo(Command::Delete { id: node_id });
                                     selection.selected_nodes.clear();
                                     selection.selected_nodes.push(node_id);
                                     renderer.mark_dirty();
@@ -922,7 +1130,7 @@ fn run_ui(
                     egui::ScrollArea::vertical()
                         .id_salt("properties_scroll")
                         .show(ui, |ui| {
-                            show_properties(ui, scene, selection, renderer);
+                            show_properties(ui, scene, history, selection, renderer);
                         });
                 });
             properties_rect = props_resp.response.rect;
@@ -970,6 +1178,24 @@ fn run_ui(
         log::info!("========================");
     }
 
+    // ── Undo/redo from menu ──
+
+    if undo_requested && !pen_state.is_building() && history.can_undo() {
+        history.undo(scene);
+        selection.selected_nodes.clear();
+        selection.selected.clear();
+        selection.hovered = None;
+        renderer.mark_dirty();
+    }
+
+    if redo_requested && !pen_state.is_building() && history.can_redo() {
+        history.redo(scene);
+        selection.selected_nodes.clear();
+        selection.selected.clear();
+        selection.hovered = None;
+        renderer.mark_dirty();
+    }
+
     // ── File dialogs (blocking — runs after egui pass) ──
 
     if open_requested {
@@ -998,6 +1224,7 @@ fn run_ui(
                 Ok(data) => match vector_svg::import_svg(&data) {
                     Ok(new_scene) => {
                         *scene = new_scene;
+                        *history = History::new(); // clear undo/redo for old scene
                         *selection = SelectState::default();
                         *pending_zoom_to_fit = true;
                         renderer.mark_dirty();
@@ -1045,6 +1272,7 @@ fn egui_to_color(c: egui::Color32) -> vector_geom::Color {
 fn show_properties(
     ui: &mut egui::Ui,
     scene: &mut Scene,
+    history: &mut History,
     selection: &SelectState,
     renderer: &mut Renderer,
 ) {
@@ -1163,6 +1391,23 @@ fn show_properties(
 
     // Apply changes to all selected path nodes.
     if changed {
+        // Snapshot old styles for undo.
+        let mut undo_cmds = Vec::new();
+        for &node_id in &node_ids {
+            if let Some(node) = scene.get(node_id)
+                && let vector_scene::NodeData::Path {
+                    style: ref old_style,
+                    ..
+                } = node.data
+            {
+                undo_cmds.push(Command::SetStyle {
+                    id: node_id,
+                    style: old_style.clone(),
+                });
+            }
+        }
+
+        // Apply new style.
         for &node_id in &node_ids {
             if let Some(node) = scene.get_mut(node_id)
                 && let vector_scene::NodeData::Path {
@@ -1173,6 +1418,14 @@ fn show_properties(
                 *node_style = style.clone();
             }
         }
+
+        // Record undo.
+        if undo_cmds.len() == 1 {
+            history.record_undo(undo_cmds.into_iter().next().unwrap());
+        } else if !undo_cmds.is_empty() {
+            history.record_undo(Command::Batch(undo_cmds));
+        }
+
         renderer.mark_dirty();
     }
 }

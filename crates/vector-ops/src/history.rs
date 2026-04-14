@@ -42,6 +42,15 @@ impl History {
         }
     }
 
+    /// Record a pre-built undo command without executing anything.
+    /// Use this when the mutation has already been applied to the scene
+    /// directly (e.g. by a continuous drag operation or a tool that manages
+    /// its own scene mutations).
+    pub fn record_undo(&mut self, undo_cmd: Command) {
+        self.undo_stack.push(undo_cmd);
+        self.redo_stack.clear();
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }

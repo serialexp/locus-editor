@@ -1,40 +1,31 @@
-# Current Task: Initial Project Scaffold
+# Current State
 
-## Status: Complete — scaffold compiles and builds
+## What's working
 
-## What was done
+- Full editor with wgpu rendering, egui UI panels, pan/zoom camera
+- **Select tool**: click to select nodes/vertices, drag to move, rubber-band selection, handle manipulation (cubic/quad control points)
+- **Pen tool**: Illustrator-style click (corner) / click-drag (smooth curve), close path, right-click undo, Enter/Escape finish
+- **Shape tool**: rectangle/ellipse drawing
+- **SVG import** via usvg (solid colors, paths, groups, transforms)
+- **SVG export**: all 4 segment types (L/Q/C/A), fill/stroke, transforms, viewBox
+- **File dialogs**: Open/Save SVG via rfd
+- **Delete**: vertex deletion (backspace/delete with vertices selected) and object deletion
+- **Double-click** to insert points on path edges
+- **Arc geometry**: proper SVG spec F.6 endpoint-to-center conversion, eval, closest point, split
+- **Undo/redo**: Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y, Edit menu buttons
+  - All operations undoable: pen path creation, shape creation, object deletion, vertex deletion, vertex dragging, insert point on edge, style changes
+  - Command system: Insert, InsertSubtree, Delete, SetPathData, SetStyle, SetTransform, Batch
+  - Subtree snapshot/restore for faithful undo of hierarchical deletions
+  - History cleared on file open / drag-and-drop load
+  - Undo/redo disabled during active pen/shape drawing
+- **CI**: GitHub Actions (format, clippy -D warnings, build, test) + cross-platform build matrix
+- **Release**: GitHub Actions on v* tags, builds for Linux/macOS/Windows
+- **Install script**: platform detection, binary install
 
-Set up the full workspace with 8 library crates + 1 binary:
+## Known TODOs
 
-```
-crates/
-  vector-geom/    ✅ Point, Vec2, Affine, Bounds, Segment, Path, SubPath, Color (linear RGBA)
-  vector-scene/   ✅ Node, NodeData, Scene (SlotMap-based), Style, Paint, PaintRef, stable IDs
-  vector-svg/     ✅ SVG import via usvg (solid colors, paths, groups), export stub
-  vector-text/    ⬜ Stub only (rustybuzz + ttf-parser deps wired)
-  vector-tess/    ✅ Path tessellation via lyon (fill + stroke), arc fallback is line-to (TODO)
-  vector-render/  ✅ wgpu pipeline, shader, ortho projection, scene walk + tessellate + draw
-  vector-ops/     ✅ Command enum (Insert/Delete/Batch) + undo/redo History
-  vector-tools/   ⬜ Stub only
-
-bin/
-  vector-editor/  ✅ winit + wgpu + egui app loop, menu bar, tool/layer/property panels,
-                     demo triangle, drag-and-drop SVG loading
-```
-
-## What works
-
-- `cargo build` succeeds with only 1 dead_code warning (history field not yet wired)
-- Running the binary opens a window with a steel-blue triangle rendered via wgpu
-- Dropping an SVG file onto the window imports and displays it (solid-color paths only)
-- egui panels render (menu bar, tool sidebar, properties, layers)
-
-## Known TODOs (next steps)
-
-1. **Arc tessellation** — `Segment::Arc` currently falls back to a straight line. Need to use `lyon_geom::SvgArc` for proper arc-to-cubic conversion in the tessellator.
-2. **World transforms** — scene walk computes world transforms but the renderer doesn't apply them to vertices yet. Need to either bake into vertices or use per-draw push constants.
-3. **Text** — vector-text is a stub. Need to implement: font loading, text shaping via rustybuzz, glyph outline extraction.
-4. **Tools** — vector-tools is a stub. Start with Select tool (click to select, drag to move).
-5. **Gradient/pattern rendering** — PaintRef::Ref falls back to black. Need gradient uniforms/textures.
-6. **SVG export** — export_svg is a stub.
-7. **Pan/zoom** — no camera controls yet.
+1. **Arc tessellation** — `Segment::Arc` falls back to a straight line in the tessellator; need lyon_geom::SvgArc conversion
+2. **World transforms in renderer** — computed but not applied to vertices
+3. **Text rendering** — vector-text is a stub (rustybuzz + ttf-parser deps wired but no implementation)
+4. **Gradient/pattern rendering** — PaintRef::Ref falls back to black
+5. **Stroke rendering fidelity** — stroke tessellation works but no dash patterns in renderer yet
