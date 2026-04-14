@@ -4,7 +4,7 @@ use std::fmt::Write;
 use vector_geom::{Affine, Color, Segment};
 use vector_scene::{
     FillRule, Gradient, GradientKind, LineCap, LineJoin, NodeData, NodeId, Paint, PaintRef, Scene,
-    SpreadMethod,
+    SpreadMethod, Style,
 };
 
 /// Export a scene graph to an SVG string.
@@ -131,62 +131,8 @@ fn write_node(
                 let _ = write!(buf, r#" transform="{t}""#);
             }
 
-            // Fill attributes.
-            match &style.fill {
-                None => {
-                    let _ = write!(buf, r#" fill="none""#);
-                }
-                Some(fill) => {
-                    let _ = write!(buf, r#" fill="{}""#, fmt_paint(&fill.paint, gradient_ids));
-                    if fill.rule == FillRule::EvenOdd {
-                        let _ = write!(buf, r#" fill-rule="evenodd""#);
-                    }
-                    if fill.opacity < 1.0 - 1e-4 {
-                        let _ = write!(buf, r#" fill-opacity="{:.4}""#, fill.opacity);
-                    }
-                }
-            }
-
-            // Stroke attributes.
-            if let Some(stroke) = &style.stroke {
-                let _ = write!(
-                    buf,
-                    r#" stroke="{}""#,
-                    fmt_paint(&stroke.paint, gradient_ids)
-                );
-                let _ = write!(buf, r#" stroke-width="{}""#, stroke.style.width);
-                if stroke.opacity < 1.0 - 1e-4 {
-                    let _ = write!(buf, r#" stroke-opacity="{:.4}""#, stroke.opacity);
-                }
-                match stroke.style.cap {
-                    LineCap::Butt => {} // SVG default
-                    LineCap::Round => {
-                        let _ = write!(buf, r#" stroke-linecap="round""#);
-                    }
-                    LineCap::Square => {
-                        let _ = write!(buf, r#" stroke-linecap="square""#);
-                    }
-                }
-                match stroke.style.join {
-                    LineJoin::Miter => {} // SVG default
-                    LineJoin::Round => {
-                        let _ = write!(buf, r#" stroke-linejoin="round""#);
-                    }
-                    LineJoin::Bevel => {
-                        let _ = write!(buf, r#" stroke-linejoin="bevel""#);
-                    }
-                }
-                if (stroke.style.miter_limit - 4.0).abs() > 1e-4 {
-                    let _ = write!(buf, r#" stroke-miterlimit="{}""#, stroke.style.miter_limit);
-                }
-                if let Some(dash) = &stroke.style.dash {
-                    let vals: Vec<String> = dash.array.iter().map(|v| v.to_string()).collect();
-                    let _ = write!(buf, r#" stroke-dasharray="{}""#, vals.join(","));
-                    if dash.offset.abs() > 1e-6 {
-                        let _ = write!(buf, r#" stroke-dashoffset="{}""#, dash.offset);
-                    }
-                }
-            }
+            write_fill_attrs(style, gradient_ids, buf);
+            write_stroke_attrs(style, gradient_ids, buf);
 
             let _ = writeln!(buf, "/>");
         }
@@ -203,7 +149,75 @@ fn write_node(
             }
             let _ = write!(buf, r#" font-family="{}""#, xml_escape(&text.font_family));
             let _ = write!(buf, r#" font-size="{}""#, text.font_size);
+
+            // Fill attributes.
+            write_fill_attrs(&text.style, gradient_ids, buf);
+
+            // Stroke attributes.
+            write_stroke_attrs(&text.style, gradient_ids, buf);
+
             let _ = writeln!(buf, ">{}</text>", xml_escape(&text.content));
+        }
+    }
+}
+
+/// Write SVG fill attributes for a `Style` into the buffer.
+fn write_fill_attrs(style: &Style, gradient_ids: &HashMap<NodeId, String>, buf: &mut String) {
+    match &style.fill {
+        None => {
+            let _ = write!(buf, r#" fill="none""#);
+        }
+        Some(fill) => {
+            let _ = write!(buf, r#" fill="{}""#, fmt_paint(&fill.paint, gradient_ids));
+            if fill.rule == FillRule::EvenOdd {
+                let _ = write!(buf, r#" fill-rule="evenodd""#);
+            }
+            if fill.opacity < 1.0 - 1e-4 {
+                let _ = write!(buf, r#" fill-opacity="{:.4}""#, fill.opacity);
+            }
+        }
+    }
+}
+
+/// Write SVG stroke attributes for a `Style` into the buffer.
+fn write_stroke_attrs(style: &Style, gradient_ids: &HashMap<NodeId, String>, buf: &mut String) {
+    if let Some(stroke) = &style.stroke {
+        let _ = write!(
+            buf,
+            r#" stroke="{}""#,
+            fmt_paint(&stroke.paint, gradient_ids)
+        );
+        let _ = write!(buf, r#" stroke-width="{}""#, stroke.style.width);
+        if stroke.opacity < 1.0 - 1e-4 {
+            let _ = write!(buf, r#" stroke-opacity="{:.4}""#, stroke.opacity);
+        }
+        match stroke.style.cap {
+            LineCap::Butt => {} // SVG default
+            LineCap::Round => {
+                let _ = write!(buf, r#" stroke-linecap="round""#);
+            }
+            LineCap::Square => {
+                let _ = write!(buf, r#" stroke-linecap="square""#);
+            }
+        }
+        match stroke.style.join {
+            LineJoin::Miter => {} // SVG default
+            LineJoin::Round => {
+                let _ = write!(buf, r#" stroke-linejoin="round""#);
+            }
+            LineJoin::Bevel => {
+                let _ = write!(buf, r#" stroke-linejoin="bevel""#);
+            }
+        }
+        if (stroke.style.miter_limit - 4.0).abs() > 1e-4 {
+            let _ = write!(buf, r#" stroke-miterlimit="{}""#, stroke.style.miter_limit);
+        }
+        if let Some(dash) = &stroke.style.dash {
+            let vals: Vec<String> = dash.array.iter().map(|v: &f64| v.to_string()).collect();
+            let _ = write!(buf, r#" stroke-dasharray="{}""#, vals.join(","));
+            if dash.offset.abs() > 1e-6 {
+                let _ = write!(buf, r#" stroke-dashoffset="{}""#, dash.offset);
+            }
         }
     }
 }
@@ -408,6 +422,7 @@ mod tests {
                 to: Point::new(30.0, 40.0),
             }],
             closed: false,
+            vertex_modes: vec![VertexMode::Corner; 2],
         });
         let d = fmt_path_data(&path);
         assert_eq!(d, "M 10 20 L 30 40");
@@ -427,6 +442,7 @@ mod tests {
                 },
             ],
             closed: true,
+            vertex_modes: vec![VertexMode::Corner; 3],
         });
         let d = fmt_path_data(&path);
         assert_eq!(d, "M 0 0 L 100 0 L 100 100 Z");
@@ -458,6 +474,7 @@ mod tests {
                 },
             ],
             closed: true,
+            vertex_modes: vec![VertexMode::Corner; 3],
         });
 
         let mut node = vector_scene::Node::path("triangle", path);
@@ -545,6 +562,7 @@ mod tests {
                 to: Point::new(100.0, 100.0),
             }],
             closed: false,
+            vertex_modes: vec![VertexMode::Corner; 2],
         });
         let mut node = vector_scene::Node::path("rect", path);
         if let NodeData::Path { ref mut style, .. } = node.data {

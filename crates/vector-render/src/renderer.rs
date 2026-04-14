@@ -3,10 +3,14 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use vector_geom::{Affine, Color, Point, Segment};
 use vector_scene::{
-    Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Scene, SpreadMethod,
+    Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Scene, SpreadMethod, Stroke,
 };
-use vector_tess::{TessPaint, Vertex, tessellate_path};
-use vector_tools::{PointKind, SelectState, VertexRef};
+use vector_tess::{
+    DashPattern, LineCap, LineJoin, StrokeParams, TessPaint, TessellatedMesh, Vertex,
+    tessellate_path,
+};
+use vector_text::global_font_db;
+use vector_tools::{PointKind, SelectState, SelectionMode, VertexRef};
 
 use crate::pipeline;
 
@@ -162,6 +166,10 @@ pub struct Renderer {
     /// Current camera pan in screen pixels.
     pan: [f32; 2],
     dirty: bool,
+    /// Minor grid spacing in canvas units (default 1.0).
+    pub grid_minor_spacing: f32,
+    /// Major grid spacing in canvas units (default 10.0).
+    pub grid_major_spacing: f32,
 }
 
 impl Renderer {
@@ -229,6 +237,8 @@ impl Renderer {
             viewport_height: 600.0,
             pan: [0.0, 0.0],
             dirty: true,
+            grid_minor_spacing: GRID_MINOR_SPACING,
+            grid_major_spacing: GRID_MAJOR_SPACING,
         }
     }
 
@@ -347,46 +357,88 @@ impl Renderer {
         let mut all_vertices: Vec<Vertex> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
 
+        // Helper: resolve scene Style into tessellation parameters.
+        let resolve_stroke = |s: &Stroke| -> StrokeParams {
+            let cap = match s.style.cap {
+                vector_scene::LineCap::Butt => LineCap::Butt,
+                vector_scene::LineCap::Round => LineCap::Round,
+                vector_scene::LineCap::Square => LineCap::Square,
+            };
+            let join = match s.style.join {
+                vector_scene::LineJoin::Miter => LineJoin::Miter,
+                vector_scene::LineJoin::Round => LineJoin::Round,
+                vector_scene::LineJoin::Bevel => LineJoin::Bevel,
+            };
+            let dash = s.style.dash.as_ref().map(|d| DashPattern {
+                array: d.array.clone(),
+                offset: d.offset,
+            });
+            StrokeParams {
+                paint: resolve_paint(&s.paint),
+                width: s.style.width,
+                cap,
+                join,
+                miter_limit: s.style.miter_limit,
+                dash,
+            }
+        };
+
+        // Helper: push a tessellated mesh into the global vertex/index buffers,
+        // applying the world transform.
+        let push_mesh = |mesh: TessellatedMesh,
+                         world_transform: &Affine,
+                         all_vertices: &mut Vec<Vertex>,
+                         all_indices: &mut Vec<u32>| {
+            let base = all_vertices.len() as u32;
+            if world_transform.is_identity() {
+                all_vertices.extend_from_slice(&mesh.vertices);
+            } else {
+                all_vertices.extend(mesh.vertices.iter().map(|v| {
+                    let p = world_transform
+                        .apply(Point::new(v.position[0] as f64, v.position[1] as f64));
+                    Vertex {
+                        position: [p.x as f32, p.y as f32],
+                        color: v.color,
+                        world_pos: [p.x as f32, p.y as f32],
+                        gradient_index: v.gradient_index,
+                        _pad: 0,
+                    }
+                }));
+            }
+            all_indices.extend(mesh.indices.iter().map(|i| i + base));
+        };
+
+        let mut font_db = global_font_db();
+
         let root = scene.root();
         scene.walk_depth_first(root, Affine::IDENTITY, &mut |_id, node, world_transform| {
             if !node.visible {
                 return;
             }
-            if let NodeData::Path {
-                ref path,
-                ref style,
-            } = node.data
-            {
-                let fill = style.fill.as_ref().map(|f| resolve_paint(&f.paint));
-                let stroke = style
-                    .stroke
-                    .as_ref()
-                    .map(|s| (resolve_paint(&s.paint), s.style.width));
+            match node.data {
+                NodeData::Path {
+                    ref path,
+                    ref style,
+                } => {
+                    let fill = style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let stroke = style.stroke.as_ref().map(&resolve_stroke);
 
-                let mesh = tessellate_path(path, fill, stroke);
-
-                let base = all_vertices.len() as u32;
-
-                if world_transform.is_identity() {
-                    all_vertices.extend_from_slice(&mesh.vertices);
-                } else {
-                    all_vertices.extend(mesh.vertices.iter().map(|v| {
-                        let p = world_transform
-                            .apply(Point::new(v.position[0] as f64, v.position[1] as f64));
-                        Vertex {
-                            position: [p.x as f32, p.y as f32],
-                            color: v.color,
-                            // world_pos carries the world-space position for gradient
-                            // evaluation. Since usvg normalizes gradient coordinates to
-                            // userSpaceOnUse (root/world space), this is the correct
-                            // space for computing the gradient parameter t.
-                            world_pos: [p.x as f32, p.y as f32],
-                            gradient_index: v.gradient_index,
-                            _pad: 0,
-                        }
-                    }));
+                    let mesh = tessellate_path(path, fill, stroke);
+                    push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
                 }
-                all_indices.extend(mesh.indices.iter().map(|i| i + base));
+                NodeData::Text(ref text) => {
+                    let shaped = font_db.shape_text(
+                        &text.content,
+                        &text.font_family,
+                        text.font_size,
+                    );
+                    let fill = text.style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let stroke = text.style.stroke.as_ref().map(&resolve_stroke);
+
+                    let mesh = tessellate_path(&shaped.path, fill, stroke);
+                    push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
+                }
+                _ => {}
             }
         });
 
@@ -440,22 +492,24 @@ impl Renderer {
         let minor_color: [f32; 4] = [1.0, 1.0, 1.0, 0.06];
         let major_color: [f32; 4] = [1.0, 1.0, 1.0, 0.15];
 
+        let minor_spacing = self.grid_minor_spacing;
+        let major_spacing = self.grid_major_spacing;
+
         // Determine whether minor lines are visible:
-        // minor spacing in screen pixels = GRID_MINOR_SPACING * zoom
-        let show_minor = GRID_MINOR_SPACING * zoom >= GRID_MINOR_MIN_SCREEN_PX;
+        // minor spacing in screen pixels = minor_spacing * zoom
+        let show_minor = minor_spacing * zoom >= GRID_MINOR_MIN_SCREEN_PX;
 
         // Helper: snap `lo` down to nearest multiple of `spacing`
         let snap_down = |val: f32, spacing: f32| -> f32 { (val / spacing).floor() * spacing };
 
         // --- Minor grid lines (drawn first, behind major) ---
         if show_minor {
-            let minor = GRID_MINOR_SPACING;
             // Vertical minor lines
-            let mut x = snap_down(canvas_left, minor);
+            let mut x = snap_down(canvas_left, minor_spacing);
             while x <= canvas_right {
                 // Skip lines that fall on major grid (they'll be drawn with major color)
-                let on_major = (x / GRID_MAJOR_SPACING).round() * GRID_MAJOR_SPACING;
-                if (x - on_major).abs() > minor * 0.01 {
+                let on_major = (x / major_spacing).round() * major_spacing;
+                if (x - on_major).abs() > minor_spacing * 0.01 {
                     push_quad(
                         &mut verts,
                         &mut idxs,
@@ -466,13 +520,13 @@ impl Renderer {
                         minor_color,
                     );
                 }
-                x += minor;
+                x += minor_spacing;
             }
             // Horizontal minor lines
-            let mut y = snap_down(canvas_top, minor);
+            let mut y = snap_down(canvas_top, minor_spacing);
             while y <= canvas_bottom {
-                let on_major = (y / GRID_MAJOR_SPACING).round() * GRID_MAJOR_SPACING;
-                if (y - on_major).abs() > minor * 0.01 {
+                let on_major = (y / major_spacing).round() * major_spacing;
+                if (y - on_major).abs() > minor_spacing * 0.01 {
                     push_quad(
                         &mut verts,
                         &mut idxs,
@@ -483,16 +537,15 @@ impl Renderer {
                         minor_color,
                     );
                 }
-                y += minor;
+                y += minor_spacing;
             }
         }
 
         // --- Major grid lines ---
         {
-            let major = GRID_MAJOR_SPACING;
             let major_thickness = 1.0 / zoom;
             // Vertical major lines
-            let mut x = snap_down(canvas_left, major);
+            let mut x = snap_down(canvas_left, major_spacing);
             while x <= canvas_right {
                 push_quad(
                     &mut verts,
@@ -503,10 +556,10 @@ impl Renderer {
                     (canvas_bottom - canvas_top) * 0.5,
                     major_color,
                 );
-                x += major;
+                x += major_spacing;
             }
             // Horizontal major lines
-            let mut y = snap_down(canvas_top, major);
+            let mut y = snap_down(canvas_top, major_spacing);
             while y <= canvas_bottom {
                 push_quad(
                     &mut verts,
@@ -517,8 +570,36 @@ impl Renderer {
                     major_thickness,
                     major_color,
                 );
-                y += major;
+                y += major_spacing;
             }
+        }
+
+        // --- Origin crosshair ---
+        {
+            let crosshair_color: [f32; 4] = [1.0, 0.4, 0.4, 0.6];
+            let crosshair_thickness = 1.0 / zoom;
+            let crosshair_half_len = 12.0 / zoom;
+
+            // Horizontal arm
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                0.0,
+                0.0,
+                crosshair_half_len,
+                crosshair_thickness,
+                crosshair_color,
+            );
+            // Vertical arm
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                0.0,
+                0.0,
+                crosshair_thickness,
+                crosshair_half_len,
+                crosshair_color,
+            );
         }
 
         self.grid_num_indices = idxs.len() as u32;
@@ -598,10 +679,10 @@ impl Renderer {
             }
         }
 
-        // ── Selection bounding boxes ──────────────────────────────────
+        // ── Selection bounding boxes (Object mode only) ─────────────
         // Draw a thin outline around each object-selected node's world-space
         // bounding box. For groups, this encompasses all children.
-        {
+        if selection.mode == SelectionMode::Object {
             let bbox_color: [f32; 4] = [0.3, 0.6, 1.0, 0.6]; // selection blue
             let bbox_thickness = 1.0 / zoom;
 
@@ -686,7 +767,83 @@ impl Renderer {
             });
         }
 
-        // ── Vertex handles ───────────────────────────────────────────────
+        // ── Vertex handles (Node mode only) ─────────────────────────────
+        if selection.mode == SelectionMode::Node {
+        let line_color: [f32; 4] = [0.5, 0.7, 1.0, 0.7];
+        let line_thickness = 1.0 / zoom;
+        let dash_len = 4.0 / zoom;
+        let gap_len = 3.0 / zoom;
+
+        /// Draw a handle line between an anchor and a control point.
+        /// Solid for Smooth/Symmetric vertices, dashed for Corner.
+        #[allow(clippy::too_many_arguments)]
+        fn draw_handle_line(
+            verts: &mut Vec<Vertex>,
+            idxs: &mut Vec<u32>,
+            anchor: Point,
+            ctrl: Point,
+            mode: vector_geom::VertexMode,
+            thickness: f32,
+            dash_len: f32,
+            gap_len: f32,
+            color: [f32; 4],
+        ) {
+            match mode {
+                vector_geom::VertexMode::Smooth | vector_geom::VertexMode::Symmetric => {
+                    push_line(verts, idxs, anchor, ctrl, thickness, color);
+                }
+                vector_geom::VertexMode::Corner => {
+                    push_dashed_line(verts, idxs, anchor, ctrl, thickness, dash_len, gap_len, color);
+                }
+            }
+        }
+
+        // First pass: draw handle lines (behind the handle squares).
+        let root = scene.root();
+        scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
+            if !node.visible || !selection.is_node_selected(id) {
+                return;
+            }
+            if let NodeData::Path { ref path, .. } = node.data {
+                let xf = |p: Point| -> Point {
+                    if world_transform.is_identity() { p } else { world_transform.apply(p) }
+                };
+
+                for subpath in &path.subpaths {
+                    let mut prev_anchor = subpath.start;
+
+                    for (seg_idx, seg) in subpath.segments.iter().enumerate() {
+                        // Vertex mode of the "from" anchor (index seg_idx for
+                        // prev endpoint, or 0 for the start point).
+                        let from_mode = subpath.vertex_modes.get(seg_idx).copied()
+                            .unwrap_or(vector_geom::VertexMode::Corner);
+                        // Vertex mode of the "to" anchor (index seg_idx + 1).
+                        let to_mode = subpath.vertex_modes.get(seg_idx + 1).copied()
+                            .unwrap_or(vector_geom::VertexMode::Corner);
+
+                        match seg {
+                            Segment::Quad { ctrl, to } => {
+                                draw_handle_line(&mut verts, &mut idxs, xf(prev_anchor), xf(*ctrl), from_mode, line_thickness, dash_len, gap_len, line_color);
+                                draw_handle_line(&mut verts, &mut idxs, xf(*to), xf(*ctrl), to_mode, line_thickness, dash_len, gap_len, line_color);
+                                prev_anchor = *to;
+                            }
+                            Segment::Cubic { ctrl1, ctrl2, to } => {
+                                // ctrl1 belongs to prev_anchor (outgoing handle).
+                                draw_handle_line(&mut verts, &mut idxs, xf(prev_anchor), xf(*ctrl1), from_mode, line_thickness, dash_len, gap_len, line_color);
+                                // ctrl2 belongs to `to` (incoming handle).
+                                draw_handle_line(&mut verts, &mut idxs, xf(*to), xf(*ctrl2), to_mode, line_thickness, dash_len, gap_len, line_color);
+                                prev_anchor = *to;
+                            }
+                            Segment::Line { to } | Segment::Arc { to, .. } => {
+                                prev_anchor = *to;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Second pass: draw handle squares (on top of lines).
         let root = scene.root();
         scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
             if !node.visible {
@@ -913,6 +1070,15 @@ impl Renderer {
             }
         });
 
+        // Ghost vertex on edge hover — shows where a double-click would insert.
+        if let Some(pt) = selection.edge_hover_point {
+            let ghost_fill: [f32; 4] = [1.0, 1.0, 1.0, 0.4];
+            let ghost_border: [f32; 4] = [0.3, 0.5, 1.0, 0.5];
+            push_handle(&mut verts, &mut idxs, pt, handle_size, ghost_fill, ghost_border);
+        }
+
+        } // end Node mode vertex handles
+
         // Marquee rectangle (if active)
         if let Some((min, max)) = selection.marquee() {
             let x0 = min[0] as f32;
@@ -1055,6 +1221,80 @@ fn push_handle(
     push_quad(verts, idxs, cx, cy, b, b, border_color);
     // Inner quad (fill, drawn on top)
     push_quad(verts, idxs, cx, cy, half_size, half_size, fill_color);
+}
+
+/// Push a thin line (as a rotated quad) between two points.
+fn push_line(
+    verts: &mut Vec<Vertex>,
+    idxs: &mut Vec<u32>,
+    a: Point,
+    b: Point,
+    thickness: f32,
+    color: [f32; 4],
+) {
+    let ax = a.x as f32;
+    let ay = a.y as f32;
+    let bx = b.x as f32;
+    let by = b.y as f32;
+
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len = dx.hypot(dy);
+    if len < 1e-6 {
+        return;
+    }
+
+    // Perpendicular unit vector scaled by half-thickness.
+    let half = thickness * 0.5;
+    let nx = -dy / len * half;
+    let ny = dx / len * half;
+
+    let base = verts.len() as u32;
+    verts.push(Vertex::solid([ax + nx, ay + ny], color));
+    verts.push(Vertex::solid([ax - nx, ay - ny], color));
+    verts.push(Vertex::solid([bx - nx, by - ny], color));
+    verts.push(Vertex::solid([bx + nx, by + ny], color));
+    idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// Push a dashed line between two points. Each dash and gap has the given length.
+#[allow(clippy::too_many_arguments)]
+fn push_dashed_line(
+    verts: &mut Vec<Vertex>,
+    idxs: &mut Vec<u32>,
+    a: Point,
+    b: Point,
+    thickness: f32,
+    dash_len: f32,
+    gap_len: f32,
+    color: [f32; 4],
+) {
+    let dx = (b.x - a.x) as f32;
+    let dy = (b.y - a.y) as f32;
+    let total_len = dx.hypot(dy);
+    if total_len < 1e-6 {
+        return;
+    }
+
+    let ux = dx / total_len;
+    let uy = dy / total_len;
+
+    let mut t = 0.0f32;
+    let ax = a.x as f32;
+    let ay = a.y as f32;
+
+    while t < total_len {
+        let end = (t + dash_len).min(total_len);
+        push_line(
+            verts,
+            idxs,
+            Point::new((ax + ux * t) as f64, (ay + uy * t) as f64),
+            Point::new((ax + ux * end) as f64, (ay + uy * end) as f64),
+            thickness,
+            color,
+        );
+        t = end + gap_len;
+    }
 }
 
 /// Push a single axis-aligned quad as two triangles.

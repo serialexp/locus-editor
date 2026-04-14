@@ -32,6 +32,7 @@ usvg = "0.47"
 # Text
 rustybuzz = "0.20"
 ttf-parser = "0.24"
+fontdb = "0.23"
 
 # Tessellation
 lyon_tessellation = "1.0"

@@ -195,7 +195,7 @@ impl PenState {
 
     /// Handle left mouse release after press (or press-drag).
     /// Returns `true` if the scene changed.
-    pub fn on_release(&mut self, _scene: &mut Scene, canvas_pos: [f64; 2], zoom: f64) -> bool {
+    pub fn on_release(&mut self, scene: &mut Scene, canvas_pos: [f64; 2], zoom: f64) -> bool {
         let Some(anchor) = self.drag_anchor.take() else {
             return false;
         };
@@ -204,13 +204,23 @@ impl PenState {
         let drag_dist_screen = anchor.distance(drag_pos) * zoom;
 
         if drag_dist_screen >= MIN_DRAG_SCREEN_PX {
-            // Significant drag — store outgoing handle.
+            // Significant drag — store outgoing handle → smooth/symmetric vertex.
             if self.committed_count == 0 {
-                // First point: record start outgoing.
+                // First point: record start outgoing, upgrade start vertex mode.
                 self.start_outgoing = Some(drag_pos);
                 self.prev_outgoing = Some(drag_pos);
+                if let Some(subpath) = self.get_subpath_mut(scene) {
+                    subpath.vertex_modes[0] = vector_geom::VertexMode::Symmetric;
+                }
             } else {
                 self.prev_outgoing = Some(drag_pos);
+                // Upgrade the last committed endpoint to Symmetric.
+                if let Some(subpath) = self.get_subpath_mut(scene) {
+                    // vertex_modes index: 0 = start, committed_count = last endpoint.
+                    if let Some(mode) = subpath.vertex_modes.get_mut(self.committed_count) {
+                        *mode = vector_geom::VertexMode::Symmetric;
+                    }
+                }
             }
         } else {
             // Click (no drag) — corner point, no outgoing handle.
@@ -253,7 +263,7 @@ impl PenState {
             subpath.segments[self.committed_count] = preview;
         } else {
             // Add new preview.
-            subpath.segments.push(preview);
+            subpath.push_segment(preview, vector_geom::VertexMode::Corner);
         }
 
         true
@@ -277,6 +287,7 @@ impl PenState {
                 && !subpath.segments.is_empty()
             {
                 subpath.segments.pop();
+                subpath.vertex_modes.pop();
             }
             self.committed_count -= 1;
             self.prev_outgoing = self.outgoing_stack.pop().flatten();
@@ -339,7 +350,7 @@ impl PenState {
                         }
                     };
 
-                subpath.segments.push(closing_seg);
+                subpath.push_segment(closing_seg, vector_geom::VertexMode::Corner);
                 subpath.closed = true;
             }
         }
@@ -436,6 +447,8 @@ impl PenState {
             return;
         };
         subpath.segments.truncate(self.committed_count);
+        // +1 because vertex_modes[0] is the start point.
+        subpath.vertex_modes.truncate(self.committed_count + 1);
     }
 
     /// Get a mutable reference to the building subpath.
@@ -448,9 +461,11 @@ impl PenState {
     }
 
     /// Push a segment onto the building subpath.
+    /// The vertex mode for the new endpoint defaults to Corner;
+    /// it gets upgraded to Symmetric on drag release.
     fn push_segment(&self, scene: &mut Scene, segment: Segment) {
         if let Some(subpath) = self.get_subpath_mut(scene) {
-            subpath.segments.push(segment);
+            subpath.push_segment(segment, vector_geom::VertexMode::Corner);
         }
     }
 

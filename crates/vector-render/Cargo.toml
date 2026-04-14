@@ -10,6 +10,7 @@ authors.workspace = true
 vector-geom = { path = "../vector-geom" }
 vector-scene = { path = "../vector-scene" }
 vector-tess = { path = "../vector-tess" }
+vector-text = { path = "../vector-text" }
 vector-tools = { path = "../vector-tools" }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }

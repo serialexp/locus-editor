@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
-use vector_geom::{Affine, Color, Path, Point, Segment, SubPath};
-use vector_scene::Node;
+use vector_geom::{Affine, Color, Path, Point, Segment, SubPath, VertexMode};
+use vector_scene::{Node, TextData};
 use vector_scene::{NodeData, NodeId, Scene, Style};
 
 /// Import an SVG file from bytes into a scene graph.
 pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
-    let opts = usvg::Options::default();
+    let mut opts = usvg::Options::default();
+    // Load system fonts so usvg can shape text nodes. Without this,
+    // text elements are silently dropped during parsing.
+    opts.fontdb_mut().load_system_fonts();
     let tree = usvg::Tree::from_data(data, &opts).map_err(ImportError::Parse)?;
 
     let mut scene = Scene::new();
@@ -22,6 +25,19 @@ pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
     Ok(scene)
 }
 
+/// Returns true if a usvg Group carries no meaningful attributes beyond
+/// being a container — i.e. identity transform, full opacity, normal blend,
+/// no clip/mask/filters, and no user-assigned ID.
+fn is_trivial_group(g: &usvg::Group) -> bool {
+    g.transform() == usvg::Transform::identity()
+        && g.opacity() == usvg::Opacity::ONE
+        && g.blend_mode() == usvg::BlendMode::Normal
+        && g.clip_path().is_none()
+        && g.mask().is_none()
+        && g.filters().is_empty()
+        && g.id().is_empty()
+}
+
 fn import_group(
     group: &usvg::Group,
     scene: &mut Scene,
@@ -31,9 +47,25 @@ fn import_group(
     for child in group.children() {
         match child {
             usvg::Node::Group(g) => {
-                let node = Node::group(g.id().to_string());
-                if let Some(id) = scene.insert(parent, node) {
-                    import_group(g, scene, id, gradient_cache);
+                if is_trivial_group(g) {
+                    // Skip trivial wrapper groups — import children directly
+                    // into the current parent.
+                    import_group(g, scene, parent, gradient_cache);
+                } else {
+                    let mut node = Node::group(g.id().to_string());
+                    // Preserve the group's transform.
+                    let ut = g.transform();
+                    node.transform = Affine {
+                        a: ut.sx as f64,
+                        b: ut.kx as f64,
+                        c: ut.ky as f64,
+                        d: ut.sy as f64,
+                        tx: ut.tx as f64,
+                        ty: ut.ty as f64,
+                    };
+                    if let Some(id) = scene.insert(parent, node) {
+                        import_group(g, scene, id, gradient_cache);
+                    }
                 }
             }
             usvg::Node::Path(p) => {
@@ -49,10 +81,8 @@ fn import_group(
                 log::warn!("Image nodes not yet supported, skipping");
             }
             usvg::Node::Text(t) => {
-                log::warn!(
-                    "Text node '{}' not yet fully supported, importing as group",
-                    t.id()
-                );
+                let text_node = convert_text(t);
+                scene.insert(parent, text_node);
             }
         }
     }
@@ -72,26 +102,35 @@ fn convert_path(data: &usvg::tiny_skia_path::Path) -> Path {
             }
             usvg::tiny_skia_path::PathSegment::LineTo(pt) => {
                 if let Some(sp) = &mut current_subpath {
-                    sp.segments.push(Segment::Line {
-                        to: Point::new(pt.x as f64, pt.y as f64),
-                    });
+                    sp.push_segment(
+                        Segment::Line {
+                            to: Point::new(pt.x as f64, pt.y as f64),
+                        },
+                        VertexMode::Corner,
+                    );
                 }
             }
             usvg::tiny_skia_path::PathSegment::QuadTo(ctrl, to) => {
                 if let Some(sp) = &mut current_subpath {
-                    sp.segments.push(Segment::Quad {
-                        ctrl: Point::new(ctrl.x as f64, ctrl.y as f64),
-                        to: Point::new(to.x as f64, to.y as f64),
-                    });
+                    sp.push_segment(
+                        Segment::Quad {
+                            ctrl: Point::new(ctrl.x as f64, ctrl.y as f64),
+                            to: Point::new(to.x as f64, to.y as f64),
+                        },
+                        VertexMode::Corner,
+                    );
                 }
             }
             usvg::tiny_skia_path::PathSegment::CubicTo(ctrl1, ctrl2, to) => {
                 if let Some(sp) = &mut current_subpath {
-                    sp.segments.push(Segment::Cubic {
-                        ctrl1: Point::new(ctrl1.x as f64, ctrl1.y as f64),
-                        ctrl2: Point::new(ctrl2.x as f64, ctrl2.y as f64),
-                        to: Point::new(to.x as f64, to.y as f64),
-                    });
+                    sp.push_segment(
+                        Segment::Cubic {
+                            ctrl1: Point::new(ctrl1.x as f64, ctrl1.y as f64),
+                            ctrl2: Point::new(ctrl2.x as f64, ctrl2.y as f64),
+                            to: Point::new(to.x as f64, to.y as f64),
+                        },
+                        VertexMode::Corner,
+                    );
                 }
             }
             usvg::tiny_skia_path::PathSegment::Close => {
@@ -161,6 +200,97 @@ fn convert_style(
     });
 
     Style { fill, stroke }
+}
+
+/// Convert a usvg `Text` node into our `Node` with `TextData`.
+///
+/// Extracts font info from the first span of the first chunk. Concatenates
+/// all chunk text into a single string. The node's transform is taken from
+/// usvg's absolute transform, and the text position from chunk x/y.
+fn convert_text(t: &usvg::Text) -> Node {
+    // Concatenate all chunk text.
+    let content: String = t.chunks().iter().map(|c| c.text().to_string()).collect();
+
+    // Extract font info from the first span of the first chunk (fallback defaults).
+    let (font_family, font_size) = t
+        .chunks()
+        .first()
+        .and_then(|c| c.spans().first())
+        .map(|span| {
+            let family = span
+                .font()
+                .families()
+                .first()
+                .map(|f| match f {
+                    usvg::FontFamily::Named(name) => name.to_string(),
+                    usvg::FontFamily::Serif => "serif".to_string(),
+                    usvg::FontFamily::SansSerif => "sans-serif".to_string(),
+                    usvg::FontFamily::Cursive => "cursive".to_string(),
+                    usvg::FontFamily::Fantasy => "fantasy".to_string(),
+                    usvg::FontFamily::Monospace => "monospace".to_string(),
+                })
+                .unwrap_or_else(|| "sans-serif".to_string());
+            let size = span.font_size().get() as f64;
+            (family, size)
+        })
+        .unwrap_or_else(|| ("sans-serif".to_string(), 16.0));
+
+    // Extract fill from the first span (text often has per-span fill).
+    let fill = t
+        .chunks()
+        .first()
+        .and_then(|c| c.spans().first())
+        .and_then(|span| {
+            span.fill().map(|f| {
+                let paint = match f.paint() {
+                    usvg::Paint::Color(c) => {
+                        vector_scene::PaintRef::Solid(Color::from_srgb8(c.red, c.green, c.blue, 255))
+                    }
+                    _ => vector_scene::PaintRef::Solid(Color::BLACK),
+                };
+                vector_scene::style::Fill {
+                    paint,
+                    rule: vector_scene::FillRule::NonZero,
+                    opacity: f.opacity().get(),
+                }
+            })
+        })
+        .unwrap_or(vector_scene::style::Fill {
+            paint: vector_scene::PaintRef::Solid(Color::BLACK),
+            rule: vector_scene::FillRule::NonZero,
+            opacity: 1.0,
+        });
+
+    let style = Style {
+        fill: Some(fill),
+        stroke: None,
+    };
+
+    // Convert usvg's absolute transform to our Affine. The text position
+    // (chunk x/y) is baked into the transform by usvg.
+    let ut = t.abs_transform();
+    let transform = Affine {
+        a: ut.sx as f64,
+        b: ut.kx as f64,
+        c: ut.ky as f64,
+        d: ut.sy as f64,
+        tx: ut.tx as f64,
+        ty: ut.ty as f64,
+    };
+
+    Node {
+        label: t.id().to_string(),
+        transform,
+        data: NodeData::Text(TextData {
+            content,
+            font_family,
+            font_size,
+            style,
+        }),
+        children: Vec::new(),
+        visible: true,
+        locked: false,
+    }
 }
 
 /// Convert a usvg `Paint` into our `PaintRef`, creating gradient nodes in
@@ -437,5 +567,34 @@ mod tests {
             gradient_ref_count, 2,
             "both paths should reference gradient via PaintRef::Ref"
         );
+    }
+
+    #[test]
+    fn import_text_node() {
+        let svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <text x="10" y="50" font-family="Arial" font-size="24" fill="red">Hello World</text>
+            </svg>
+        "#;
+        let scene = import_svg(svg.as_bytes()).unwrap();
+
+        // Find the text node.
+        let root = scene.root();
+        let root_node = scene.get(root).unwrap();
+        let text_node = root_node.children.iter().find_map(|&id| {
+            let node = scene.get(id)?;
+            if let NodeData::Text(ref text) = node.data {
+                Some(text.clone())
+            } else {
+                None
+            }
+        });
+
+        assert!(text_node.is_some(), "should have a text node");
+        let text = text_node.unwrap();
+        assert_eq!(text.content, "Hello World");
+        assert_eq!(text.font_size, 24.0);
+        // Fill should be red (or close to it).
+        assert!(text.style.fill.is_some(), "text should have a fill");
     }
 }

@@ -61,6 +61,21 @@ impl Segment {
         }
     }
 
+    // ── Arc length ──────────────────────────────────────────────────
+
+    /// Approximate arc length of this segment using Gauss-Legendre quadrature.
+    /// `from` is the implicit start point.
+    pub fn arc_length(&self, from: Point) -> f64 {
+        match self {
+            Segment::Line { to } => from.distance(*to),
+            _ => {
+                // 16-point Gauss-Legendre quadrature on [0, 1].
+                // Integrates ||r'(t)|| dt by sampling the derivative magnitude.
+                gauss_legendre_arc_length(self, from)
+            }
+        }
+    }
+
     // ── Evaluation ──────────────────────────────────────────────────
 
     /// Evaluate the point on this segment at parameter `t` ∈ [0, 1].
@@ -409,6 +424,68 @@ fn split_cubic(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> (Segment, 
             to: p3,
         },
     )
+}
+
+/// 16-point Gauss-Legendre arc length estimation for any segment type.
+/// Approximates ∫₀¹ ||r'(t)|| dt by sampling positions at quadrature nodes
+/// and computing finite-difference derivatives.
+fn gauss_legendre_arc_length(seg: &Segment, from: Point) -> f64 {
+    // 16-point Gauss-Legendre nodes and weights on [-1, 1].
+    const NODES: [f64; 16] = [
+        -0.989400934991650,
+        -0.944575023073233,
+        -0.865631202387832,
+        -0.755404408355003,
+        -0.617876244402644,
+        -0.458016777657227,
+        -0.281603550779259,
+        -0.095012509837637,
+        0.095012509837637,
+        0.281603550779259,
+        0.458016777657227,
+        0.617876244402644,
+        0.755404408355003,
+        0.865631202387832,
+        0.944575023073233,
+        0.989400934991650,
+    ];
+    const WEIGHTS: [f64; 16] = [
+        0.027152459411754,
+        0.062253523938648,
+        0.095158511682493,
+        0.124628971255534,
+        0.149595988816577,
+        0.169156519395003,
+        0.182603415044924,
+        0.189450610455069,
+        0.189450610455069,
+        0.182603415044924,
+        0.169156519395003,
+        0.149595988816577,
+        0.124628971255534,
+        0.095158511682493,
+        0.062253523938648,
+        0.027152459411754,
+    ];
+
+    let h = 1e-7;
+    let mut sum = 0.0;
+    for i in 0..16 {
+        // Map from [-1, 1] to [0, 1]: t = (node + 1) / 2
+        let t = (NODES[i] + 1.0) * 0.5;
+        // Central finite difference for derivative
+        let t_lo = (t - h).max(0.0);
+        let t_hi = (t + h).min(1.0);
+        let dt = t_hi - t_lo;
+        let p_lo = seg.eval_at(from, t_lo);
+        let p_hi = seg.eval_at(from, t_hi);
+        let dx = (p_hi.x - p_lo.x) / dt;
+        let dy = (p_hi.y - p_lo.y) / dt;
+        let speed = (dx * dx + dy * dy).sqrt();
+        // Factor of 0.5 for the change of variable from [-1,1] to [0,1]
+        sum += WEIGHTS[i] * speed * 0.5;
+    }
+    sum
 }
 
 #[cfg(test)]

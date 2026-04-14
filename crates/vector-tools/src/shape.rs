@@ -4,7 +4,7 @@
 //! drag to set the opposite corner, release to finalize. During the drag
 //! a live-preview node is inserted into the scene and updated each frame.
 
-use vector_geom::{Color, Path, Point, Segment, SubPath, Vec2};
+use vector_geom::{Color, Path, Point, Segment, SubPath, Vec2, VertexMode};
 use vector_scene::{NodeData, NodeId, Scene};
 
 use crate::ToolType;
@@ -137,6 +137,7 @@ fn build_rect_path(a: [f64; 2], b: [f64; 2]) -> Path {
             },
         ],
         closed: true,
+        vertex_modes: vec![VertexMode::Corner; 4],
     });
     path
 }
@@ -199,6 +200,8 @@ fn build_ellipse_path(a: [f64; 2], b: [f64; 2]) -> Path {
             },
         ],
         closed: true,
+        // Ellipse arcs meet smoothly at each quadrant point.
+        vertex_modes: vec![VertexMode::Smooth; 5],
     });
     path
 }

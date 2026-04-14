@@ -9,5 +9,6 @@ authors.workspace = true
 [dependencies]
 vector-geom = { path = "../vector-geom" }
 vector-scene = { path = "../vector-scene" }
+vector-text = { path = "../vector-text" }
 vector-ops = { path = "../vector-ops" }
 egui-phosphor = { workspace = true }

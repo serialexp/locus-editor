@@ -10,3 +10,5 @@ authors.workspace = true
 vector-geom = { path = "../vector-geom" }
 rustybuzz = { workspace = true }
 ttf-parser = { workspace = true }
+fontdb = { workspace = true }
+log = { workspace = true }

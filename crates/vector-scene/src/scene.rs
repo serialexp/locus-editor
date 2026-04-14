@@ -207,8 +207,19 @@ impl Scene {
         xform
     }
 
-    /// Compute the bounding box of all visible path content (skipping defs),
-    /// taking group transforms into account.
+    /// Compute the accumulated world transform of a node's *parent chain*,
+    /// excluding the node's own transform. Useful for converting a world-space
+    /// delta into the local space where the node's transform operates.
+    pub fn parent_world_transform(&self, id: NodeId) -> vector_geom::Affine {
+        let parent_id = match self.parents.get(id) {
+            Some(&p) => p,
+            None => return vector_geom::Affine::IDENTITY,
+        };
+        self.world_transform(parent_id)
+    }
+
+    /// Compute the bounding box of all visible content (paths and text),
+    /// skipping defs, taking group transforms into account.
     pub fn content_bounds(&self) -> vector_geom::Bounds {
         let mut bounds = vector_geom::Bounds::EMPTY;
         self.walk_depth_first(
@@ -218,11 +229,18 @@ impl Scene {
                 if !node.visible {
                     return;
                 }
-                if let crate::node::NodeData::Path { ref path, .. } = node.data {
-                    let path_bounds = path.bounding_box().transform(world);
-                    if !path_bounds.is_empty() {
-                        bounds = bounds.union(path_bounds);
+                let node_bounds = match node.data {
+                    crate::node::NodeData::Path { ref path, .. } => {
+                        path.bounding_box().transform(world)
                     }
+                    crate::node::NodeData::Text(ref text) => {
+                        vector_text::text_bounds(&text.content, &text.font_family, text.font_size)
+                            .transform(world)
+                    }
+                    _ => return,
+                };
+                if !node_bounds.is_empty() {
+                    bounds = bounds.union(node_bounds);
                 }
             },
         );
@@ -292,7 +310,7 @@ impl Default for Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vector_geom::{Path, Point, Segment, SubPath};
+    use vector_geom::{Path, Point, Segment, SubPath, VertexMode};
 
     fn make_test_path() -> Path {
         let mut path = Path::new();
@@ -302,6 +320,7 @@ mod tests {
                 to: Point::new(100.0, 100.0),
             }],
             closed: false,
+            vertex_modes: vec![VertexMode::Corner; 2],
         });
         path
     }

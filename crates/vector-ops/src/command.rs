@@ -109,7 +109,7 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vector_geom::{Path, Point, Segment, SubPath};
+    use vector_geom::{Path, Point, Segment, SubPath, VertexMode};
     use vector_scene::{Node, NodeData};
 
     fn make_test_path() -> Path {
@@ -120,6 +120,7 @@ mod tests {
                 to: Point::new(100.0, 100.0),
             }],
             closed: false,
+            vertex_modes: vec![VertexMode::Corner; 2],
         });
         path
     }
@@ -199,6 +200,7 @@ mod tests {
                 to: Point::new(200.0, 200.0),
             }],
             closed: true,
+            vertex_modes: vec![VertexMode::Corner; 2],
         });
 
         let cmd = Command::SetPathData {

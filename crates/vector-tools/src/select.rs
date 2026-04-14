@@ -1,5 +1,17 @@
-use vector_geom::{Point, Segment};
+use vector_geom::{Affine, Bounds, Point, Segment, VertexMode};
 use vector_scene::{NodeData, NodeId, Scene};
+
+/// Compute the world-space bounding box for a node's visual content.
+fn node_bounds(data: &NodeData, world: Affine) -> Bounds {
+    match data {
+        NodeData::Path { path, .. } => path.bounding_box().transform(world),
+        NodeData::Text(text) => {
+            vector_text::text_bounds(&text.content, &text.font_family, text.font_size)
+                .transform(world)
+        }
+        _ => Bounds::EMPTY,
+    }
+}
 
 /// Which specific point within a segment we're referring to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -103,6 +115,265 @@ impl VertexRef {
     }
 }
 
+/// After moving a control point, enforce the vertex mode constraint on
+/// the opposite handle at the same anchor vertex.
+fn enforce_vertex_constraint(vr: &VertexRef, scene: &mut Scene) {
+    let Some(node) = scene.get_mut(vr.node) else {
+        return;
+    };
+    let NodeData::Path { ref mut path, .. } = node.data else {
+        return;
+    };
+    let Some(subpath) = path.subpaths.get_mut(vr.subpath) else {
+        return;
+    };
+
+    match vr.kind {
+        PointKind::CubicCtrl1 => {
+            // ctrl1 of segment[seg] belongs to anchor at vertex_modes[seg].
+            let anchor_mode = subpath
+                .vertex_modes
+                .get(vr.segment)
+                .copied()
+                .unwrap_or(VertexMode::Corner);
+            if anchor_mode == VertexMode::Corner {
+                return;
+            }
+
+            // The anchor point is the endpoint of segment[seg-1], or subpath.start.
+            let anchor = if vr.segment == 0 {
+                subpath.start
+            } else {
+                subpath.segments[vr.segment - 1].endpoint()
+            };
+
+            let ctrl1 = match &subpath.segments[vr.segment] {
+                Segment::Cubic { ctrl1, .. } => *ctrl1,
+                _ => return,
+            };
+
+            // The opposite handle is ctrl2 of segment[seg-1] (incoming to anchor).
+            if vr.segment == 0 {
+                return; // No previous segment to constrain.
+            }
+            let prev = &mut subpath.segments[vr.segment - 1];
+            match prev {
+                Segment::Cubic { ctrl2, .. } => {
+                    mirror_handle(anchor, ctrl1, ctrl2, anchor_mode);
+                }
+                Segment::Quad { ctrl, .. } => {
+                    mirror_handle(anchor, ctrl1, ctrl, anchor_mode);
+                }
+                _ => {}
+            }
+        }
+        PointKind::CubicCtrl2 => {
+            // ctrl2 of segment[seg] belongs to anchor at vertex_modes[seg+1].
+            let anchor_mode = subpath
+                .vertex_modes
+                .get(vr.segment + 1)
+                .copied()
+                .unwrap_or(VertexMode::Corner);
+            if anchor_mode == VertexMode::Corner {
+                return;
+            }
+
+            let anchor = subpath.segments[vr.segment].endpoint();
+            let ctrl2 = match &subpath.segments[vr.segment] {
+                Segment::Cubic { ctrl2, .. } => *ctrl2,
+                _ => return,
+            };
+
+            // The opposite handle is ctrl1 of segment[seg+1] (outgoing from anchor).
+            let next_idx = vr.segment + 1;
+            if next_idx >= subpath.segments.len() {
+                return; // No next segment to constrain.
+            }
+            let next = &mut subpath.segments[next_idx];
+            match next {
+                Segment::Cubic { ctrl1, .. } => {
+                    mirror_handle(anchor, ctrl2, ctrl1, anchor_mode);
+                }
+                Segment::Quad { ctrl, .. } => {
+                    mirror_handle(anchor, ctrl2, ctrl, anchor_mode);
+                }
+                _ => {}
+            }
+        }
+        PointKind::QuadCtrl => {
+            // Quad control point affects both the "from" and "to" anchors.
+            // For simplicity, constrain the "from" anchor's opposite handle
+            // (incoming) and the "to" anchor's opposite handle (outgoing).
+            // This is complex for quads; skip for now since quads are rare
+            // in practice (most curves are cubics).
+        }
+        _ => {
+            // Endpoints and SubpathStart don't trigger handle constraints.
+        }
+    }
+}
+
+/// Fraction of segment length to place initial cubic handles at.
+const HANDLE_FRACTION: f64 = 1.0 / 3.0;
+
+/// Ensure that the segments adjacent to anchor `mode_idx` are cubics with
+/// handles visibly offset from the anchor. Converts Lines to Cubics and
+/// spreads handles that sit directly on the anchor.
+///
+/// Only the control point belonging to `mode_idx` is spread out; the control
+/// point belonging to the neighboring vertex stays collapsed at the neighbor's
+/// position so it doesn't create a spurious visible handle there.
+///
+/// Handles wrap-around for closed subpaths: vertex 0's incoming is the last
+/// segment, and the last vertex's outgoing is segment 0.
+fn ensure_cubic_handles(subpath: &mut vector_geom::SubPath, mode_idx: usize) {
+    let n_segs = subpath.segments.len();
+    if n_segs == 0 {
+        return;
+    }
+
+    // The anchor point at this mode index.
+    let anchor = if mode_idx == 0 {
+        subpath.start
+    } else {
+        subpath.segments[mode_idx - 1].endpoint()
+    };
+
+    // Determine incoming and outgoing segment indices.
+    // For open paths, first/last vertex may lack one side.
+    // For closed paths, they wrap around.
+    let incoming_idx: Option<usize> = if mode_idx > 0 {
+        Some(mode_idx - 1)
+    } else if subpath.closed && n_segs > 0 {
+        Some(n_segs - 1) // wrap: last segment leads into start
+    } else {
+        None
+    };
+
+    let outgoing_idx: Option<usize> = if mode_idx < n_segs {
+        Some(mode_idx)
+    } else if subpath.closed && n_segs > 0 {
+        Some(0) // wrap: segment 0 leads out from the last vertex
+    } else {
+        None
+    };
+
+    // --- Incoming segment: our handle is ctrl2 ---
+    // ctrl1 belongs to the previous vertex → collapse it at `from`.
+    if let Some(seg_idx) = incoming_idx {
+        let from = if seg_idx == 0 {
+            subpath.start
+        } else {
+            subpath.segments[seg_idx - 1].endpoint()
+        };
+        let seg = &mut subpath.segments[seg_idx];
+        match seg {
+            Segment::Line { to } => {
+                let dx = to.x - from.x;
+                let dy = to.y - from.y;
+                *seg = Segment::Cubic {
+                    ctrl1: from,
+                    ctrl2: Point::new(
+                        anchor.x - dx * HANDLE_FRACTION,
+                        anchor.y - dy * HANDLE_FRACTION,
+                    ),
+                    to: *to,
+                };
+            }
+            Segment::Cubic { ctrl2, .. } => {
+                let d = ((ctrl2.x - anchor.x).powi(2) + (ctrl2.y - anchor.y).powi(2)).sqrt();
+                if d < 1e-6 {
+                    let dx = anchor.x - from.x;
+                    let dy = anchor.y - from.y;
+                    ctrl2.x = anchor.x - dx * HANDLE_FRACTION;
+                    ctrl2.y = anchor.y - dy * HANDLE_FRACTION;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Outgoing segment: our handle is ctrl1 ---
+    // ctrl2 belongs to the next vertex → collapse it at `to`.
+    if let Some(seg_idx) = outgoing_idx {
+        let seg = &mut subpath.segments[seg_idx];
+        match seg {
+            Segment::Line { to } => {
+                let dx = to.x - anchor.x;
+                let dy = to.y - anchor.y;
+                *seg = Segment::Cubic {
+                    ctrl1: Point::new(
+                        anchor.x + dx * HANDLE_FRACTION,
+                        anchor.y + dy * HANDLE_FRACTION,
+                    ),
+                    ctrl2: *to,
+                    to: *to,
+                };
+            }
+            Segment::Cubic { ctrl1, .. } => {
+                let d = ((ctrl1.x - anchor.x).powi(2) + (ctrl1.y - anchor.y).powi(2)).sqrt();
+                if d < 1e-6 {
+                    let to = subpath.segments[seg_idx].endpoint();
+                    let dx = to.x - anchor.x;
+                    let dy = to.y - anchor.y;
+                    if let Segment::Cubic { ctrl1, .. } = &mut subpath.segments[seg_idx] {
+                        ctrl1.x = anchor.x + dx * HANDLE_FRACTION;
+                        ctrl1.y = anchor.y + dy * HANDLE_FRACTION;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Enforce the constraint so the two handles are consistent with the mode.
+    // Use the outgoing handle as the "source" to mirror/constrain the incoming.
+    let new_mode = subpath
+        .vertex_modes
+        .get(mode_idx)
+        .copied()
+        .unwrap_or(VertexMode::Corner);
+    if new_mode == VertexMode::Corner {
+        return;
+    }
+
+    if let (Some(out_idx), Some(in_idx)) = (outgoing_idx, incoming_idx)
+        && let Segment::Cubic { ctrl1, .. } = subpath.segments[out_idx]
+        && let Segment::Cubic { ctrl2, .. } = &mut subpath.segments[in_idx]
+    {
+        mirror_handle(anchor, ctrl1, ctrl2, new_mode);
+    }
+}
+
+/// Mirror `opposite` around `anchor` to match the direction (and optionally
+/// distance) of `moved`. Mutates `opposite` in place.
+fn mirror_handle(anchor: Point, moved: Point, opposite: &mut Point, mode: VertexMode) {
+    let dx = moved.x - anchor.x;
+    let dy = moved.y - anchor.y;
+
+    match mode {
+        VertexMode::Symmetric => {
+            // Mirror: same distance, opposite direction.
+            opposite.x = anchor.x - dx;
+            opposite.y = anchor.y - dy;
+        }
+        VertexMode::Smooth => {
+            // Keep opposite's distance but constrain direction to be opposite.
+            let moved_len = (dx * dx + dy * dy).sqrt();
+            if moved_len < 1e-12 {
+                return;
+            }
+            let opp_dx = opposite.x - anchor.x;
+            let opp_dy = opposite.y - anchor.y;
+            let opp_len = (opp_dx * opp_dx + opp_dy * opp_dy).sqrt();
+            // Opposite direction, same length as before.
+            opposite.x = anchor.x - dx / moved_len * opp_len;
+            opposite.y = anchor.y - dy / moved_len * opp_len;
+        }
+        VertexMode::Corner => {} // No constraint.
+    }
+}
+
 fn translate_endpoint(seg: &mut Segment, dx: f64, dy: f64) {
     match seg {
         Segment::Line { to } => {
@@ -130,6 +401,8 @@ enum DragMode {
     Idle,
     /// Dragging selected vertices. Stores last canvas position.
     MoveVertices { prev: [f64; 2] },
+    /// Dragging entire objects by translating their transforms.
+    MoveObjects { prev: [f64; 2] },
     /// Drawing a marquee rectangle. Stores the anchor corner in canvas coords
     /// and whether shift was held at the start.
     Marquee {
@@ -139,13 +412,23 @@ enum DragMode {
     },
 }
 
+/// Whether we're showing the bounding box (object level) or individual
+/// vertex handles (node editing level).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Show bounding box around selected objects. Dragging moves the whole object.
+    Object,
+    /// Show individual vertex handles. Dragging moves vertices.
+    Node,
+}
+
 /// State for the select tool — tracks object and vertex selection.
 ///
 /// Selection is two-level:
 /// 1. **Object selection** (`selected_nodes`) — which paths/groups are active.
-///    Handles are shown for object-selected nodes.
+///    In `Object` mode, a bounding box is shown around them.
 /// 2. **Vertex selection** (`selected`) — individual control points within
-///    object-selected nodes, for direct manipulation.
+///    object-selected nodes, for direct manipulation. Only active in `Node` mode.
 pub struct SelectState {
     /// Object-level selection: which nodes are "active".
     pub selected_nodes: Vec<NodeId>,
@@ -155,8 +438,14 @@ pub struct SelectState {
     pub selected: Vec<VertexRef>,
     /// Vertex currently under the cursor (only within object-selected nodes).
     pub hovered: Option<VertexRef>,
+    /// World-space position of a ghost vertex on an edge near the cursor.
+    /// Shown when the cursor is near an edge but not near an existing vertex,
+    /// indicating where a double-click would insert a new point.
+    pub edge_hover_point: Option<Point>,
     /// Current drag mode.
     drag_mode: DragMode,
+    /// Whether we're in object mode (bounding box) or node mode (vertex handles).
+    pub mode: SelectionMode,
 }
 
 impl Default for SelectState {
@@ -166,7 +455,9 @@ impl Default for SelectState {
             marquee_preview_nodes: Vec::new(),
             selected: Vec::new(),
             hovered: None,
+            edge_hover_point: None,
             drag_mode: DragMode::Idle,
+            mode: SelectionMode::Object,
         }
     }
 }
@@ -319,11 +610,9 @@ impl SelectState {
                 if !node.visible {
                     return;
                 }
-                if let NodeData::Path { ref path, .. } = node.data {
-                    let bounds = path.bounding_box().transform(world);
-                    if !bounds.is_empty() && bounds.contains_point(target) {
-                        best = Some(id);
-                    }
+                let bounds = node_bounds(&node.data, world);
+                if !bounds.is_empty() && bounds.contains_point(target) {
+                    best = Some(id);
                 }
             },
         );
@@ -331,7 +620,7 @@ impl SelectState {
         best
     }
 
-    /// Find all visible path nodes whose bounding boxes intersect the given rect.
+    /// Find all visible nodes whose bounding boxes intersect the given rect.
     pub fn objects_in_rect(scene: &Scene, min: [f64; 2], max: [f64; 2]) -> Vec<NodeId> {
         let query =
             vector_geom::Bounds::new(Point::new(min[0], min[1]), Point::new(max[0], max[1]));
@@ -345,11 +634,9 @@ impl SelectState {
                 if !node.visible {
                     return;
                 }
-                if let NodeData::Path { ref path, .. } = node.data {
-                    let bounds = path.bounding_box().transform(world);
-                    if !bounds.is_empty() && bounds.intersects(query) {
-                        result.push(id);
-                    }
+                let bounds = node_bounds(&node.data, world);
+                if !bounds.is_empty() && bounds.intersects(query) {
+                    result.push(id);
                 }
             },
         );
@@ -361,78 +648,162 @@ impl SelectState {
 
     /// Update the hover state for vertices within object-selected nodes.
     /// Returns `true` if the hovered vertex changed (caller should request redraw).
+    /// Only active in `Node` mode — in `Object` mode, hover is always `None`.
     pub fn update_hover(&mut self, scene: &Scene, canvas_pos: [f64; 2], zoom: f64) -> bool {
-        let new_hover = if self.selected_nodes.is_empty() {
+        let mut changed = false;
+
+        let new_hover = if self.mode != SelectionMode::Node || self.selected_nodes.is_empty() {
             None
         } else {
             Self::hit_test_in_nodes(scene, canvas_pos, zoom, &self.selected_nodes)
         };
         if new_hover != self.hovered {
             self.hovered = new_hover;
-            true
-        } else {
-            false
+            changed = true;
         }
+
+        // When no vertex is hovered, check for an edge nearby to show
+        // a ghost insertion point.
+        let new_edge_pt = if self.mode == SelectionMode::Node
+            && self.hovered.is_none()
+            && !self.selected_nodes.is_empty()
+        {
+            Self::edge_hover_position(scene, canvas_pos, zoom, &self.selected_nodes)
+        } else {
+            None
+        };
+        if new_edge_pt != self.edge_hover_point {
+            self.edge_hover_point = new_edge_pt;
+            changed = true;
+        }
+
+        changed
     }
 
     // ── Press / drag / release ───────────────────────────────────────
 
-    /// Handle a mouse press at `canvas_pos`.
-    ///
-    /// Priority:
-    /// 1. Vertex hit on an already-object-selected node → vertex select + drag.
-    /// 2. Object hit on any visible path → object select (clears vertex selection).
-    /// 3. Empty space → clear all, start marquee for object selection.
-    pub fn on_press(&mut self, scene: &Scene, canvas_pos: [f64; 2], shift: bool, zoom: f64) {
-        // 1. Try vertex hit within object-selected nodes.
-        let vertex_hit = if !self.selected_nodes.is_empty() {
-            Self::hit_test_in_nodes(scene, canvas_pos, zoom, &self.selected_nodes)
-        } else {
-            None
+    /// Enter node editing mode for the currently selected objects.
+    /// Shows vertex handles instead of the bounding box.
+    pub fn enter_node_mode(&mut self) {
+        if !self.selected_nodes.is_empty() {
+            self.mode = SelectionMode::Node;
+        }
+    }
+
+    /// Exit node editing mode, returning to object mode.
+    /// Clears vertex selection but keeps object selection.
+    pub fn exit_node_mode(&mut self) {
+        self.mode = SelectionMode::Object;
+        self.selected.clear();
+        self.hovered = None;
+    }
+
+    /// Cycle the vertex mode of the anchor vertex at `vr` through
+    /// Corner → Smooth → Symmetric → Corner.
+    /// Only applies to anchor points (SubpathStart or Endpoint).
+    /// Returns the new mode, or None if inapplicable.
+    pub fn cycle_vertex_mode(scene: &mut Scene, vr: &VertexRef) -> Option<VertexMode> {
+        let node = scene.get_mut(vr.node)?;
+        let NodeData::Path { ref mut path, .. } = node.data else {
+            return None;
+        };
+        let subpath = path.subpaths.get_mut(vr.subpath)?;
+
+        // Determine which vertex_modes index this anchor maps to.
+        let mode_idx = match vr.kind {
+            PointKind::SubpathStart => 0,
+            PointKind::Endpoint => vr.segment + 1,
+            // Control points aren't anchors — cycle the anchor they belong to.
+            PointKind::CubicCtrl1 | PointKind::QuadCtrl => vr.segment,
+            PointKind::CubicCtrl2 => vr.segment + 1,
         };
 
-        if let Some(vr) = vertex_hit {
-            // Vertex hit — do vertex-level selection.
-            if shift {
-                if let Some(idx) = self.selected.iter().position(|v| v == &vr) {
-                    self.selected.remove(idx);
-                } else {
-                    self.selected.push(vr);
-                }
-            } else if !self.selected.contains(&vr) {
-                self.selected.clear();
-                self.selected.push(vr);
-            }
-            self.drag_mode = DragMode::MoveVertices { prev: canvas_pos };
-            return;
+        let mode = subpath.vertex_modes.get_mut(mode_idx)?;
+        let old_mode = *mode;
+        *mode = match *mode {
+            VertexMode::Corner => VertexMode::Smooth,
+            VertexMode::Smooth => VertexMode::Symmetric,
+            VertexMode::Symmetric => VertexMode::Corner,
+        };
+        let new_mode = *mode;
+
+        // When switching FROM Corner TO Smooth/Symmetric, ensure adjacent
+        // segments are cubics with handles spread out from the anchor.
+        // Otherwise the control points sit on top of the vertex and are
+        // invisible/unselectable.
+        if old_mode == VertexMode::Corner && new_mode != VertexMode::Corner {
+            ensure_cubic_handles(subpath, mode_idx);
         }
 
-        // 2. Try object hit.
+        Some(new_mode)
+    }
+
+    /// Handle a mouse press at `canvas_pos`.
+    ///
+    /// In **Node** mode:
+    /// 1. Vertex hit on an object-selected node → vertex select + drag.
+    /// 2. Click outside all selected objects → exit to object mode.
+    ///
+    /// In **Object** mode:
+    /// 1. Object hit → object select.
+    /// 2. Empty space → clear all, start marquee.
+    pub fn on_press(&mut self, scene: &Scene, canvas_pos: [f64; 2], shift: bool, zoom: f64) {
+        if self.mode == SelectionMode::Node {
+            // In node mode, try vertex hit first.
+            let vertex_hit = if !self.selected_nodes.is_empty() {
+                Self::hit_test_in_nodes(scene, canvas_pos, zoom, &self.selected_nodes)
+            } else {
+                None
+            };
+
+            if let Some(vr) = vertex_hit {
+                if shift {
+                    if let Some(idx) = self.selected.iter().position(|v| v == &vr) {
+                        self.selected.remove(idx);
+                    } else {
+                        self.selected.push(vr);
+                    }
+                } else if !self.selected.contains(&vr) {
+                    self.selected.clear();
+                    self.selected.push(vr);
+                }
+                self.drag_mode = DragMode::MoveVertices { prev: canvas_pos };
+                return;
+            }
+
+            // Clicked outside vertices — exit node mode, fall through to
+            // object-level handling below.
+            self.exit_node_mode();
+        }
+
+        // Object mode: try object hit.
         let object_hit = Self::object_hit_test(scene, canvas_pos);
 
         if let Some(node_id) = object_hit {
-            // Clear vertex selection when changing object selection.
             self.selected.clear();
 
             if shift {
-                // Toggle node in object selection.
                 if let Some(idx) = self.selected_nodes.iter().position(|n| *n == node_id) {
                     self.selected_nodes.remove(idx);
                 } else {
                     self.selected_nodes.push(node_id);
                 }
-            } else if !self.selected_nodes.contains(&node_id) {
-                self.selected_nodes.clear();
-                self.selected_nodes.push(node_id);
+            } else {
+                if !self.selected_nodes.contains(&node_id) {
+                    self.selected_nodes.clear();
+                    self.selected_nodes.push(node_id);
+                }
+                // Start dragging all selected objects.
+                self.drag_mode = DragMode::MoveObjects { prev: canvas_pos };
             }
-            // Don't start a drag — object selection is instant.
             return;
         }
 
-        // 3. Empty space — clear and start marquee.
+        // Empty space — clear and start marquee.
         if !shift {
             self.selected_nodes.clear();
             self.selected.clear();
+            self.mode = SelectionMode::Object;
         }
         self.drag_mode = DragMode::Marquee {
             anchor: canvas_pos,
@@ -466,6 +837,46 @@ impl SelectState {
                         let local_dx = inv.a * dx + inv.b * dy;
                         let local_dy = inv.c * dx + inv.d * dy;
                         vr.translate(scene, local_dx, local_dy);
+                    }
+
+                    // Enforce smooth/symmetric constraints on the opposite handle.
+                    if matches!(
+                        vr.kind,
+                        PointKind::CubicCtrl1
+                            | PointKind::CubicCtrl2
+                            | PointKind::QuadCtrl
+                    ) {
+                        enforce_vertex_constraint(vr, scene);
+                    }
+                }
+
+                *prev = canvas_pos;
+                true
+            }
+            DragMode::MoveObjects { prev } => {
+                let dx = canvas_pos[0] - prev[0];
+                let dy = canvas_pos[1] - prev[1];
+
+                if dx == 0.0 && dy == 0.0 {
+                    return false;
+                }
+
+                // Translate each selected node's transform by the delta.
+                // Convert world-space delta to local-space, accounting for
+                // any parent group transforms.
+                for &node_id in &self.selected_nodes {
+                    let parent_world = scene.parent_world_transform(node_id);
+                    let (local_dx, local_dy) = if parent_world.is_identity() {
+                        (dx, dy)
+                    } else if let Some(inv) = parent_world.inverse() {
+                        (inv.a * dx + inv.b * dy, inv.c * dx + inv.d * dy)
+                    } else {
+                        continue;
+                    };
+
+                    if let Some(node) = scene.get_mut(node_id) {
+                        node.transform.tx += local_dx;
+                        node.transform.ty += local_dy;
                     }
                 }
 
@@ -509,6 +920,11 @@ impl SelectState {
     /// Whether we're currently dragging vertices (not marquee).
     pub fn is_dragging_vertices(&self) -> bool {
         matches!(self.drag_mode, DragMode::MoveVertices { .. })
+    }
+
+    /// Whether we're currently dragging whole objects.
+    pub fn is_dragging_objects(&self) -> bool {
+        matches!(self.drag_mode, DragMode::MoveObjects { .. })
     }
 
     /// Whether we're currently in any drag operation.
@@ -622,11 +1038,21 @@ impl SelectState {
                     if !subpath.segments.is_empty() {
                         subpath.start = subpath.segments[0].endpoint();
                         subpath.segments.remove(0);
+                        // Remove the start point's mode, shift the next one
+                        // into position 0 (it becomes the new start).
+                        if subpath.vertex_modes.len() > 1 {
+                            subpath.vertex_modes.remove(0);
+                        }
                     }
                 }
                 PointKind::Endpoint => {
                     if vr.segment < subpath.segments.len() {
                         subpath.segments.remove(vr.segment);
+                        // vertex_modes index for this endpoint is vr.segment + 1.
+                        let mode_idx = vr.segment + 1;
+                        if mode_idx < subpath.vertex_modes.len() {
+                            subpath.vertex_modes.remove(mode_idx);
+                        }
                     }
                 }
                 _ => {}
@@ -718,6 +1144,60 @@ impl SelectState {
         best.map(|(hit, _)| hit)
     }
 
+    /// Find the world-space point on the nearest edge to `canvas_pos`,
+    /// if one is within the hit radius. Used for the ghost insertion preview.
+    fn edge_hover_position(
+        scene: &Scene,
+        canvas_pos: [f64; 2],
+        zoom: f64,
+        nodes: &[NodeId],
+    ) -> Option<Point> {
+        let radius = HIT_RADIUS_SCREEN_PX / zoom;
+        let canvas_target = Point::new(canvas_pos[0], canvas_pos[1]);
+        let mut best: Option<(Point, f64)> = None;
+
+        for &node_id in nodes {
+            let Some(node) = scene.get(node_id) else {
+                continue;
+            };
+            if !node.visible {
+                continue;
+            }
+            let NodeData::Path { ref path, .. } = node.data else {
+                continue;
+            };
+
+            let world = scene.world_transform(node_id);
+            let target = if world.is_identity() {
+                canvas_target
+            } else if let Some(inv) = world.inverse() {
+                inv.apply(canvas_target)
+            } else {
+                continue;
+            };
+
+            for subpath in &path.subpaths {
+                let mut current = subpath.start;
+                for seg in &subpath.segments {
+                    let (t, _pt, dist) = seg.closest_point(current, target);
+                    if dist < radius && best.as_ref().is_none_or(|(_, bd)| dist < *bd) {
+                        // Compute world-space position of the point on the edge.
+                        let local_pt = seg.eval_at(current, t);
+                        let world_pt = if world.is_identity() {
+                            local_pt
+                        } else {
+                            world.apply(local_pt)
+                        };
+                        best = Some((world_pt, dist));
+                    }
+                    current = seg.endpoint();
+                }
+            }
+        }
+
+        best.map(|(pt, _)| pt)
+    }
+
     /// Insert a new anchor point on the edge described by `hit`, splitting
     /// the segment in two. Returns a `VertexRef` to the newly created point.
     pub fn insert_point_on_edge(scene: &mut Scene, hit: &EdgeHit) -> Option<VertexRef> {
@@ -744,6 +1224,8 @@ impl SelectState {
         // Replace the original segment with the two halves.
         subpath.segments[seg_idx] = first;
         subpath.segments.insert(seg_idx + 1, second);
+        // Insert a vertex mode for the new split point (Corner by default).
+        subpath.vertex_modes.insert(seg_idx + 1, VertexMode::Corner);
 
         // The new point is the endpoint of `first` (at seg_idx).
         Some(VertexRef {

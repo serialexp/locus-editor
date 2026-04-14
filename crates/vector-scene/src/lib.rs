@@ -8,4 +8,4 @@ pub use paint::{
     ColorStop, Gradient, GradientKind, InterpolationSpace, Paint, PaintRef, SpreadMethod,
 };
 pub use scene::{NodeId, NodeSnapshot, Scene};
-pub use style::{FillRule, LineCap, LineJoin, StrokeStyle, Style};
+pub use style::{FillRule, LineCap, LineJoin, Stroke, StrokeStyle, Style};

@@ -5,6 +5,7 @@ use lyon_tessellation::{
 
 use vector_geom::{Color, Path, Segment};
 
+use crate::dash::{DashPattern, dash_path};
 use crate::vertex::Vertex;
 
 /// Tessellated output: vertices + indices ready for GPU upload.
@@ -21,11 +22,38 @@ pub enum TessPaint {
     Gradient { index: i32 },
 }
 
+/// Line cap style for stroke ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineCap {
+    Butt,
+    Round,
+    Square,
+}
+
+/// Line join style for stroke corners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineJoin {
+    Miter,
+    Round,
+    Bevel,
+}
+
+/// Full stroke parameters for tessellation.
+#[derive(Debug, Clone)]
+pub struct StrokeParams {
+    pub paint: TessPaint,
+    pub width: f64,
+    pub cap: LineCap,
+    pub join: LineJoin,
+    pub miter_limit: f64,
+    pub dash: Option<DashPattern>,
+}
+
 /// Tessellate a path's fill and/or stroke into triangles.
 pub fn tessellate_path(
     path: &Path,
     fill: Option<TessPaint>,
-    stroke: Option<(TessPaint, f64)>,
+    stroke: Option<StrokeParams>,
 ) -> TessellatedMesh {
     let lyon_path = to_lyon_path(path);
 
@@ -50,12 +78,38 @@ pub fn tessellate_path(
             .expect("fill tessellation failed");
     }
 
-    if let Some((paint, width)) = stroke {
+    if let Some(params) = stroke {
+        let lyon_cap = match params.cap {
+            LineCap::Butt => lyon_tessellation::LineCap::Butt,
+            LineCap::Round => lyon_tessellation::LineCap::Round,
+            LineCap::Square => lyon_tessellation::LineCap::Square,
+        };
+        let lyon_join = match params.join {
+            LineJoin::Miter => lyon_tessellation::LineJoin::Miter,
+            LineJoin::Round => lyon_tessellation::LineJoin::Round,
+            LineJoin::Bevel => lyon_tessellation::LineJoin::Bevel,
+        };
+
+        let stroke_opts = StrokeOptions::default()
+            .with_line_width(params.width as f32)
+            .with_line_cap(lyon_cap)
+            .with_line_join(lyon_join)
+            .with_miter_limit(params.miter_limit as f32);
+
+        // If there's a dash pattern, expand the path into dashes first.
+        let stroke_path = if let Some(ref dash) = params.dash {
+            let dashed = dash_path(path, dash);
+            to_lyon_path(&dashed)
+        } else {
+            lyon_path.clone()
+        };
+
+        let paint = params.paint;
         let mut tessellator = StrokeTessellator::new();
         tessellator
             .tessellate_path(
-                &lyon_path,
-                &StrokeOptions::default().with_line_width(width as f32),
+                &stroke_path,
+                &stroke_opts,
                 &mut BuffersBuilder::new(
                     &mut buffers,
                     |vertex: lyon_tessellation::StrokeVertex| {
