@@ -150,41 +150,51 @@ impl Renderer {
         let mut all_vertices: Vec<Vertex> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
 
-        // Walk the visible tree (skip defs) and tessellate each path
+        // Walk the visible tree (skip defs) and tessellate each path.
+        // The world transform accumulated during the walk is applied to
+        // each vertex so that group transforms affect their children.
         let root = scene.root();
-        scene.walk_depth_first(
-            root,
-            Affine::IDENTITY,
-            &mut |_id, node, _world_transform| {
-                if !node.visible {
-                    return;
-                }
-                if let NodeData::Path {
-                    ref path,
-                    ref style,
-                } = node.data
-                {
-                    let fill_color = style.fill.as_ref().map(|f| match &f.paint {
+        scene.walk_depth_first(root, Affine::IDENTITY, &mut |_id, node, world_transform| {
+            if !node.visible {
+                return;
+            }
+            if let NodeData::Path {
+                ref path,
+                ref style,
+            } = node.data
+            {
+                let fill_color = style.fill.as_ref().map(|f| match &f.paint {
+                    vector_scene::PaintRef::Solid(c) => *c,
+                    _ => Color::BLACK, // TODO: gradient/pattern rendering
+                });
+
+                let stroke = style.stroke.as_ref().map(|s| {
+                    let color = match &s.paint {
                         vector_scene::PaintRef::Solid(c) => *c,
-                        _ => Color::BLACK, // TODO: gradient/pattern rendering
-                    });
+                        _ => Color::BLACK,
+                    };
+                    (color, s.style.width)
+                });
 
-                    let stroke = style.stroke.as_ref().map(|s| {
-                        let color = match &s.paint {
-                            vector_scene::PaintRef::Solid(c) => *c,
-                            _ => Color::BLACK,
-                        };
-                        (color, s.style.width)
-                    });
+                let mesh = tessellate_path(path, fill_color, stroke);
 
-                    let mesh = tessellate_path(path, fill_color, stroke);
+                let base = all_vertices.len() as u32;
 
-                    let base = all_vertices.len() as u32;
+                if world_transform.is_identity() {
                     all_vertices.extend_from_slice(&mesh.vertices);
-                    all_indices.extend(mesh.indices.iter().map(|i| i + base));
+                } else {
+                    all_vertices.extend(mesh.vertices.iter().map(|v| {
+                        let p = world_transform
+                            .apply(Point::new(v.position[0] as f64, v.position[1] as f64));
+                        Vertex {
+                            position: [p.x as f32, p.y as f32],
+                            color: v.color,
+                        }
+                    }));
                 }
-            },
-        );
+                all_indices.extend(mesh.indices.iter().map(|i| i + base));
+            }
+        });
 
         self.num_indices = all_indices.len() as u32;
 
@@ -394,8 +404,97 @@ impl Renderer {
             }
         }
 
+        // ── Selection bounding boxes ──────────────────────────────────
+        // Draw a thin outline around each object-selected node's world-space
+        // bounding box. For groups, this encompasses all children.
+        {
+            let bbox_color: [f32; 4] = [0.3, 0.6, 1.0, 0.6]; // selection blue
+            let bbox_thickness = 1.0 / zoom;
+
+            let root = scene.root();
+            scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
+                if !node.visible || !selection.is_node_selected(id) {
+                    return;
+                }
+
+                // Compute the world-space bounding box for this node.
+                let bounds = match &node.data {
+                    NodeData::Path { path, .. } => path.bounding_box().transform(world_transform),
+                    NodeData::Group { .. } => {
+                        // For groups, walk the subtree to get the aggregate bounds.
+                        let mut b = vector_geom::Bounds::EMPTY;
+                        scene.walk_depth_first(id, world_transform, &mut |_cid, cnode, cworld| {
+                            if !cnode.visible {
+                                return;
+                            }
+                            if let NodeData::Path { ref path, .. } = cnode.data {
+                                let pb = path.bounding_box().transform(cworld);
+                                if !pb.is_empty() {
+                                    b = b.union(pb);
+                                }
+                            }
+                        });
+                        b
+                    }
+                    _ => vector_geom::Bounds::EMPTY,
+                };
+
+                if bounds.is_empty() {
+                    return;
+                }
+
+                let x0 = bounds.min.x as f32;
+                let y0 = bounds.min.y as f32;
+                let x1 = bounds.max.x as f32;
+                let y1 = bounds.max.y as f32;
+                let t = bbox_thickness * 0.5;
+
+                // Top edge
+                push_quad(
+                    &mut verts,
+                    &mut idxs,
+                    (x0 + x1) * 0.5,
+                    y0,
+                    (x1 - x0) * 0.5 + t,
+                    t,
+                    bbox_color,
+                );
+                // Bottom edge
+                push_quad(
+                    &mut verts,
+                    &mut idxs,
+                    (x0 + x1) * 0.5,
+                    y1,
+                    (x1 - x0) * 0.5 + t,
+                    t,
+                    bbox_color,
+                );
+                // Left edge
+                push_quad(
+                    &mut verts,
+                    &mut idxs,
+                    x0,
+                    (y0 + y1) * 0.5,
+                    t,
+                    (y1 - y0) * 0.5 + t,
+                    bbox_color,
+                );
+                // Right edge
+                push_quad(
+                    &mut verts,
+                    &mut idxs,
+                    x1,
+                    (y0 + y1) * 0.5,
+                    t,
+                    (y1 - y0) * 0.5 + t,
+                    bbox_color,
+                );
+            });
+        }
+
+        // ── Vertex handles ───────────────────────────────────────────────
         let root = scene.root();
-        scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, _world_transform| {
+        scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
             if !node.visible {
                 return;
             }
@@ -404,6 +503,15 @@ impl Renderer {
                 return;
             }
             if let NodeData::Path { ref path, .. } = node.data {
+                // Helper: transform a point from local to world coordinates for handle display.
+                let xform = |p: Point| -> Point {
+                    if world_transform.is_identity() {
+                        p
+                    } else {
+                        world_transform.apply(p)
+                    }
+                };
+
                 for (sp_idx, subpath) in path.subpaths.iter().enumerate() {
                     let make_vr = |kind: PointKind, seg_idx: usize| -> VertexRef {
                         VertexRef {
@@ -432,7 +540,7 @@ impl Renderer {
                     push_handle(
                         &mut verts,
                         &mut idxs,
-                        subpath.start,
+                        xform(subpath.start),
                         handle_size,
                         fill,
                         border,
@@ -455,7 +563,14 @@ impl Renderer {
                                     hovered_fill,
                                     hovered_border,
                                 );
-                                push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
+                                push_handle(
+                                    &mut verts,
+                                    &mut idxs,
+                                    xform(*to),
+                                    handle_size,
+                                    fill,
+                                    border,
+                                );
                             }
                             Segment::Quad { ctrl, to } => {
                                 let vr = make_vr(PointKind::QuadCtrl, seg_idx);
@@ -475,7 +590,7 @@ impl Renderer {
                                 push_handle(
                                     &mut verts,
                                     &mut idxs,
-                                    *ctrl,
+                                    xform(*ctrl),
                                     ctrl_handle_size,
                                     fill,
                                     border,
@@ -495,7 +610,14 @@ impl Renderer {
                                     hovered_fill,
                                     hovered_border,
                                 );
-                                push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
+                                push_handle(
+                                    &mut verts,
+                                    &mut idxs,
+                                    xform(*to),
+                                    handle_size,
+                                    fill,
+                                    border,
+                                );
                             }
                             Segment::Cubic { ctrl1, ctrl2, to } => {
                                 let vr = make_vr(PointKind::CubicCtrl1, seg_idx);
@@ -515,7 +637,7 @@ impl Renderer {
                                 push_handle(
                                     &mut verts,
                                     &mut idxs,
-                                    *ctrl1,
+                                    xform(*ctrl1),
                                     ctrl_handle_size,
                                     fill,
                                     border,
@@ -538,7 +660,7 @@ impl Renderer {
                                 push_handle(
                                     &mut verts,
                                     &mut idxs,
-                                    *ctrl2,
+                                    xform(*ctrl2),
                                     ctrl_handle_size,
                                     fill,
                                     border,
@@ -558,7 +680,14 @@ impl Renderer {
                                     hovered_fill,
                                     hovered_border,
                                 );
-                                push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
+                                push_handle(
+                                    &mut verts,
+                                    &mut idxs,
+                                    xform(*to),
+                                    handle_size,
+                                    fill,
+                                    border,
+                                );
                             }
                             Segment::Arc { to, .. } => {
                                 let vr = make_vr(PointKind::Endpoint, seg_idx);
@@ -575,7 +704,14 @@ impl Renderer {
                                     hovered_fill,
                                     hovered_border,
                                 );
-                                push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
+                                push_handle(
+                                    &mut verts,
+                                    &mut idxs,
+                                    xform(*to),
+                                    handle_size,
+                                    fill,
+                                    border,
+                                );
                             }
                         }
                     }

@@ -212,6 +212,8 @@ impl SelectState {
     }
 
     /// Iterate over every editable vertex of the given nodes.
+    /// Vertex positions are reported in world (canvas) coordinates,
+    /// transformed by each node's accumulated world transform.
     fn for_each_vertex_in_nodes(
         scene: &Scene,
         nodes: &[NodeId],
@@ -227,6 +229,16 @@ impl SelectState {
             let NodeData::Path { ref path, .. } = node.data else {
                 continue;
             };
+
+            let world = scene.world_transform(node_id);
+            let xform = |p: Point| -> Point {
+                if world.is_identity() {
+                    p
+                } else {
+                    world.apply(p)
+                }
+            };
+
             for (sp_idx, subpath) in path.subpaths.iter().enumerate() {
                 f(
                     VertexRef {
@@ -235,7 +247,7 @@ impl SelectState {
                         segment: 0,
                         kind: PointKind::SubpathStart,
                     },
-                    subpath.start,
+                    xform(subpath.start),
                 );
 
                 for (seg_idx, seg) in subpath.segments.iter().enumerate() {
@@ -246,7 +258,7 @@ impl SelectState {
                             segment: seg_idx,
                             kind: PointKind::Endpoint,
                         },
-                        seg.endpoint(),
+                        xform(seg.endpoint()),
                     );
 
                     match seg {
@@ -258,7 +270,7 @@ impl SelectState {
                                     segment: seg_idx,
                                     kind: PointKind::QuadCtrl,
                                 },
-                                *ctrl,
+                                xform(*ctrl),
                             );
                         }
                         Segment::Cubic { ctrl1, ctrl2, .. } => {
@@ -269,7 +281,7 @@ impl SelectState {
                                     segment: seg_idx,
                                     kind: PointKind::CubicCtrl1,
                                 },
-                                *ctrl1,
+                                xform(*ctrl1),
                             );
                             f(
                                 VertexRef {
@@ -278,7 +290,7 @@ impl SelectState {
                                     segment: seg_idx,
                                     kind: PointKind::CubicCtrl2,
                                 },
-                                *ctrl2,
+                                xform(*ctrl2),
                             );
                         }
                         _ => {}
@@ -303,12 +315,12 @@ impl SelectState {
         scene.walk_depth_first(
             root,
             vector_geom::Affine::IDENTITY,
-            &mut |id, node, _world| {
+            &mut |id, node, world| {
                 if !node.visible {
                     return;
                 }
                 if let NodeData::Path { ref path, .. } = node.data {
-                    let bounds = path.bounding_box();
+                    let bounds = path.bounding_box().transform(world);
                     if !bounds.is_empty() && bounds.contains_point(target) {
                         best = Some(id);
                     }
@@ -329,12 +341,12 @@ impl SelectState {
         scene.walk_depth_first(
             root,
             vector_geom::Affine::IDENTITY,
-            &mut |id, node, _world| {
+            &mut |id, node, world| {
                 if !node.visible {
                     return;
                 }
                 if let NodeData::Path { ref path, .. } = node.data {
-                    let bounds = path.bounding_box();
+                    let bounds = path.bounding_box().transform(world);
                     if !bounds.is_empty() && bounds.intersects(query) {
                         result.push(id);
                     }
@@ -443,7 +455,18 @@ impl SelectState {
                 }
 
                 for vr in &self.selected {
-                    vr.translate(scene, dx, dy);
+                    // Convert the world-space delta to local-space for this
+                    // node, accounting for any group transforms above it.
+                    let world = scene.world_transform(vr.node);
+                    if world.is_identity() {
+                        vr.translate(scene, dx, dy);
+                    } else if let Some(inv) = world.inverse() {
+                        // Apply only the linear part (no translation) to the
+                        // delta vector: local_delta = inv_linear * world_delta.
+                        let local_dx = inv.a * dx + inv.b * dy;
+                        let local_dy = inv.c * dx + inv.d * dy;
+                        vr.translate(scene, local_dx, local_dy);
+                    }
                 }
 
                 *prev = canvas_pos;
@@ -648,7 +671,7 @@ impl SelectState {
         nodes: &[NodeId],
     ) -> Option<EdgeHit> {
         let radius = HIT_RADIUS_SCREEN_PX / zoom;
-        let target = Point::new(canvas_pos[0], canvas_pos[1]);
+        let canvas_target = Point::new(canvas_pos[0], canvas_pos[1]);
         let mut best: Option<(EdgeHit, f64)> = None;
 
         for &node_id in nodes {
@@ -661,6 +684,17 @@ impl SelectState {
             let NodeData::Path { ref path, .. } = node.data else {
                 continue;
             };
+
+            // Transform the canvas-space target into local space for this node.
+            let world = scene.world_transform(node_id);
+            let target = if world.is_identity() {
+                canvas_target
+            } else if let Some(inv) = world.inverse() {
+                inv.apply(canvas_target)
+            } else {
+                continue; // degenerate transform, skip
+            };
+
             for (sp_idx, subpath) in path.subpaths.iter().enumerate() {
                 let mut current = subpath.start;
                 for (seg_idx, seg) in subpath.segments.iter().enumerate() {

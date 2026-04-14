@@ -184,18 +184,42 @@ impl Scene {
 }
 
 impl Scene {
-    /// Compute the bounding box of all visible path content (skipping defs).
+    /// Compute the accumulated world transform for a node by walking up
+    /// the parent chain. Returns `Affine::IDENTITY` for the root.
+    pub fn world_transform(&self, id: NodeId) -> vector_geom::Affine {
+        let mut chain = Vec::new();
+        let mut current = id;
+        while let Some(parent) = self.parents.get(current).copied() {
+            chain.push(current);
+            current = parent;
+        }
+        // `current` is now the root (no parent entry). Build the transform
+        // from root down to `id`.
+        let mut xform = self
+            .nodes
+            .get(current)
+            .map_or(vector_geom::Affine::IDENTITY, |n| n.transform);
+        for &node_id in chain.iter().rev() {
+            if let Some(node) = self.nodes.get(node_id) {
+                xform = xform.then(node.transform);
+            }
+        }
+        xform
+    }
+
+    /// Compute the bounding box of all visible path content (skipping defs),
+    /// taking group transforms into account.
     pub fn content_bounds(&self) -> vector_geom::Bounds {
         let mut bounds = vector_geom::Bounds::EMPTY;
         self.walk_depth_first(
             self.root,
             vector_geom::Affine::IDENTITY,
-            &mut |_id, node, _world| {
+            &mut |_id, node, world| {
                 if !node.visible {
                     return;
                 }
                 if let crate::node::NodeData::Path { ref path, .. } = node.data {
-                    let path_bounds = path.bounding_box();
+                    let path_bounds = path.bounding_box().transform(world);
                     if !path_bounds.is_empty() {
                         bounds = bounds.union(path_bounds);
                     }

@@ -70,6 +70,21 @@ impl Bounds {
     pub fn is_empty(self) -> bool {
         self.min.x > self.max.x || self.min.y > self.max.y
     }
+
+    /// Transform this bounding box by an affine transform, returning a new
+    /// axis-aligned bounding box that encloses the transformed corners.
+    pub fn transform(self, xform: crate::Affine) -> Self {
+        if self.is_empty() {
+            return self;
+        }
+        let corners = [
+            xform.apply(self.min),
+            xform.apply(Point::new(self.max.x, self.min.y)),
+            xform.apply(self.max),
+            xform.apply(Point::new(self.min.x, self.max.y)),
+        ];
+        Self::from_points(corners)
+    }
 }
 
 impl Default for Bounds {
