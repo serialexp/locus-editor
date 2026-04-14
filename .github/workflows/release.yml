@@ -1,0 +1,242 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: vector-editor
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Get version from Cargo.toml
+        id: cargo
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check version match
+        run: |
+          if [ "${{ steps.tag.outputs.VERSION }}" != "${{ steps.cargo.outputs.VERSION }}" ]; then
+            echo "::error::Version mismatch! Tag version is ${{ steps.tag.outputs.VERSION }} but Cargo.toml version is ${{ steps.cargo.outputs.VERSION }}"
+            echo "Please update the version in Cargo.toml to match the release tag."
+            exit 1
+          fi
+          echo "Version check passed: ${{ steps.tag.outputs.VERSION }}"
+
+  build-linux:
+    needs: validate-version
+    if: always() && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped')
+    strategy:
+      matrix:
+        include:
+          - name: modern
+            runner: ubuntu-24.04
+            suffix: ""
+          - name: compat
+            runner: ubuntu-22.04
+            suffix: "-compat"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev \
+            libgtk-3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Build release binary (${{ matrix.name }})
+        run: cargo build --release --package vector-editor
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cp target/release/${{ env.APP_NAME }} dist/
+          cd dist && tar -czvf ../${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}-linux-x86_64${{ matrix.suffix }}.tar.gz *
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.name }}
+          path: |
+            ${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}-linux-x86_64${{ matrix.suffix }}.tar.gz
+
+  build-macos:
+    needs: validate-version
+    if: always() && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped')
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --package vector-editor --target ${{ matrix.target }}
+
+      - name: Create app bundle
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          APP_DIR="Vector Editor.app"
+          mkdir -p "$APP_DIR/Contents/MacOS"
+          mkdir -p "$APP_DIR/Contents/Resources"
+
+          # Copy binary
+          cp target/${{ matrix.target }}/release/${{ env.APP_NAME }} "$APP_DIR/Contents/MacOS/"
+
+          # Create Info.plist
+          cat > "$APP_DIR/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>Vector Editor</string>
+              <key>CFBundleDisplayName</key>
+              <string>Vector Editor</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.serialexp.vector-editor</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleExecutable</key>
+              <string>vector-editor</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.13</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSSupportsAutomaticGraphicsSwitching</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Create DMG
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ARCH=$(echo "${{ matrix.target }}" | cut -d'-' -f1)
+          hdiutil create -volname "Vector Editor" -srcfolder "Vector Editor.app" -ov -format UDZO "${{ env.APP_NAME }}-${VERSION}-macos-${ARCH}.dmg"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: "*.dmg"
+
+  build-windows:
+    needs: validate-version
+    if: always() && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --package vector-editor
+
+      - name: Create distribution folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/release/${{ env.APP_NAME }}.exe" -Destination dist/
+
+      - name: Create ZIP archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath ${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}-windows-x86_64.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: ${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}-windows-x86_64.zip
+
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/linux-modern/*.tar.gz
+            artifacts/linux-compat/*.tar.gz
+            artifacts/macos-x86_64-apple-darwin/*.dmg
+            artifacts/macos-aarch64-apple-darwin/*.dmg
+            artifacts/windows-artifacts/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
