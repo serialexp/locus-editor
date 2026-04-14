@@ -13,33 +13,44 @@ pub struct TessellatedMesh {
     pub indices: Vec<u32>,
 }
 
+/// Describes how to paint a fill or stroke — either a solid color or a
+/// reference into the gradient storage buffer.
+#[derive(Debug, Clone, Copy)]
+pub enum TessPaint {
+    Solid(Color),
+    Gradient { index: i32 },
+}
+
 /// Tessellate a path's fill and/or stroke into triangles.
 pub fn tessellate_path(
     path: &Path,
-    fill_color: Option<Color>,
-    stroke: Option<(Color, f64)>,
+    fill: Option<TessPaint>,
+    stroke: Option<(TessPaint, f64)>,
 ) -> TessellatedMesh {
     let lyon_path = to_lyon_path(path);
 
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
 
-    if let Some(color) = fill_color {
+    if let Some(paint) = fill {
         let mut tessellator = FillTessellator::new();
         tessellator
             .tessellate_path(
                 &lyon_path,
                 &FillOptions::default(),
                 &mut BuffersBuilder::new(&mut buffers, |vertex: lyon_tessellation::FillVertex| {
-                    Vertex {
-                        position: [vertex.position().x, vertex.position().y],
-                        color: [color.r, color.g, color.b, color.a],
+                    let pos = [vertex.position().x, vertex.position().y];
+                    match paint {
+                        TessPaint::Solid(color) => {
+                            Vertex::solid(pos, [color.r, color.g, color.b, color.a])
+                        }
+                        TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index),
                     }
                 }),
             )
             .expect("fill tessellation failed");
     }
 
-    if let Some((color, width)) = stroke {
+    if let Some((paint, width)) = stroke {
         let mut tessellator = StrokeTessellator::new();
         tessellator
             .tessellate_path(
@@ -47,9 +58,14 @@ pub fn tessellate_path(
                 &StrokeOptions::default().with_line_width(width as f32),
                 &mut BuffersBuilder::new(
                     &mut buffers,
-                    |vertex: lyon_tessellation::StrokeVertex| Vertex {
-                        position: [vertex.position().x, vertex.position().y],
-                        color: [color.r, color.g, color.b, color.a],
+                    |vertex: lyon_tessellation::StrokeVertex| {
+                        let pos = [vertex.position().x, vertex.position().y];
+                        match paint {
+                            TessPaint::Solid(color) => {
+                                Vertex::solid(pos, [color.r, color.g, color.b, color.a])
+                            }
+                            TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index),
+                        }
                     },
                 ),
             )

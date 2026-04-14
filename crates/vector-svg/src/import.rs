@@ -1,6 +1,8 @@
-use vector_geom::{Color, Path, Point, Segment, SubPath};
+use std::collections::HashMap;
+
+use vector_geom::{Affine, Color, Path, Point, Segment, SubPath};
 use vector_scene::Node;
-use vector_scene::{NodeData, Scene, Style};
+use vector_scene::{NodeData, NodeId, Scene, Style};
 
 /// Import an SVG file from bytes into a scene graph.
 pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
@@ -10,23 +12,33 @@ pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
     let mut scene = Scene::new();
     let root = scene.root();
 
-    import_group(tree.root(), &mut scene, root);
+    // Cache for gradient deduplication. usvg shares `Arc<LinearGradient>` /
+    // `Arc<RadialGradient>` across paths that reference the same SVG element.
+    // We key by the Arc's raw pointer to avoid creating duplicate paint nodes.
+    let mut gradient_cache: HashMap<usize, NodeId> = HashMap::new();
+
+    import_group(tree.root(), &mut scene, root, &mut gradient_cache);
 
     Ok(scene)
 }
 
-fn import_group(group: &usvg::Group, scene: &mut Scene, parent: vector_scene::NodeId) {
+fn import_group(
+    group: &usvg::Group,
+    scene: &mut Scene,
+    parent: NodeId,
+    gradient_cache: &mut HashMap<usize, NodeId>,
+) {
     for child in group.children() {
         match child {
             usvg::Node::Group(g) => {
                 let node = Node::group(g.id().to_string());
                 if let Some(id) = scene.insert(parent, node) {
-                    import_group(g, scene, id);
+                    import_group(g, scene, id, gradient_cache);
                 }
             }
             usvg::Node::Path(p) => {
                 let path = convert_path(p.data());
-                let style = convert_style(p);
+                let style = convert_style(p, scene, gradient_cache);
                 let mut node = Node::path(p.id().to_string(), path);
                 if let NodeData::Path { style: s, .. } = &mut node.data {
                     *s = style;
@@ -100,17 +112,13 @@ fn convert_path(data: &usvg::tiny_skia_path::Path) -> Path {
     path
 }
 
-fn convert_style(path: &usvg::Path) -> Style {
+fn convert_style(
+    path: &usvg::Path,
+    scene: &mut Scene,
+    gradient_cache: &mut HashMap<usize, NodeId>,
+) -> Style {
     let fill = path.fill().map(|f| {
-        let paint = match f.paint() {
-            usvg::Paint::Color(c) => {
-                vector_scene::PaintRef::Solid(Color::from_srgb8(c.red, c.green, c.blue, 255))
-            }
-            _ => {
-                log::warn!("Non-solid fill paints not yet imported, falling back to black");
-                vector_scene::PaintRef::Solid(Color::BLACK)
-            }
-        };
+        let paint = convert_paint(f.paint(), scene, gradient_cache);
         vector_scene::style::Fill {
             paint,
             rule: match f.rule() {
@@ -122,15 +130,7 @@ fn convert_style(path: &usvg::Path) -> Style {
     });
 
     let stroke = path.stroke().map(|s| {
-        let paint = match s.paint() {
-            usvg::Paint::Color(c) => {
-                vector_scene::PaintRef::Solid(Color::from_srgb8(c.red, c.green, c.blue, 255))
-            }
-            _ => {
-                log::warn!("Non-solid stroke paints not yet imported, falling back to black");
-                vector_scene::PaintRef::Solid(Color::BLACK)
-            }
-        };
+        let paint = convert_paint(s.paint(), scene, gradient_cache);
         vector_scene::style::Stroke {
             paint,
             style: vector_scene::StrokeStyle {
@@ -163,6 +163,142 @@ fn convert_style(path: &usvg::Path) -> Style {
     Style { fill, stroke }
 }
 
+/// Convert a usvg `Paint` into our `PaintRef`, creating gradient nodes in
+/// the scene's defs subtree as needed.
+fn convert_paint(
+    paint: &usvg::Paint,
+    scene: &mut Scene,
+    gradient_cache: &mut HashMap<usize, NodeId>,
+) -> vector_scene::PaintRef {
+    match paint {
+        usvg::Paint::Color(c) => {
+            vector_scene::PaintRef::Solid(Color::from_srgb8(c.red, c.green, c.blue, 255))
+        }
+        usvg::Paint::LinearGradient(lg) => {
+            // Dedup by Arc pointer identity.
+            let ptr = std::sync::Arc::as_ptr(lg) as usize;
+            if let Some(&node_id) = gradient_cache.get(&ptr) {
+                return vector_scene::PaintRef::Ref(node_id);
+            }
+
+            let gradient = vector_scene::Gradient {
+                kind: vector_scene::GradientKind::Linear {
+                    start: Point::new(lg.x1() as f64, lg.y1() as f64),
+                    end: Point::new(lg.x2() as f64, lg.y2() as f64),
+                },
+                stops: convert_stops(lg.stops()),
+                interpolation: vector_scene::InterpolationSpace::LinearRgb,
+                transform: convert_transform(lg.transform()),
+                spread: convert_spread(lg.spread_method()),
+            };
+            let label = if lg.id().is_empty() {
+                format!("linearGradient_{}", gradient_cache.len())
+            } else {
+                lg.id().to_string()
+            };
+            let node = vector_scene::Node {
+                label,
+                transform: Affine::IDENTITY,
+                data: NodeData::Paint(vector_scene::Paint::Gradient(gradient)),
+                children: Vec::new(),
+                visible: true,
+                locked: false,
+            };
+            let defs = scene.defs();
+            if let Some(id) = scene.insert(defs, node) {
+                gradient_cache.insert(ptr, id);
+                vector_scene::PaintRef::Ref(id)
+            } else {
+                log::warn!("Failed to insert linear gradient into defs");
+                vector_scene::PaintRef::Solid(Color::BLACK)
+            }
+        }
+        usvg::Paint::RadialGradient(rg) => {
+            let ptr = std::sync::Arc::as_ptr(rg) as usize;
+            if let Some(&node_id) = gradient_cache.get(&ptr) {
+                return vector_scene::PaintRef::Ref(node_id);
+            }
+
+            let gradient = vector_scene::Gradient {
+                kind: vector_scene::GradientKind::Radial {
+                    center: Point::new(rg.cx() as f64, rg.cy() as f64),
+                    radius: rg.r().get() as f64,
+                    focal: Point::new(rg.fx() as f64, rg.fy() as f64),
+                    focal_radius: rg.fr().get() as f64,
+                },
+                stops: convert_stops(rg.stops()),
+                interpolation: vector_scene::InterpolationSpace::LinearRgb,
+                transform: convert_transform(rg.transform()),
+                spread: convert_spread(rg.spread_method()),
+            };
+            let label = if rg.id().is_empty() {
+                format!("radialGradient_{}", gradient_cache.len())
+            } else {
+                rg.id().to_string()
+            };
+            let node = vector_scene::Node {
+                label,
+                transform: Affine::IDENTITY,
+                data: NodeData::Paint(vector_scene::Paint::Gradient(gradient)),
+                children: Vec::new(),
+                visible: true,
+                locked: false,
+            };
+            let defs = scene.defs();
+            if let Some(id) = scene.insert(defs, node) {
+                gradient_cache.insert(ptr, id);
+                vector_scene::PaintRef::Ref(id)
+            } else {
+                log::warn!("Failed to insert radial gradient into defs");
+                vector_scene::PaintRef::Solid(Color::BLACK)
+            }
+        }
+        usvg::Paint::Pattern(_) => {
+            log::warn!("Pattern paints not yet imported, falling back to black");
+            vector_scene::PaintRef::Solid(Color::BLACK)
+        }
+    }
+}
+
+/// Convert usvg gradient stops to our `ColorStop` representation.
+fn convert_stops(stops: &[usvg::Stop]) -> Vec<vector_scene::ColorStop> {
+    stops
+        .iter()
+        .map(|s| {
+            let c = s.color();
+            let opacity = s.opacity().get();
+            // Convert sRGB stop color to linear RGBA, pre-multiplied by stop opacity.
+            let base = Color::from_srgb8(c.red, c.green, c.blue, 255);
+            vector_scene::ColorStop {
+                offset: s.offset().get(),
+                color: Color::new(base.r, base.g, base.b, base.a * opacity),
+            }
+        })
+        .collect()
+}
+
+/// Convert a usvg `Transform` to our `Affine`.
+/// usvg: `(sx, ky, kx, sy, tx, ty)` — our Affine: `{ a, b, c, d, tx, ty }`
+/// where matrix is [[a, b, tx], [c, d, ty], [0, 0, 1]].
+fn convert_transform(t: usvg::Transform) -> Affine {
+    Affine {
+        a: t.sx as f64,
+        b: t.kx as f64,
+        c: t.ky as f64,
+        d: t.sy as f64,
+        tx: t.tx as f64,
+        ty: t.ty as f64,
+    }
+}
+
+fn convert_spread(s: usvg::SpreadMethod) -> vector_scene::SpreadMethod {
+    match s {
+        usvg::SpreadMethod::Pad => vector_scene::SpreadMethod::Pad,
+        usvg::SpreadMethod::Reflect => vector_scene::SpreadMethod::Reflect,
+        usvg::SpreadMethod::Repeat => vector_scene::SpreadMethod::Repeat,
+    }
+}
+
 #[derive(Debug)]
 pub enum ImportError {
     Parse(usvg::Error),
@@ -177,3 +313,129 @@ impl std::fmt::Display for ImportError {
 }
 
 impl std::error::Error for ImportError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_linear_gradient() {
+        let svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <defs>
+                    <linearGradient id="lg1" x1="0" y1="0" x2="200" y2="0">
+                        <stop offset="0" stop-color="red"/>
+                        <stop offset="1" stop-color="blue"/>
+                    </linearGradient>
+                </defs>
+                <rect x="0" y="0" width="200" height="200" fill="url(#lg1)"/>
+            </svg>
+        "#;
+        let scene = import_svg(svg.as_bytes()).unwrap();
+
+        // There should be at least one gradient node in defs.
+        let defs = scene.defs();
+        let defs_node = scene.get(defs).unwrap();
+        let gradient_children: Vec<_> = defs_node
+            .children
+            .iter()
+            .filter_map(|&id| {
+                let node = scene.get(id)?;
+                if let NodeData::Paint(vector_scene::Paint::Gradient(_)) = &node.data {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !gradient_children.is_empty(),
+            "should have gradient in defs"
+        );
+
+        // The rect path should reference the gradient via PaintRef::Ref.
+        let root = scene.root();
+        let root_node = scene.get(root).unwrap();
+        let has_gradient_ref = root_node.children.iter().any(|&id| {
+            let node = scene.get(id).unwrap();
+            if let NodeData::Path { style, .. } = &node.data {
+                matches!(&style.fill, Some(f) if matches!(&f.paint, vector_scene::PaintRef::Ref(_)))
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_gradient_ref,
+            "path should reference gradient via PaintRef::Ref"
+        );
+    }
+
+    #[test]
+    fn import_radial_gradient() {
+        let svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <defs>
+                    <radialGradient id="rg1" cx="100" cy="100" r="100">
+                        <stop offset="0" stop-color="white"/>
+                        <stop offset="1" stop-color="black"/>
+                    </radialGradient>
+                </defs>
+                <circle cx="100" cy="100" r="100" fill="url(#rg1)"/>
+            </svg>
+        "#;
+        let scene = import_svg(svg.as_bytes()).unwrap();
+
+        // Check gradient exists in defs.
+        let defs = scene.defs();
+        let defs_node = scene.get(defs).unwrap();
+        let grad_id = defs_node.children.iter().find_map(|&id| {
+            let node = scene.get(id)?;
+            if let NodeData::Paint(vector_scene::Paint::Gradient(g)) = &node.data {
+                if matches!(g.kind, vector_scene::GradientKind::Radial { .. }) {
+                    return Some(id);
+                }
+            }
+            None
+        });
+        assert!(grad_id.is_some(), "should have radial gradient in defs");
+    }
+
+    #[test]
+    fn gradient_ref_from_two_paths() {
+        // Two paths referencing the same gradient should both get PaintRef::Ref.
+        let svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <defs>
+                    <linearGradient id="lg1" x1="0" y1="0" x2="200" y2="0">
+                        <stop offset="0" stop-color="red"/>
+                        <stop offset="1" stop-color="blue"/>
+                    </linearGradient>
+                </defs>
+                <rect x="0" y="0" width="100" height="100" fill="url(#lg1)"/>
+                <rect x="100" y="0" width="100" height="100" fill="url(#lg1)"/>
+            </svg>
+        "#;
+        let scene = import_svg(svg.as_bytes()).unwrap();
+
+        // Both paths should reference a gradient (not fall back to solid black).
+        let root = scene.root();
+        let root_node = scene.get(root).unwrap();
+        let gradient_ref_count = root_node
+            .children
+            .iter()
+            .filter(|&&id| {
+                if let Some(node) = scene.get(id)
+                    && let NodeData::Path { style, .. } = &node.data
+                {
+                    matches!(&style.fill, Some(f) if matches!(&f.paint, vector_scene::PaintRef::Ref(_)))
+                } else {
+                    false
+                }
+            })
+            .count();
+        assert_eq!(
+            gradient_ref_count, 2,
+            "both paths should reference gradient via PaintRef::Ref"
+        );
+    }
+}

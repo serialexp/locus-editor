@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 
 use vector_geom::{Affine, Color, Segment};
-use vector_scene::{FillRule, LineCap, LineJoin, NodeData, NodeId, PaintRef, Scene};
+use vector_scene::{
+    FillRule, Gradient, GradientKind, LineCap, LineJoin, NodeData, NodeId, Paint, PaintRef, Scene,
+    SpreadMethod,
+};
 
 /// Export a scene graph to an SVG string.
 pub fn export_svg(scene: &Scene) -> String {
@@ -19,6 +23,9 @@ pub fn export_svg(scene: &Scene) -> String {
         )
     };
 
+    // Build gradient label map: NodeId → SVG id string.
+    let gradient_ids = build_gradient_id_map(scene);
+
     let mut buf = String::with_capacity(4096);
     let _ = writeln!(buf, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
     let _ = writeln!(
@@ -30,7 +37,7 @@ pub fn export_svg(scene: &Scene) -> String {
     let root = scene.root();
     if let Some(root_node) = scene.get(root) {
         for &child_id in &root_node.children {
-            write_node(scene, child_id, 1, &mut buf);
+            write_node(scene, child_id, 1, &mut buf, &gradient_ids);
         }
     }
 
@@ -38,8 +45,40 @@ pub fn export_svg(scene: &Scene) -> String {
     buf
 }
 
+/// Build a map from gradient NodeIds to their SVG element id strings.
+/// Ensures unique ids even if labels collide.
+fn build_gradient_id_map(scene: &Scene) -> HashMap<NodeId, String> {
+    let mut map = HashMap::new();
+    let defs = scene.defs();
+    let Some(defs_node) = scene.get(defs) else {
+        return map;
+    };
+
+    let mut counter = 0usize;
+    for &child_id in &defs_node.children {
+        if let Some(child) = scene.get(child_id)
+            && matches!(&child.data, NodeData::Paint(Paint::Gradient(_)))
+        {
+            let id = if child.label.is_empty() {
+                counter += 1;
+                format!("gradient_{counter}")
+            } else {
+                child.label.clone()
+            };
+            map.insert(child_id, id);
+        }
+    }
+    map
+}
+
 /// Recursively emit a node and its children as SVG elements.
-fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
+fn write_node(
+    scene: &Scene,
+    id: NodeId,
+    indent: usize,
+    buf: &mut String,
+    gradient_ids: &HashMap<NodeId, String>,
+) {
     let Some(node) = scene.get(id) else { return };
     if !node.visible {
         return;
@@ -50,7 +89,20 @@ fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
 
     match &node.data {
         NodeData::Group { is_defs: true } => {
-            // Skip the defs group entirely (gradient refs not exported yet).
+            // Emit a <defs> block if there are any gradient definitions.
+            if gradient_ids.is_empty() {
+                return;
+            }
+            let _ = writeln!(buf, "{pad}<defs>");
+            for &child_id in &node.children {
+                if let Some(child) = scene.get(child_id)
+                    && let NodeData::Paint(Paint::Gradient(gradient)) = &child.data
+                    && let Some(svg_id) = gradient_ids.get(&child_id)
+                {
+                    write_gradient(gradient, svg_id, indent + 1, buf);
+                }
+            }
+            let _ = writeln!(buf, "{pad}</defs>");
         }
         NodeData::Group { is_defs: false } => {
             let _ = write!(buf, "{pad}<g");
@@ -63,7 +115,7 @@ fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
             let _ = writeln!(buf, ">");
 
             for &child_id in &node.children {
-                write_node(scene, child_id, indent + 1, buf);
+                write_node(scene, child_id, indent + 1, buf, gradient_ids);
             }
 
             let _ = writeln!(buf, "{pad}</g>");
@@ -85,8 +137,7 @@ fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
                     let _ = write!(buf, r#" fill="none""#);
                 }
                 Some(fill) => {
-                    let color = paint_color(&fill.paint);
-                    let _ = write!(buf, r#" fill="{}""#, fmt_color(color));
+                    let _ = write!(buf, r#" fill="{}""#, fmt_paint(&fill.paint, gradient_ids));
                     if fill.rule == FillRule::EvenOdd {
                         let _ = write!(buf, r#" fill-rule="evenodd""#);
                     }
@@ -98,8 +149,11 @@ fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
 
             // Stroke attributes.
             if let Some(stroke) = &style.stroke {
-                let color = paint_color(&stroke.paint);
-                let _ = write!(buf, r#" stroke="{}""#, fmt_color(color));
+                let _ = write!(
+                    buf,
+                    r#" stroke="{}""#,
+                    fmt_paint(&stroke.paint, gradient_ids)
+                );
                 let _ = write!(buf, r#" stroke-width="{}""#, stroke.style.width);
                 if stroke.opacity < 1.0 - 1e-4 {
                     let _ = write!(buf, r#" stroke-opacity="{:.4}""#, stroke.opacity);
@@ -137,7 +191,7 @@ fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
             let _ = writeln!(buf, "/>");
         }
         NodeData::Paint(_) => {
-            // Paint definitions are in the defs group; skip here.
+            // Paint definitions are emitted from the defs group handler; skip here.
         }
         NodeData::Text(text) => {
             let _ = write!(buf, r#"{pad}<text"#);
@@ -151,6 +205,89 @@ fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
             let _ = write!(buf, r#" font-size="{}""#, text.font_size);
             let _ = writeln!(buf, ">{}</text>", xml_escape(&text.content));
         }
+    }
+}
+
+/// Emit an SVG gradient definition element.
+fn write_gradient(gradient: &Gradient, svg_id: &str, indent: usize, buf: &mut String) {
+    let pad = "  ".repeat(indent);
+    let transform_attr = fmt_transform(gradient.transform);
+    let spread_attr = match gradient.spread {
+        SpreadMethod::Pad => None,
+        SpreadMethod::Reflect => Some("reflect"),
+        SpreadMethod::Repeat => Some("repeat"),
+    };
+
+    match &gradient.kind {
+        GradientKind::Linear { start, end } => {
+            let _ = write!(
+                buf,
+                r#"{pad}<linearGradient id="{}" x1="{}" y1="{}" x2="{}" y2="{}""#,
+                xml_escape(svg_id),
+                start.x,
+                start.y,
+                end.x,
+                end.y
+            );
+            let _ = write!(buf, r#" gradientUnits="userSpaceOnUse""#);
+            if let Some(ref t) = transform_attr {
+                let _ = write!(buf, r#" gradientTransform="{t}""#);
+            }
+            if let Some(s) = spread_attr {
+                let _ = write!(buf, r#" spreadMethod="{s}""#);
+            }
+            let _ = writeln!(buf, ">");
+            write_stops(&gradient.stops, indent + 1, buf);
+            let _ = writeln!(buf, "{pad}</linearGradient>");
+        }
+        GradientKind::Radial {
+            center,
+            radius,
+            focal,
+            focal_radius,
+        } => {
+            let _ = write!(
+                buf,
+                r#"{pad}<radialGradient id="{}" cx="{}" cy="{}" r="{}""#,
+                xml_escape(svg_id),
+                center.x,
+                center.y,
+                radius
+            );
+            let _ = write!(buf, r#" fx="{}" fy="{}""#, focal.x, focal.y);
+            if *focal_radius > 1e-8 {
+                let _ = write!(buf, r#" fr="{}""#, focal_radius);
+            }
+            let _ = write!(buf, r#" gradientUnits="userSpaceOnUse""#);
+            if let Some(ref t) = transform_attr {
+                let _ = write!(buf, r#" gradientTransform="{t}""#);
+            }
+            if let Some(s) = spread_attr {
+                let _ = write!(buf, r#" spreadMethod="{s}""#);
+            }
+            let _ = writeln!(buf, ">");
+            write_stops(&gradient.stops, indent + 1, buf);
+            let _ = writeln!(buf, "{pad}</radialGradient>");
+        }
+    }
+}
+
+/// Emit `<stop>` elements for gradient color stops.
+fn write_stops(stops: &[vector_scene::ColorStop], indent: usize, buf: &mut String) {
+    let pad = "  ".repeat(indent);
+    for stop in stops {
+        let color = Color::new(stop.color.r, stop.color.g, stop.color.b, 1.0);
+        let opacity = stop.color.a;
+        let _ = write!(
+            buf,
+            r#"{pad}<stop offset="{}" stop-color="{}""#,
+            stop.offset,
+            fmt_color(color)
+        );
+        if opacity < 1.0 - 1e-4 {
+            let _ = write!(buf, r#" stop-opacity="{:.4}""#, opacity);
+        }
+        let _ = writeln!(buf, "/>");
     }
 }
 
@@ -228,13 +365,17 @@ fn fmt_transform(affine: Affine) -> Option<String> {
     ))
 }
 
-/// Resolve a PaintRef to a solid color (gradient refs fall back to black).
-fn paint_color(paint: &PaintRef) -> Color {
+/// Format a PaintRef as an SVG paint value string.
+/// Solid colors become `#rrggbb`, gradient refs become `url(#id)`.
+fn fmt_paint(paint: &PaintRef, gradient_ids: &HashMap<NodeId, String>) -> String {
     match paint {
-        PaintRef::Solid(c) => *c,
-        PaintRef::Ref(_) => {
-            // Gradient/pattern refs are not exported yet.
-            Color::BLACK
+        PaintRef::Solid(c) => fmt_color(*c),
+        PaintRef::Ref(node_id) => {
+            if let Some(svg_id) = gradient_ids.get(node_id) {
+                format!("url(#{})", xml_escape(svg_id))
+            } else {
+                fmt_color(Color::BLACK)
+            }
         }
     }
 }
@@ -356,5 +497,80 @@ mod tests {
         assert!(t.contains("matrix("));
         assert!(t.contains("10"));
         assert!(t.contains("20"));
+    }
+
+    #[test]
+    fn export_gradient_defs() {
+        use vector_scene::{ColorStop, Gradient, GradientKind, InterpolationSpace, SpreadMethod};
+
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let defs = scene.defs();
+
+        // Create a linear gradient in defs.
+        let gradient = Gradient {
+            kind: GradientKind::Linear {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(100.0, 0.0),
+            },
+            stops: vec![
+                ColorStop {
+                    offset: 0.0,
+                    color: Color::from_srgb8(255, 0, 0, 255),
+                },
+                ColorStop {
+                    offset: 1.0,
+                    color: Color::from_srgb8(0, 0, 255, 255),
+                },
+            ],
+            interpolation: InterpolationSpace::LinearRgb,
+            transform: Affine::IDENTITY,
+            spread: SpreadMethod::Pad,
+        };
+        let grad_node = vector_scene::Node {
+            label: "my_grad".into(),
+            transform: Affine::IDENTITY,
+            data: NodeData::Paint(vector_scene::Paint::Gradient(gradient)),
+            children: Vec::new(),
+            visible: true,
+            locked: false,
+        };
+        let grad_id = scene.insert(defs, grad_node).unwrap();
+
+        // Create a path that references the gradient.
+        let mut path = Path::new();
+        path.subpaths.push(SubPath {
+            start: Point::new(0.0, 0.0),
+            segments: vec![Segment::Line {
+                to: Point::new(100.0, 100.0),
+            }],
+            closed: false,
+        });
+        let mut node = vector_scene::Node::path("rect", path);
+        if let NodeData::Path { ref mut style, .. } = node.data {
+            style.fill = Some(vector_scene::style::Fill {
+                paint: PaintRef::Ref(grad_id),
+                rule: FillRule::NonZero,
+                opacity: 1.0,
+            });
+        }
+        scene.insert(root, node);
+
+        let svg = export_svg(&scene);
+        assert!(svg.contains("<defs>"), "should have defs section");
+        assert!(
+            svg.contains("linearGradient"),
+            "should have linearGradient element"
+        );
+        assert!(
+            svg.contains(r#"id="my_grad""#),
+            "gradient should have correct id"
+        );
+        assert!(
+            svg.contains("url(#my_grad)"),
+            "path fill should reference gradient"
+        );
+        assert!(svg.contains("<stop"), "should have stop elements");
+        assert!(svg.contains("</defs>"), "should close defs section");
     }
 }

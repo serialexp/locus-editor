@@ -4,5 +4,6 @@
 - [x] Arc tessellation — already implemented via `lyon_geom::SvgArc::for_each_cubic_bezier`
 - [x] World transforms in renderer — applied to tessellated vertices, handles, hit testing, bounds, and vertex dragging
 - [ ] Text rendering — vector-text is a stub (rustybuzz + ttf-parser deps wired, no implementation)
-- [ ] Gradient/pattern rendering — `PaintRef::Ref` falls back to black
+- [x] Gradient rendering — fragment shader evaluation, SVG import/export, linear + radial + spread methods
+- [ ] Pattern rendering — patterns not yet supported
 - [ ] Stroke dash patterns — not rendered yet

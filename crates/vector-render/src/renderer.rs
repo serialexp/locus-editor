@@ -1,6 +1,11 @@
+use std::collections::HashMap;
+
+use bytemuck::{Pod, Zeroable};
 use vector_geom::{Affine, Color, Point, Segment};
-use vector_scene::{NodeData, Scene};
-use vector_tess::{Vertex, tessellate_path};
+use vector_scene::{
+    Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Scene, SpreadMethod,
+};
+use vector_tess::{TessPaint, Vertex, tessellate_path};
 use vector_tools::{PointKind, SelectState, VertexRef};
 
 use crate::pipeline;
@@ -16,16 +21,125 @@ const GRID_MINOR_SPACING: f32 = 1.0;
 const GRID_MAJOR_SPACING: f32 = 10.0;
 /// Minimum screen-pixel distance between minor lines before they appear.
 const GRID_MINOR_MIN_SCREEN_PX: f32 = 4.0;
+/// Maximum number of color stops per gradient on the GPU.
+const MAX_STOPS: usize = 8;
+
+// ── GPU-side gradient data structures ───────────────────────────────────
+//
+// These must match the WGSL shader's `GpuGradient` / `GpuColorStop` layout
+// exactly, including padding and alignment.
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct GpuColorStop {
+    offset: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct GpuGradient {
+    kind: u32,   // 0 = linear, 1 = radial
+    spread: u32, // 0 = pad, 1 = reflect, 2 = repeat
+    stop_count: u32,
+    _pad: u32,
+    // Linear: [start.x, start.y, end.x, end.y]
+    // Radial: [center.x, center.y, radius, 0]
+    p0: [f32; 4],
+    // Linear: unused
+    // Radial: [focal.x, focal.y, focal_radius, 0]
+    p1: [f32; 4],
+    // Inverse gradient transform: inv0 = [a, b, tx, 0], inv1 = [c, d, ty, 0]
+    inv0: [f32; 4],
+    inv1: [f32; 4],
+    stops: [GpuColorStop; MAX_STOPS],
+}
+
+impl GpuGradient {
+    fn from_gradient(gradient: &Gradient) -> Self {
+        let inv = gradient.transform.inverse().unwrap_or(Affine::IDENTITY);
+
+        let (kind, p0, p1) = match &gradient.kind {
+            GradientKind::Linear { start, end } => (
+                0u32,
+                [start.x as f32, start.y as f32, end.x as f32, end.y as f32],
+                [0.0; 4],
+            ),
+            GradientKind::Radial {
+                center,
+                radius,
+                focal,
+                focal_radius,
+            } => (
+                1u32,
+                [center.x as f32, center.y as f32, *radius as f32, 0.0],
+                [focal.x as f32, focal.y as f32, *focal_radius as f32, 0.0],
+            ),
+        };
+
+        let spread = match gradient.spread {
+            SpreadMethod::Pad => 0u32,
+            SpreadMethod::Reflect => 1u32,
+            SpreadMethod::Repeat => 2u32,
+        };
+
+        let stop_count = gradient.stops.len().min(MAX_STOPS) as u32;
+        let mut stops = [GpuColorStop {
+            offset: 0.0,
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        }; MAX_STOPS];
+
+        for (i, stop) in gradient.stops.iter().take(MAX_STOPS).enumerate() {
+            stops[i] = GpuColorStop {
+                offset: stop.offset,
+                r: stop.color.r,
+                g: stop.color.g,
+                b: stop.color.b,
+                a: stop.color.a,
+                _pad0: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            };
+        }
+
+        Self {
+            kind,
+            spread,
+            stop_count,
+            _pad: 0,
+            p0,
+            p1,
+            inv0: [inv.a as f32, inv.b as f32, inv.tx as f32, 0.0],
+            inv1: [inv.c as f32, inv.d as f32, inv.ty as f32, 0.0],
+            stops,
+        }
+    }
+}
 
 /// The main renderer — owns the wgpu pipeline state and draws the scene.
 #[allow(clippy::struct_field_names)]
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
-    // Kept alive — wgpu requires the layout to outlive bind groups created from it.
-    _bind_group_layout: wgpu::BindGroupLayout,
+    /// Bind group layout (kept alive for bind group creation).
+    bind_group_layout: wgpu::BindGroupLayout,
     /// Uniform buffer holding the view-projection matrix.
     globals_buffer: wgpu::Buffer,
-    globals_bind_group: wgpu::BindGroup,
+    /// Storage buffer for gradient descriptors.
+    gradient_buffer: wgpu::Buffer,
+    /// Combined bind group: globals uniform + gradient storage.
+    bind_group: wgpu::BindGroup,
     /// Cached vertex/index buffers for scene geometry. Rebuilt when scene changes.
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
@@ -70,20 +184,36 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vector globals bind group"),
+        // Create an initial (empty) gradient storage buffer — one dummy element
+        // so the bind group is valid even when no gradients exist.
+        let gradient_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gradient storage"),
+            size: std::mem::size_of::<GpuGradient>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vector bind group"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: gradient_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         Self {
             pipeline,
-            _bind_group_layout: bind_group_layout,
+            bind_group_layout,
             globals_buffer,
-            globals_bind_group,
+            gradient_buffer,
+            bind_group,
             vertex_buffer: None,
             index_buffer: None,
             num_indices: 0,
@@ -147,12 +277,76 @@ impl Renderer {
         }
         self.dirty = false;
 
+        // ── Collect gradient descriptors from the defs subtree ──────────
+        let mut gpu_gradients: Vec<GpuGradient> = Vec::new();
+        let mut gradient_index_map: HashMap<NodeId, i32> = HashMap::new();
+
+        let defs = scene.defs();
+        if let Some(defs_node) = scene.get(defs) {
+            for &child_id in &defs_node.children {
+                if let Some(child) = scene.get(child_id)
+                    && let NodeData::Paint(Paint::Gradient(gradient)) = &child.data
+                {
+                    let idx = gpu_gradients.len() as i32;
+                    gradient_index_map.insert(child_id, idx);
+                    gpu_gradients.push(GpuGradient::from_gradient(gradient));
+                }
+            }
+        }
+
+        // Upload gradient buffer (or a dummy if empty).
+        if gpu_gradients.is_empty() {
+            gpu_gradients.push(GpuGradient::zeroed());
+        }
+
+        let grad_size = (gpu_gradients.len() * std::mem::size_of::<GpuGradient>()) as u64;
+        if self.gradient_buffer.size() < grad_size {
+            // Recreate gradient buffer and bind group with new size.
+            self.gradient_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gradient storage"),
+                size: grad_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vector bind group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.globals_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.gradient_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        }
+        queue.write_buffer(
+            &self.gradient_buffer,
+            0,
+            bytemuck::cast_slice(&gpu_gradients),
+        );
+
+        // ── Helper: resolve PaintRef → TessPaint ───────────────────────
+        let resolve_paint = |paint: &PaintRef| -> TessPaint {
+            match paint {
+                PaintRef::Solid(c) => TessPaint::Solid(*c),
+                PaintRef::Ref(node_id) => {
+                    if let Some(&idx) = gradient_index_map.get(node_id) {
+                        TessPaint::Gradient { index: idx }
+                    } else {
+                        TessPaint::Solid(Color::BLACK)
+                    }
+                }
+            }
+        };
+
+        // ── Walk scene and tessellate ──────────────────────────────────
         let mut all_vertices: Vec<Vertex> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
 
-        // Walk the visible tree (skip defs) and tessellate each path.
-        // The world transform accumulated during the walk is applied to
-        // each vertex so that group transforms affect their children.
         let root = scene.root();
         scene.walk_depth_first(root, Affine::IDENTITY, &mut |_id, node, world_transform| {
             if !node.visible {
@@ -163,20 +357,13 @@ impl Renderer {
                 ref style,
             } = node.data
             {
-                let fill_color = style.fill.as_ref().map(|f| match &f.paint {
-                    vector_scene::PaintRef::Solid(c) => *c,
-                    _ => Color::BLACK, // TODO: gradient/pattern rendering
-                });
+                let fill = style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                let stroke = style
+                    .stroke
+                    .as_ref()
+                    .map(|s| (resolve_paint(&s.paint), s.style.width));
 
-                let stroke = style.stroke.as_ref().map(|s| {
-                    let color = match &s.paint {
-                        vector_scene::PaintRef::Solid(c) => *c,
-                        _ => Color::BLACK,
-                    };
-                    (color, s.style.width)
-                });
-
-                let mesh = tessellate_path(path, fill_color, stroke);
+                let mesh = tessellate_path(path, fill, stroke);
 
                 let base = all_vertices.len() as u32;
 
@@ -189,6 +376,13 @@ impl Renderer {
                         Vertex {
                             position: [p.x as f32, p.y as f32],
                             color: v.color,
+                            // world_pos carries the world-space position for gradient
+                            // evaluation. Since usvg normalizes gradient coordinates to
+                            // userSpaceOnUse (root/world space), this is the correct
+                            // space for computing the gradient parameter t.
+                            world_pos: [p.x as f32, p.y as f32],
+                            gradient_index: v.gradient_index,
+                            _pad: 0,
                         }
                     }));
                 }
@@ -809,7 +1003,7 @@ impl Renderer {
     /// Record draw commands into a render pass.
     pub fn render(&self, pass: &mut wgpu::RenderPass<'static>) {
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.globals_bind_group, &[]);
+        pass.set_bind_group(0, &self.bind_group, &[]);
 
         // Draw grid (behind everything)
         if self.grid_num_indices > 0
@@ -874,22 +1068,10 @@ fn push_quad(
     color: [f32; 4],
 ) {
     let base = verts.len() as u32;
-    verts.push(Vertex {
-        position: [cx - half_x, cy - half_y],
-        color,
-    });
-    verts.push(Vertex {
-        position: [cx + half_x, cy - half_y],
-        color,
-    });
-    verts.push(Vertex {
-        position: [cx + half_x, cy + half_y],
-        color,
-    });
-    verts.push(Vertex {
-        position: [cx - half_x, cy + half_y],
-        color,
-    });
+    verts.push(Vertex::solid([cx - half_x, cy - half_y], color));
+    verts.push(Vertex::solid([cx + half_x, cy - half_y], color));
+    verts.push(Vertex::solid([cx + half_x, cy + half_y], color));
+    verts.push(Vertex::solid([cx - half_x, cy + half_y], color));
     idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 

@@ -1,5 +1,5 @@
 mod tessellator;
 mod vertex;
 
-pub use tessellator::tessellate_path;
+pub use tessellator::{TessPaint, tessellate_path};
 pub use vertex::Vertex;
