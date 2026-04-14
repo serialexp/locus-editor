@@ -15,13 +15,17 @@ pub struct TessellatedMesh {
     pub indices: Vec<u32>,
 }
 
-/// Tessellate a path's fill into triangles.
-pub fn tessellate_path(path: &Path, color: Color, fill: bool, stroke_width: Option<f64>) -> TessellatedMesh {
+/// Tessellate a path's fill and/or stroke into triangles.
+pub fn tessellate_path(
+    path: &Path,
+    fill_color: Option<Color>,
+    stroke: Option<(Color, f64)>,
+) -> TessellatedMesh {
     let lyon_path = to_lyon_path(path);
 
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
 
-    if fill {
+    if let Some(color) = fill_color {
         let mut tessellator = FillTessellator::new();
         tessellator
             .tessellate_path(
@@ -37,7 +41,7 @@ pub fn tessellate_path(path: &Path, color: Color, fill: bool, stroke_width: Opti
             .expect("fill tessellation failed");
     }
 
-    if let Some(width) = stroke_width {
+    if let Some((color, width)) = stroke {
         let mut tessellator = StrokeTessellator::new();
         tessellator
             .tessellate_path(
@@ -69,6 +73,7 @@ fn to_lyon_path(path: &Path) -> LyonPath {
             subpath.start.y as f32,
         ));
 
+        let mut current = subpath.start;
         for seg in &subpath.segments {
             match seg {
                 Segment::Line { to } => {
@@ -94,13 +99,28 @@ fn to_lyon_path(path: &Path) -> LyonPath {
                     sweep,
                     to,
                 } => {
-                    // Lyon doesn't have native arc segments in its path builder,
-                    // so we approximate with cubics via lyon_geom's arc.
-                    // TODO: use lyon_geom::SvgArc for proper arc-to-cubic conversion.
-                    // For now, just draw a line (placeholder).
-                    builder.line_to(lyon_tessellation::math::point(to.x as f32, to.y as f32));
+                    // Convert the SVG arc to cubic bezier approximations via lyon_geom.
+                    let svg_arc = lyon_geom::SvgArc {
+                        from: lyon_geom::point(current.x as f32, current.y as f32),
+                        to: lyon_geom::point(to.x as f32, to.y as f32),
+                        radii: lyon_geom::vector(radii.x as f32, radii.y as f32),
+                        x_rotation: lyon_geom::Angle::radians(*x_rotation as f32),
+                        flags: lyon_geom::ArcFlags {
+                            large_arc: *large_arc,
+                            sweep: *sweep,
+                        },
+                    };
+
+                    svg_arc.for_each_cubic_bezier(&mut |cb| {
+                        builder.cubic_bezier_to(
+                            lyon_tessellation::math::point(cb.ctrl1.x, cb.ctrl1.y),
+                            lyon_tessellation::math::point(cb.ctrl2.x, cb.ctrl2.y),
+                            lyon_tessellation::math::point(cb.to.x, cb.to.y),
+                        );
+                    });
                 }
             }
+            current = seg.endpoint();
         }
 
         builder.end(subpath.closed);

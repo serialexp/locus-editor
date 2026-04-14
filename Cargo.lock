@@ -3480,6 +3480,7 @@ dependencies = [
  "vector-geom",
  "vector-scene",
  "vector-tess",
+ "vector-tools",
  "wgpu",
 ]
 

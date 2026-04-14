@@ -160,6 +160,25 @@ impl Scene {
     }
 }
 
+impl Scene {
+    /// Compute the bounding box of all visible path content (skipping defs).
+    pub fn content_bounds(&self) -> vector_geom::Bounds {
+        let mut bounds = vector_geom::Bounds::EMPTY;
+        self.walk_depth_first(self.root, vector_geom::Affine::IDENTITY, &mut |_id, node, _world| {
+            if !node.visible {
+                return;
+            }
+            if let crate::node::NodeData::Path { ref path, .. } = node.data {
+                let path_bounds = path.bounding_box();
+                if !path_bounds.is_empty() {
+                    bounds = bounds.union(path_bounds);
+                }
+            }
+        });
+        bounds
+    }
+}
+
 impl Default for Scene {
     fn default() -> Self {
         Self::new()

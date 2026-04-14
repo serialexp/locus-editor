@@ -2,6 +2,14 @@
 // Each tool is a state machine that consumes input events
 // and emits Commands (via vector-ops) to modify the scene.
 
+mod pen;
+mod select;
+mod shape;
+
+pub use pen::{PenAction, PenState};
+pub use select::{EdgeHit, VertexRef, PointKind, SelectState};
+pub use shape::ShapeDrawState;
+
 /// The available editing tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ToolType {

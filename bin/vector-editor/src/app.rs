@@ -1,14 +1,85 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
 use vector_ops::History;
 use vector_render::Renderer;
 use vector_scene::Scene;
-use vector_tools::ToolType;
+use vector_tools::{PenAction, PenState, SelectState, ShapeDrawState, ToolType};
+
+/// Camera state for canvas pan/zoom.
+struct Camera {
+    /// Offset in screen pixels (how much the canvas origin has been dragged).
+    pan: [f32; 2],
+    /// Zoom level (1.0 = 100%).
+    zoom: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            pan: [0.0, 0.0],
+            zoom: 1.0,
+        }
+    }
+}
+
+impl Camera {
+    /// Convert screen pixel coordinates to canvas (scene) coordinates.
+    pub fn screen_to_canvas(&self, screen_x: f32, screen_y: f32) -> [f32; 2] {
+        [
+            (screen_x - self.pan[0]) / self.zoom,
+            (screen_y - self.pan[1]) / self.zoom,
+        ]
+    }
+
+    /// Set pan and zoom so that `bounds` (in canvas coordinates) fits inside
+    /// the screen-space rectangle described by `viewport` (min_x, min_y, width,
+    /// height in screen pixels), with some padding.
+    pub fn zoom_to_fit(&mut self, bounds: vector_geom::Bounds, viewport: [f32; 4]) {
+        if bounds.is_empty() {
+            return;
+        }
+        let [vx, vy, vw, vh] = viewport;
+        let content_w = bounds.width() as f32;
+        let content_h = bounds.height() as f32;
+        if content_w <= 0.0 || content_h <= 0.0 || vw <= 0.0 || vh <= 0.0 {
+            return;
+        }
+
+        // Leave 5% padding on each side
+        let padding_frac = 0.05;
+        let usable_w = vw * (1.0 - 2.0 * padding_frac);
+        let usable_h = vh * (1.0 - 2.0 * padding_frac);
+
+        // Zoom to fit the smaller axis
+        self.zoom = (usable_w / content_w).min(usable_h / content_h);
+        self.zoom = self.zoom.clamp(0.05, 100.0);
+
+        // Pan so that the center of the content maps to the center of the viewport.
+        // screen = canvas * zoom + pan  =>  pan = screen_center - canvas_center * zoom
+        let center = bounds.center();
+        let viewport_center_x = vx + vw * 0.5;
+        let viewport_center_y = vy + vh * 0.5;
+        self.pan[0] = viewport_center_x - center.x as f32 * self.zoom;
+        self.pan[1] = viewport_center_y - center.y as f32 * self.zoom;
+    }
+
+    /// Zoom by a factor, keeping the given screen point fixed.
+    pub fn zoom_at(&mut self, factor: f32, screen_x: f32, screen_y: f32) {
+        // Point in canvas coords before zoom
+        let before = self.screen_to_canvas(screen_x, screen_y);
+        self.zoom *= factor;
+        self.zoom = self.zoom.clamp(0.05, 100.0);
+        // Adjust pan so that `before` maps back to (screen_x, screen_y)
+        self.pan[0] = screen_x - before[0] * self.zoom;
+        self.pan[1] = screen_y - before[1] * self.zoom;
+    }
+}
 
 /// Initialized GPU + window state. Created on first resume.
 struct GpuState {
@@ -28,6 +99,22 @@ pub struct App {
     scene: Scene,
     history: History,
     active_tool: ToolType,
+    select_state: SelectState,
+    shape_draw: ShapeDrawState,
+    pen_state: PenState,
+    camera: Camera,
+    /// The canvas area in screen pixels (excluding egui panels), updated each frame.
+    canvas_rect: [f32; 4],
+    /// Current cursor position in screen pixels.
+    cursor_pos: Option<[f32; 2]>,
+    /// Whether middle mouse (or space+left) is held for panning.
+    is_panning: bool,
+    /// Whether left mouse is held (for tool dragging).
+    is_left_down: bool,
+    /// Whether to zoom-to-fit the scene on the next frame.
+    pending_zoom_to_fit: bool,
+    /// For double-click detection: time + screen position of the last left press.
+    last_left_press: Option<(Instant, [f32; 2])>,
 }
 
 impl Default for App {
@@ -37,6 +124,16 @@ impl Default for App {
             scene: Scene::new(),
             history: History::new(),
             active_tool: ToolType::default(),
+            select_state: SelectState::default(),
+            shape_draw: ShapeDrawState::default(),
+            pen_state: PenState::default(),
+            camera: Camera::default(),
+            canvas_rect: [0.0, 0.0, 1280.0, 800.0],
+            cursor_pos: None,
+            is_panning: false,
+            is_left_down: false,
+            pending_zoom_to_fit: false,
+            last_left_press: None,
         }
     }
 }
@@ -194,6 +291,8 @@ impl ApplicationHandler for App {
                         Ok(data) => match vector_svg::import_svg(&data) {
                             Ok(scene) => {
                                 self.scene = scene;
+                                self.select_state = SelectState::default();
+                                self.pending_zoom_to_fit = true;
                                 if let Some(gpu) = &mut self.gpu {
                                     gpu.renderer.mark_dirty();
                                     gpu.window.request_redraw();
@@ -209,29 +308,228 @@ impl ApplicationHandler for App {
             // --- Canvas input events: guard with wants_pointer/wants_keyboard ---
             WindowEvent::MouseInput { button, state, .. } => {
                 if !gpu.egui_ctx.egui_wants_pointer_input() {
-                    // TODO: forward to active tool (select, pen, etc.)
-                    let _ = (button, state);
+                    match button {
+                        MouseButton::Middle => {
+                            self.is_panning = state == ElementState::Pressed;
+                        }
+                        MouseButton::Left => {
+                            if state == ElementState::Pressed {
+                                self.is_left_down = true;
+                                // Double-click detection.
+                                let now = Instant::now();
+                                let is_double_click = if let Some((prev_time, prev_pos)) = self.last_left_press {
+                                    let dt = now.duration_since(prev_time);
+                                    let dx = self.cursor_pos.map_or(f32::INFINITY, |c| (c[0] - prev_pos[0]).abs());
+                                    let dy = self.cursor_pos.map_or(f32::INFINITY, |c| (c[1] - prev_pos[1]).abs());
+                                    dt.as_millis() < 400 && dx < 5.0 && dy < 5.0
+                                } else {
+                                    false
+                                };
+                                self.last_left_press = self.cursor_pos.map(|c| (now, c));
+
+                                if let Some(cursor) = self.cursor_pos {
+                                    let canvas = self.camera.screen_to_canvas(cursor[0], cursor[1]);
+                                    let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
+                                    match self.active_tool {
+                                        ToolType::Select => {
+                                            // Double-click: insert point on edge.
+                                            let mut handled = false;
+                                            if is_double_click && !self.select_state.selected_nodes.is_empty() {
+                                                if let Some(hit) = SelectState::edge_hit_test(
+                                                    &self.scene,
+                                                    canvas_f64,
+                                                    self.camera.zoom as f64,
+                                                    &self.select_state.selected_nodes,
+                                                ) {
+                                                    if let Some(vr) = SelectState::insert_point_on_edge(&mut self.scene, &hit) {
+                                                        self.select_state.selected.clear();
+                                                        self.select_state.selected.push(vr);
+                                                        gpu.renderer.mark_dirty();
+                                                        handled = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if !handled {
+                                                let shift = gpu.egui_ctx.input(|i| i.modifiers.shift);
+                                                self.select_state.on_press(
+                                                    &self.scene,
+                                                    canvas_f64,
+                                                    shift,
+                                                    self.camera.zoom as f64,
+                                                );
+                                            }
+                                        }
+                                        ToolType::Pen => {
+                                            let action = self.pen_state.on_press(
+                                                &mut self.scene,
+                                                canvas_f64,
+                                                self.camera.zoom as f64,
+                                            );
+                                            handle_pen_action(action, &self.pen_state, &mut self.select_state, &mut self.active_tool, &mut gpu.renderer);
+                                        }
+                                        ToolType::Rectangle | ToolType::Ellipse => {
+                                            self.shape_draw.on_press(
+                                                &mut self.scene,
+                                                canvas_f64,
+                                                self.active_tool,
+                                            );
+                                            gpu.renderer.mark_dirty();
+                                        }
+                                        _ => {}
+                                    }
+                                    gpu.window.request_redraw();
+                                }
+                            } else {
+                                self.is_left_down = false;
+                                match self.active_tool {
+                                    ToolType::Select => {
+                                        self.select_state.on_release();
+                                    }
+                                    ToolType::Pen => {
+                                        if let Some(cursor) = self.cursor_pos {
+                                            let canvas = self.camera.screen_to_canvas(cursor[0], cursor[1]);
+                                            let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
+                                            self.pen_state.on_release(
+                                                &mut self.scene,
+                                                canvas_f64,
+                                                self.camera.zoom as f64,
+                                            );
+                                            gpu.renderer.mark_dirty();
+                                            gpu.window.request_redraw();
+                                        }
+                                    }
+                                    ToolType::Rectangle | ToolType::Ellipse => {
+                                        if let Some(node_id) = self.shape_draw.on_release(&mut self.scene) {
+                                            // Auto-select the new shape and switch to Select
+                                            self.select_state.selected_nodes.clear();
+                                            self.select_state.selected_nodes.push(node_id);
+                                            self.active_tool = ToolType::Select;
+                                        }
+                                        gpu.renderer.mark_dirty();
+                                        gpu.window.request_redraw();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        MouseButton::Right => {
+                            // Right-click: undo last pen point
+                            if state == ElementState::Pressed && self.active_tool == ToolType::Pen {
+                                let action = self.pen_state.undo_last(&mut self.scene);
+                                handle_pen_action(action, &self.pen_state, &mut self.select_state, &mut self.active_tool, &mut gpu.renderer);
+                                gpu.window.request_redraw();
+                            }
+                        }
+                        _ => {}
+                    }
+                    Self::update_cursor(
+                        &self.camera, &self.scene, &mut self.select_state,
+                        self.active_tool, self.is_panning, self.cursor_pos,
+                        gpu, &self.pen_state,
+                    );
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if !gpu.egui_ctx.egui_wants_pointer_input() {
-                    // TODO: forward to active tool / update hover hit-test
-                    let _ = position;
+                let new_pos = [position.x as f32, position.y as f32];
+
+                if self.is_panning {
+                    if let Some(prev) = self.cursor_pos {
+                        let dx = new_pos[0] - prev[0];
+                        let dy = new_pos[1] - prev[1];
+                        self.camera.pan[0] += dx;
+                        self.camera.pan[1] += dy;
+                        gpu.window.request_redraw();
+                    }
+                } else if self.is_left_down
+                    && !gpu.egui_ctx.egui_wants_pointer_input()
+                {
+                    let canvas = self.camera.screen_to_canvas(new_pos[0], new_pos[1]);
+                    let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
+                    let changed = match self.active_tool {
+                        ToolType::Select => {
+                            self.select_state.on_drag(&mut self.scene, canvas_f64)
+                        }
+                        ToolType::Pen => {
+                            self.pen_state.on_drag(&mut self.scene, canvas_f64)
+                        }
+                        ToolType::Rectangle | ToolType::Ellipse => {
+                            self.shape_draw.on_drag(
+                                &mut self.scene,
+                                canvas_f64,
+                                self.active_tool,
+                            )
+                        }
+                        _ => false,
+                    };
+                    if changed {
+                        gpu.renderer.mark_dirty();
+                        gpu.window.request_redraw();
+                    }
+                } else if !self.is_left_down
+                    && !gpu.egui_ctx.egui_wants_pointer_input()
+                    && self.active_tool == ToolType::Pen
+                    && self.pen_state.is_building()
+                {
+                    // Pen hover preview: show tentative segment to cursor.
+                    let canvas = self.camera.screen_to_canvas(new_pos[0], new_pos[1]);
+                    let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
+                    if self.pen_state.on_move(&mut self.scene, canvas_f64) {
+                        gpu.renderer.mark_dirty();
+                        gpu.window.request_redraw();
+                    }
                 }
+
+                self.cursor_pos = Some(new_pos);
+                Self::update_cursor(
+                    &self.camera, &self.scene, &mut self.select_state,
+                    self.active_tool, self.is_panning, self.cursor_pos,
+                    gpu, &self.pen_state,
+                );
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_pos = None;
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if !gpu.egui_ctx.egui_wants_pointer_input() {
-                    // TODO: canvas pan/zoom
-                    let _ = delta;
+                    let scroll_y = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
+                    };
+
+                    if let Some(cursor) = self.cursor_pos {
+                        let factor = 1.0 + scroll_y * 0.1;
+                        self.camera.zoom_at(factor, cursor[0], cursor[1]);
+                        gpu.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
                 event: ref key_event,
                 ..
             } => {
-                if !gpu.egui_ctx.egui_wants_keyboard_input() {
-                    // TODO: keyboard shortcuts, tool switching
-                    let _ = key_event;
+                if !gpu.egui_ctx.egui_wants_keyboard_input()
+                    && key_event.state == ElementState::Pressed
+                {
+                    use winit::keyboard::{Key, NamedKey};
+                    match &key_event.logical_key {
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                            if self.active_tool == ToolType::Pen && self.pen_state.is_building() {
+                                let action = self.pen_state.finish(&mut self.scene, false);
+                                handle_pen_action(action, &self.pen_state, &mut self.select_state, &mut self.active_tool, &mut gpu.renderer);
+                                gpu.window.request_redraw();
+                            }
+                        }
+                        Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
+                            if self.active_tool == ToolType::Select {
+                                if self.select_state.delete_selection(&mut self.scene) {
+                                    gpu.renderer.mark_dirty();
+                                    gpu.window.request_redraw();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -239,18 +537,133 @@ impl ApplicationHandler for App {
     }
 }
 
-impl App {
-    fn draw(&mut self) {
-        // Destructure to get disjoint borrows on gpu, scene, and active_tool
-        let Some(gpu) = &mut self.gpu else { return };
-        let scene = &self.scene;
-        let active_tool = &mut self.active_tool;
-
-        draw_frame(gpu, scene, active_tool);
+/// Process a PenAction result — auto-select, switch tools, mark dirty.
+fn handle_pen_action(
+    action: PenAction,
+    pen_state: &PenState,
+    select_state: &mut SelectState,
+    active_tool: &mut ToolType,
+    renderer: &mut Renderer,
+) {
+    match action {
+        PenAction::None => {}
+        PenAction::Continue => {
+            // While building, keep the pen node in selected_nodes so
+            // that vertex handles are rendered for it.
+            if let Some(node_id) = pen_state.building_node()
+                && !select_state.selected_nodes.contains(&node_id)
+            {
+                select_state.selected_nodes.clear();
+                select_state.selected_nodes.push(node_id);
+            }
+            renderer.mark_dirty();
+        }
+        PenAction::Finished(node_id) => {
+            select_state.selected_nodes.clear();
+            select_state.selected_nodes.push(node_id);
+            *active_tool = ToolType::Select;
+            renderer.mark_dirty();
+        }
+        PenAction::Cancelled => {
+            select_state.selected_nodes.clear();
+            renderer.mark_dirty();
+        }
     }
 }
 
-fn draw_frame(gpu: &mut GpuState, scene: &Scene, active_tool: &mut ToolType) {
+impl App {
+    fn update_cursor(
+        camera: &Camera,
+        scene: &Scene,
+        select_state: &mut SelectState,
+        active_tool: ToolType,
+        is_panning: bool,
+        cursor_pos: Option<[f32; 2]>,
+        gpu: &GpuState,
+        pen_state: &PenState,
+    ) {
+        let _ = pen_state; // Used for future cursor refinements
+        if gpu.egui_ctx.egui_wants_pointer_input() {
+            gpu.window.set_cursor(winit::window::CursorIcon::Default);
+            // Clear hover when over egui
+            if select_state.hovered.is_some() {
+                select_state.hovered = None;
+                gpu.window.request_redraw();
+            }
+            return;
+        }
+
+        if is_panning || select_state.is_dragging_vertices() {
+            gpu.window.set_cursor(winit::window::CursorIcon::Grabbing);
+        } else if active_tool == ToolType::Select {
+            if let Some(pos) = cursor_pos {
+                let canvas = camera.screen_to_canvas(pos[0], pos[1]);
+                let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
+
+                // Update vertex hover (only within object-selected nodes)
+                let hover_changed = select_state.update_hover(
+                    scene,
+                    canvas_f64,
+                    camera.zoom as f64,
+                );
+                if hover_changed {
+                    gpu.window.request_redraw();
+                }
+
+                // Cursor: grab for selected vertex, pointer for clickable object, default otherwise
+                if select_state.hovered.is_some_and(|vr| select_state.selected.contains(&vr)) {
+                    gpu.window.set_cursor(winit::window::CursorIcon::Grab);
+                } else if select_state.hovered.is_some() {
+                    // Hovering a vertex handle of a selected object (but vertex not yet selected)
+                    gpu.window.set_cursor(winit::window::CursorIcon::Pointer);
+                } else if SelectState::object_hit_test(scene, canvas_f64).is_some() {
+                    // Hovering over an unselected object
+                    gpu.window.set_cursor(winit::window::CursorIcon::Pointer);
+                } else {
+                    gpu.window.set_cursor(winit::window::CursorIcon::Default);
+                }
+            } else {
+                if select_state.hovered.is_some() {
+                    select_state.hovered = None;
+                    gpu.window.request_redraw();
+                }
+                gpu.window.set_cursor(winit::window::CursorIcon::Default);
+            }
+        } else if active_tool == ToolType::Pen
+            || active_tool == ToolType::Rectangle
+            || active_tool == ToolType::Ellipse
+        {
+            gpu.window.set_cursor(winit::window::CursorIcon::Crosshair);
+        } else {
+            gpu.window.set_cursor(winit::window::CursorIcon::Default);
+        }
+    }
+
+    fn draw(&mut self) {
+        // Destructure to get disjoint borrows
+        let Some(gpu) = &mut self.gpu else { return };
+        let scene = &mut self.scene;
+        let active_tool = &mut self.active_tool;
+        let camera = &mut self.camera;
+        let select_state = &mut self.select_state;
+        let pen_state = &mut self.pen_state;
+        let pending_zoom_to_fit = &mut self.pending_zoom_to_fit;
+        let canvas_rect = &mut self.canvas_rect;
+
+        draw_frame(gpu, scene, active_tool, camera, select_state, pen_state, pending_zoom_to_fit, canvas_rect);
+    }
+}
+
+fn draw_frame(
+    gpu: &mut GpuState,
+    scene: &mut Scene,
+    active_tool: &mut ToolType,
+    camera: &mut Camera,
+    select_state: &mut SelectState,
+    pen_state: &mut PenState,
+    pending_zoom_to_fit: &mut bool,
+    canvas_rect: &mut [f32; 4],
+) {
     let output = match gpu.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(t) => t,
         wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
@@ -265,11 +678,32 @@ fn draw_frame(gpu: &mut GpuState, scene: &Scene, active_tool: &mut ToolType) {
 
     let view = output.texture.create_view(&Default::default());
 
-    // Run egui
+    // Run egui — use begin_pass/end_pass so the canvas area is NOT part of
+    // any egui Ui, which lets is_pointer_over_egui() return false for it.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
-    let full_output = gpu.egui_ctx.run_ui(raw_input, |ui| {
-        run_ui(ui, active_tool);
-    });
+    gpu.egui_ctx.begin_pass(raw_input);
+    let reorder = run_ui(&gpu.egui_ctx, active_tool, scene, select_state, pen_state, &mut gpu.renderer, pending_zoom_to_fit);
+
+    // Capture the canvas rect (area not covered by egui panels) before ending the pass.
+    #[expect(deprecated)] // content_rect may not exist in this egui version yet
+    let avail = gpu.egui_ctx.available_rect();
+    *canvas_rect = [avail.min.x, avail.min.y, avail.width(), avail.height()];
+
+    let full_output = gpu.egui_ctx.end_pass();
+
+    // Apply any reorder from the structure panel (before renderer.prepare).
+    if let Some((node_id, new_parent, index)) = reorder {
+        if scene.reparent(node_id, new_parent, index) {
+            gpu.renderer.mark_dirty();
+        }
+    }
+
+    // Handle pending zoom-to-fit (e.g. after loading an SVG).
+    if *pending_zoom_to_fit {
+        *pending_zoom_to_fit = false;
+        let bounds = scene.content_bounds();
+        camera.zoom_to_fit(bounds, *canvas_rect);
+    }
 
     gpu.egui_state
         .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -303,8 +737,14 @@ fn draw_frame(gpu: &mut GpuState, scene: &Scene, active_tool: &mut ToolType) {
         &screen_descriptor,
     );
 
-    // Prepare vector scene
-    gpu.renderer.prepare(&gpu.device, &gpu.queue, scene);
+    // Update camera and prepare vector scene
+    gpu.renderer.set_camera(
+        gpu.surface_config.width as f32,
+        gpu.surface_config.height as f32,
+        camera.pan,
+        camera.zoom,
+    );
+    gpu.renderer.prepare(&gpu.device, &gpu.queue, scene, select_state);
 
     // Create render pass — forget_lifetime() decouples the pass from the encoder
     // borrow, which is required by egui-wgpu 0.31's render() expecting RenderPass<'static>.
@@ -357,19 +797,30 @@ fn draw_frame(gpu: &mut GpuState, scene: &Scene, active_tool: &mut ToolType) {
     }
 }
 
-/// UI layout — free function to avoid borrowing `self`.
-fn run_ui(ui: &mut egui::Ui, active_tool: &mut ToolType) {
-    let mut dump_requested = false;
+/// A pending reorder: (node to move, new parent, index within new parent).
+type ReorderCommand = Option<(vector_scene::NodeId, vector_scene::NodeId, usize)>;
 
-    let menu_resp = egui::Panel::top("menu_bar").show_inside(ui, |ui| {
+/// UI layout — uses begin_pass/end_pass with Panel::show on the Context directly,
+/// so the canvas area is NOT part of any egui Ui. This lets
+/// `is_pointer_over_egui()` return false for the canvas.
+///
+/// Returns an optional reorder command from the structure panel drag-and-drop.
+#[expect(deprecated)] // Panel::show is deprecated in 0.34 but needed for top-level panels
+fn run_ui(ctx: &egui::Context, active_tool: &mut ToolType, scene: &mut Scene, selection: &mut SelectState, pen_state: &mut PenState, renderer: &mut Renderer, pending_zoom_to_fit: &mut bool) -> ReorderCommand {
+    let mut dump_requested = false;
+    let mut reorder_cmd: ReorderCommand = None;
+    let mut open_requested = false;
+    let mut save_requested = false;
+
+    let menu_resp = egui::Panel::top("menu_bar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open SVG...").clicked() {
-                    // TODO: file dialog via rfd
+                    open_requested = true;
                     ui.close();
                 }
-                if ui.button("Export SVG...").clicked() {
-                    // TODO: export
+                if ui.button("Save SVG...").clicked() {
+                    save_requested = true;
                     ui.close();
                 }
             });
@@ -395,11 +846,27 @@ fn run_ui(ui: &mut egui::Ui, active_tool: &mut ToolType) {
     let tools_resp = egui::Panel::left("tools_panel")
         .default_size(120.0)
         .resizable(false)
-        .show_inside(ui, |ui| {
+        .show(ctx, |ui| {
             ui.vertical(|ui| {
                 for &tool in ToolType::ALL {
                     let label = format!("{} {}", tool.icon(), tool.name());
                     if ui.selectable_label(*active_tool == tool, label).clicked() {
+                        // Finish pen path if switching away from pen tool.
+                        if *active_tool == ToolType::Pen && tool != ToolType::Pen && pen_state.is_building() {
+                            let action = pen_state.finish(scene, false);
+                            match action {
+                                PenAction::Finished(node_id) => {
+                                    selection.selected_nodes.clear();
+                                    selection.selected_nodes.push(node_id);
+                                    renderer.mark_dirty();
+                                }
+                                PenAction::Cancelled => {
+                                    selection.selected_nodes.clear();
+                                    renderer.mark_dirty();
+                                }
+                                _ => {}
+                            }
+                        }
                         *active_tool = tool;
                     }
                 }
@@ -407,11 +874,11 @@ fn run_ui(ui: &mut egui::Ui, active_tool: &mut ToolType) {
         });
 
     let mut properties_rect = egui::Rect::NOTHING;
-    let mut layers_rect = egui::Rect::NOTHING;
+    let mut structure_rect = egui::Rect::NOTHING;
 
     let inspector_resp = egui::Panel::right("inspector_panel")
         .default_size(220.0)
-        .show_inside(ui, |ui| {
+        .show(ctx, |ui| {
             let half = ui.available_height() * 0.5;
 
             // Properties — top half
@@ -424,23 +891,28 @@ fn run_ui(ui: &mut egui::Ui, active_tool: &mut ToolType) {
                     egui::ScrollArea::vertical()
                         .id_salt("properties_scroll")
                         .show(ui, |ui| {
-                            ui.label("No selection");
+                            show_properties(ui, scene, selection, renderer);
                         });
                 });
             properties_rect = props_resp.response.rect;
 
-            // Layers — bottom half
-            let layers_resp = egui::CentralPanel::default()
+            // Structure — bottom half (scene graph tree)
+            let structure_resp = egui::CentralPanel::default()
                 .show_inside(ui, |ui| {
-                    ui.heading("Layers");
+                    ui.heading("Structure");
                     ui.separator();
                     egui::ScrollArea::vertical()
-                        .id_salt("layers_scroll")
+                        .id_salt("structure_scroll")
                         .show(ui, |ui| {
-                            // TODO: tree view of scene nodes
+                            let root = scene.root();
+                            if let Some(root_node) = scene.get(root) {
+                                // Don't show root itself, just its children
+                                let children: Vec<_> = root_node.children.clone();
+                                show_children(ui, scene, root, &children, selection, &mut reorder_cmd);
+                            }
                         });
                 });
-            layers_rect = layers_resp.response.rect;
+            structure_rect = structure_resp.response.rect;
         });
 
     if dump_requested {
@@ -450,15 +922,469 @@ fn run_ui(ui: &mut egui::Ui, active_tool: &mut ToolType) {
                 r.min.x, r.min.y, r.width(), r.height()
             )
         }
-        let available = ui.max_rect();
+        #[expect(deprecated)]
+        let available = ctx.available_rect();
         log::info!("=== egui layout dump ===");
-        log::info!("{}", fmt_rect("root_ui", available));
+        log::info!("{}", fmt_rect("canvas (available)", available));
         log::info!("{}", fmt_rect("menu_bar", menu_resp.response.rect));
         log::info!("{}", fmt_rect("tools_panel", tools_resp.response.rect));
         log::info!("{}", fmt_rect("inspector_panel", inspector_resp.response.rect));
         log::info!("{}", fmt_rect("  properties", properties_rect));
-        log::info!("{}", fmt_rect("  layers", layers_rect));
+        log::info!("{}", fmt_rect("  structure", structure_rect));
         log::info!("========================");
+    }
+
+    // ── File dialogs (blocking — runs after egui pass) ──
+
+    if open_requested {
+        // Finish any in-progress pen path before loading.
+        if pen_state.is_building() {
+            let action = pen_state.finish(scene, false);
+            match action {
+                PenAction::Finished(node_id) => {
+                    selection.selected_nodes.clear();
+                    selection.selected_nodes.push(node_id);
+                    renderer.mark_dirty();
+                }
+                PenAction::Cancelled => {
+                    selection.selected_nodes.clear();
+                    renderer.mark_dirty();
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("SVG files", &["svg"])
+            .pick_file()
+        {
+            match std::fs::read(&path) {
+                Ok(data) => match vector_svg::import_svg(&data) {
+                    Ok(new_scene) => {
+                        *scene = new_scene;
+                        *selection = SelectState::default();
+                        *pending_zoom_to_fit = true;
+                        renderer.mark_dirty();
+                        log::info!("Opened SVG: {}", path.display());
+                    }
+                    Err(e) => log::error!("Failed to import SVG: {e}"),
+                },
+                Err(e) => log::error!("Failed to read file: {e}"),
+            }
+        }
+    }
+
+    if save_requested {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("SVG files", &["svg"])
+            .set_file_name("untitled.svg")
+            .save_file()
+        {
+            let svg = vector_svg::export_svg(scene);
+            match std::fs::write(&path, &svg) {
+                Ok(()) => log::info!("Saved SVG: {}", path.display()),
+                Err(e) => log::error!("Failed to save file: {e}"),
+            }
+        }
+    }
+
+    reorder_cmd
+}
+
+// ── Color conversion helpers ─────────────────────────────────────────
+
+/// Convert our linear RGBA `Color` to egui's sRGB `Color32`.
+fn color_to_egui(c: vector_geom::Color) -> egui::Color32 {
+    let [r, g, b, a] = c.to_srgb8();
+    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// Convert egui's sRGB `Color32` to our linear RGBA `Color`.
+fn egui_to_color(c: egui::Color32) -> vector_geom::Color {
+    vector_geom::Color::from_srgb8(c.r(), c.g(), c.b(), c.a())
+}
+
+// ── Properties panel ─────────────────────────────────────────────────
+
+/// Show fill/stroke properties for the current selection.
+fn show_properties(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    selection: &SelectState,
+    renderer: &mut Renderer,
+) {
+    if selection.selected_nodes.is_empty() {
+        ui.label("No selection");
+        return;
+    }
+
+    if selection.selected_nodes.len() > 1 {
+        ui.label(format!("{} objects selected", selection.selected_nodes.len()));
+        ui.separator();
+        // For multi-selection, apply changes to all selected nodes.
+        // Read from the first node as the "reference".
+    }
+
+    // Collect the node IDs so we don't borrow selection during scene mutation.
+    let node_ids: Vec<_> = selection.selected_nodes.clone();
+
+    // Read current style from the first selected path node.
+    let reference_style = node_ids.iter().find_map(|&id| {
+        let node = scene.get(id)?;
+        match &node.data {
+            vector_scene::NodeData::Path { style, .. } => Some(style.clone()),
+            _ => None,
+        }
+    });
+
+    let Some(mut style) = reference_style else {
+        ui.label("Selected node has no style");
+        return;
+    };
+
+    let mut changed = false;
+
+    // ── Fill section ──
+    ui.label(egui::RichText::new("Fill").strong());
+    let mut has_fill = style.fill.is_some();
+    if ui.checkbox(&mut has_fill, "Enabled").changed() {
+        if has_fill && style.fill.is_none() {
+            // Add default fill
+            style.fill = Some(vector_scene::style::Fill {
+                paint: vector_scene::PaintRef::Solid(vector_geom::Color::BLACK),
+                rule: vector_scene::FillRule::NonZero,
+                opacity: 1.0,
+            });
+        } else if !has_fill {
+            style.fill = None;
+        }
+        changed = true;
+    }
+
+    if let Some(ref mut fill) = style.fill {
+        if let vector_scene::PaintRef::Solid(ref mut color) = fill.paint {
+            let mut egui_color = color_to_egui(*color);
+            if ui.color_edit_button_srgba(&mut egui_color).changed() {
+                *color = egui_to_color(egui_color);
+                changed = true;
+            }
+        }
+        if ui.add(egui::Slider::new(&mut fill.opacity, 0.0..=1.0).text("Opacity")).changed() {
+            changed = true;
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+
+    // ── Stroke section ──
+    ui.label(egui::RichText::new("Stroke").strong());
+    let mut has_stroke = style.stroke.is_some();
+    if ui.checkbox(&mut has_stroke, "Enabled").changed() {
+        if has_stroke && style.stroke.is_none() {
+            style.stroke = Some(vector_scene::style::Stroke {
+                paint: vector_scene::PaintRef::Solid(vector_geom::Color::BLACK),
+                style: vector_scene::StrokeStyle::default(),
+                opacity: 1.0,
+            });
+        } else if !has_stroke {
+            style.stroke = None;
+        }
+        changed = true;
+    }
+
+    if let Some(ref mut stroke) = style.stroke {
+        if let vector_scene::PaintRef::Solid(ref mut color) = stroke.paint {
+            let mut egui_color = color_to_egui(*color);
+            if ui.color_edit_button_srgba(&mut egui_color).changed() {
+                *color = egui_to_color(egui_color);
+                changed = true;
+            }
+        }
+
+        let mut width = stroke.style.width as f32;
+        if ui.add(egui::Slider::new(&mut width, 0.0..=50.0).text("Width")).changed() {
+            stroke.style.width = width as f64;
+            changed = true;
+        }
+
+        if ui.add(egui::Slider::new(&mut stroke.opacity, 0.0..=1.0).text("Opacity")).changed() {
+            changed = true;
+        }
+    }
+
+    // Apply changes to all selected path nodes.
+    if changed {
+        for &node_id in &node_ids {
+            if let Some(node) = scene.get_mut(node_id) {
+                if let vector_scene::NodeData::Path {
+                    style: ref mut node_style,
+                    ..
+                } = node.data
+                {
+                    *node_style = style.clone();
+                }
+            }
+        }
+        renderer.mark_dirty();
+    }
+}
+
+/// Build the display label and icon for a scene node.
+fn node_display(node: &vector_scene::Node) -> (&'static str, String) {
+    use vector_scene::NodeData;
+
+    let icon = match &node.data {
+        NodeData::Group { is_defs: true } => egui_phosphor::regular::LOCK_KEY,
+        NodeData::Group { is_defs: false } => egui_phosphor::regular::FOLDER,
+        NodeData::Path { .. } => egui_phosphor::regular::PATH,
+        NodeData::Paint(_) => egui_phosphor::regular::PALETTE,
+        NodeData::Text(_) => egui_phosphor::regular::TEXT_AA,
+    };
+
+    let label = if node.label.is_empty() {
+        match &node.data {
+            NodeData::Group { is_defs: true } => "defs".to_string(),
+            NodeData::Group { .. } => "Group".to_string(),
+            NodeData::Path { .. } => "Path".to_string(),
+            NodeData::Paint(_) => "Paint".to_string(),
+            NodeData::Text(t) => {
+                let preview: String = t.content.chars().take(20).collect();
+                if t.content.len() > 20 {
+                    format!("{preview}...")
+                } else {
+                    preview
+                }
+            }
+        }
+    } else {
+        node.label.clone()
+    };
+
+    (icon, label)
+}
+
+/// Render a list of sibling nodes with drop-slots between them for reordering.
+///
+/// `parent_id` is the parent whose children we're rendering. Each child gets a
+/// drop slot before it, plus one final slot after the last child.
+fn show_children(
+    ui: &mut egui::Ui,
+    scene: &Scene,
+    parent_id: vector_scene::NodeId,
+    children: &[vector_scene::NodeId],
+    selection: &SelectState,
+    reorder_cmd: &mut ReorderCommand,
+) {
+    for (i, &child_id) in children.iter().enumerate() {
+        // Drop slot before this child (insert at index i)
+        drop_slot(ui, parent_id, i, reorder_cmd);
+        // The node itself
+        show_scene_node(ui, scene, child_id, selection, reorder_cmd);
+    }
+    // Final drop slot after last child
+    drop_slot(ui, parent_id, children.len(), reorder_cmd);
+}
+
+/// A thin drop target between sibling rows. When a node is dragged over it,
+/// it highlights; when released, it emits a reorder command.
+fn drop_slot(
+    ui: &mut egui::Ui,
+    parent_id: vector_scene::NodeId,
+    index: usize,
+    reorder_cmd: &mut ReorderCommand,
+) {
+    // Only show/interact when a drag is active
+    if !egui::DragAndDrop::has_any_payload(ui.ctx()) {
+        return;
+    }
+
+    let id = egui::Id::new(("drop_slot", parent_id, index));
+    let is_being_dragged_here = ui.ctx().is_being_dragged(id);
+    _ = is_being_dragged_here;
+
+    // Allocate a thin horizontal strip
+    let desired = egui::vec2(ui.available_width(), 4.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+
+    // Check if a NodeId payload is hovering over this slot
+    let hovering = response.contains_pointer()
+        && egui::DragAndDrop::has_payload_of_type::<vector_scene::NodeId>(ui.ctx());
+
+    if hovering {
+        // Visual feedback: draw a bright line
+        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255));
+        ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+    }
+
+    // Check for drop
+    if hovering && ui.input(|i| i.pointer.any_released()) {
+        if let Some(dragged_id) = egui::DragAndDrop::take_payload::<vector_scene::NodeId>(ui.ctx()) {
+            *reorder_cmd = Some((*dragged_id, parent_id, index));
+        }
+    }
+}
+
+/// Recursively render a scene node and its children in the structure panel.
+/// Each node is a drag source for reordering.
+fn show_scene_node(
+    ui: &mut egui::Ui,
+    scene: &Scene,
+    node_id: vector_scene::NodeId,
+    selection: &SelectState,
+    reorder_cmd: &mut ReorderCommand,
+) {
+    use vector_scene::NodeData;
+
+    let Some(node) = scene.get(node_id) else {
+        return;
+    };
+
+    let is_defs = matches!(&node.data, NodeData::Group { is_defs: true });
+    let is_group = matches!(&node.data, NodeData::Group { .. });
+    let has_children = !node.children.is_empty() && !is_defs;
+
+    let (icon, label) = node_display(node);
+    let children: Vec<_> = node.children.clone();
+
+    // Check if this node is object-selected
+    let node_selected = selection.is_node_selected(node_id);
+
+    // Text color: dim invisible/defs, highlight selected
+    let text_color = if !node.visible || is_defs {
+        ui.visuals().weak_text_color()
+    } else if node_selected {
+        egui::Color32::from_rgb(80, 160, 255) // selection blue
+    } else {
+        ui.visuals().text_color()
+    };
+
+    // Visibility icon
+    let vis_icon = if node.visible {
+        egui_phosphor::regular::EYE
+    } else {
+        egui_phosphor::regular::EYE_SLASH
+    };
+
+    // Don't allow dragging the defs group
+    let draggable = !is_defs;
+
+    if has_children && is_group {
+        // Collapsible group with drag support
+        let header_text = format!("{vis_icon}  {icon} {label}");
+
+        if draggable {
+            let drag_id = egui::Id::new(("struct_drag", node_id));
+
+            // Check if THIS node is currently being dragged
+            if ui.ctx().is_being_dragged(drag_id) {
+                // Render a ghost at the cursor
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                egui::Area::new(egui::Id::new(("drag_ghost", node_id)))
+                    .interactable(false)
+                    .pivot(egui::Align2::LEFT_CENTER)
+                    .current_pos(ui.ctx().pointer_hover_pos().unwrap_or_default())
+                    .show(ui.ctx(), |ui| {
+                        let frame = egui::Frame::popup(ui.style()).fill(
+                            egui::Color32::from_rgba_premultiplied(50, 50, 50, 200),
+                        );
+                        frame.show(ui, |ui| {
+                            ui.label(egui::RichText::new(&header_text).color(text_color));
+                        });
+                    });
+
+                // Show a placeholder in the original position
+                ui.label(
+                    egui::RichText::new(&header_text)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            } else {
+                // Normal rendering — collapsing header with drag sense
+                let header = egui::CollapsingHeader::new(
+                    egui::RichText::new(&header_text).color(text_color),
+                )
+                .id_salt(node_id)
+                .default_open(true);
+
+                let resp = header.show(ui, |ui| {
+                    show_children(ui, scene, node_id, &children, selection, reorder_cmd);
+                });
+
+                // Make the header row a drag source
+                let header_resp = resp.header_response;
+                if header_resp.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), node_id);
+                    ui.ctx().set_dragged_id(drag_id);
+                }
+            }
+        } else {
+            // Non-draggable (defs) — just show the header
+            let header = egui::CollapsingHeader::new(
+                egui::RichText::new(header_text).color(text_color),
+            )
+            .id_salt(node_id)
+            .default_open(true);
+
+            header.show(ui, |ui| {
+                show_children(ui, scene, node_id, &children, selection, reorder_cmd);
+            });
+        }
+    } else {
+        // Leaf node — draggable row
+        let row_text = format!("{vis_icon}  {icon} {label}");
+
+        if draggable {
+            let drag_id = egui::Id::new(("struct_drag", node_id));
+
+            if ui.ctx().is_being_dragged(drag_id) {
+                // Ghost at cursor
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                egui::Area::new(egui::Id::new(("drag_ghost", node_id)))
+                    .interactable(false)
+                    .pivot(egui::Align2::LEFT_CENTER)
+                    .current_pos(ui.ctx().pointer_hover_pos().unwrap_or_default())
+                    .show(ui.ctx(), |ui| {
+                        let frame = egui::Frame::popup(ui.style()).fill(
+                            egui::Color32::from_rgba_premultiplied(50, 50, 50, 200),
+                        );
+                        frame.show(ui, |ui| {
+                            ui.label(egui::RichText::new(&row_text).color(text_color));
+                        });
+                    });
+
+                // Placeholder in original position
+                ui.label(
+                    egui::RichText::new(&row_text)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            } else {
+                // Normal row with drag sensing
+                let desired_size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::drag());
+
+                // Selection tint
+                if node_selected {
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        egui::Color32::from_rgba_premultiplied(40, 90, 160, 60),
+                    );
+                }
+
+                ui.put(rect, egui::Label::new(
+                    egui::RichText::new(&row_text).color(text_color),
+                ));
+
+                if response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), node_id);
+                    ui.ctx().set_dragged_id(drag_id);
+                }
+            }
+        } else {
+            // Non-draggable leaf (shouldn't happen in practice, but handle gracefully)
+            ui.label(egui::RichText::new(row_text).color(text_color));
+        }
     }
 }
 
