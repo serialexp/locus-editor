@@ -106,13 +106,21 @@ fn write_node(scene: &Scene, id: NodeId, indent: usize, buf: &mut String) {
                 }
                 match stroke.style.cap {
                     LineCap::Butt => {} // SVG default
-                    LineCap::Round => { let _ = write!(buf, r#" stroke-linecap="round""#); }
-                    LineCap::Square => { let _ = write!(buf, r#" stroke-linecap="square""#); }
+                    LineCap::Round => {
+                        let _ = write!(buf, r#" stroke-linecap="round""#);
+                    }
+                    LineCap::Square => {
+                        let _ = write!(buf, r#" stroke-linecap="square""#);
+                    }
                 }
                 match stroke.style.join {
                     LineJoin::Miter => {} // SVG default
-                    LineJoin::Round => { let _ = write!(buf, r#" stroke-linejoin="round""#); }
-                    LineJoin::Bevel => { let _ = write!(buf, r#" stroke-linejoin="bevel""#); }
+                    LineJoin::Round => {
+                        let _ = write!(buf, r#" stroke-linejoin="round""#);
+                    }
+                    LineJoin::Bevel => {
+                        let _ = write!(buf, r#" stroke-linejoin="bevel""#);
+                    }
                 }
                 if (stroke.style.miter_limit - 4.0).abs() > 1e-4 {
                     let _ = write!(buf, r#" stroke-miterlimit="{}""#, stroke.style.miter_limit);
@@ -255,11 +263,9 @@ mod tests {
         let mut path = Path::new();
         path.subpaths.push(SubPath {
             start: Point::new(10.0, 20.0),
-            segments: vec![
-                Segment::Line {
-                    to: Point::new(30.0, 40.0),
-                },
-            ],
+            segments: vec![Segment::Line {
+                to: Point::new(30.0, 40.0),
+            }],
             closed: false,
         });
         let d = fmt_path_data(&path);
@@ -303,8 +309,12 @@ mod tests {
         path.subpaths.push(SubPath {
             start: Point::new(0.0, 0.0),
             segments: vec![
-                Segment::Line { to: Point::new(100.0, 0.0) },
-                Segment::Line { to: Point::new(50.0, 100.0) },
+                Segment::Line {
+                    to: Point::new(100.0, 0.0),
+                },
+                Segment::Line {
+                    to: Point::new(50.0, 100.0),
+                },
             ],
             closed: true,
         });

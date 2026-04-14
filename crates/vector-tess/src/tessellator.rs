@@ -1,9 +1,7 @@
+use lyon_tessellation::path::Path as LyonPath;
 use lyon_tessellation::{
     BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
 };
-use lyon_tessellation::geometry_builder::simple_builder;
-use lyon_tessellation::path::Path as LyonPath;
-use lyon_tessellation::path::Builder;
 
 use vector_geom::{Color, Path, Segment};
 
@@ -47,12 +45,13 @@ pub fn tessellate_path(
             .tessellate_path(
                 &lyon_path,
                 &StrokeOptions::default().with_line_width(width as f32),
-                &mut BuffersBuilder::new(&mut buffers, |vertex: lyon_tessellation::StrokeVertex| {
-                    Vertex {
+                &mut BuffersBuilder::new(
+                    &mut buffers,
+                    |vertex: lyon_tessellation::StrokeVertex| Vertex {
                         position: [vertex.position().x, vertex.position().y],
                         color: [color.r, color.g, color.b, color.a],
-                    }
-                }),
+                    },
+                ),
             )
             .expect("stroke tessellation failed");
     }

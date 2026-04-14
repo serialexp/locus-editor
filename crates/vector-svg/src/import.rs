@@ -1,6 +1,6 @@
 use vector_geom::{Color, Path, Point, Segment, SubPath};
-use vector_scene::{NodeData, Scene, Style};
 use vector_scene::Node;
+use vector_scene::{NodeData, Scene, Style};
 
 /// Import an SVG file from bytes into a scene graph.
 pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
@@ -10,7 +10,7 @@ pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
     let mut scene = Scene::new();
     let root = scene.root();
 
-    import_group(&tree.root(), &mut scene, root);
+    import_group(tree.root(), &mut scene, root);
 
     Ok(scene)
 }
@@ -28,10 +28,7 @@ fn import_group(group: &usvg::Group, scene: &mut Scene, parent: vector_scene::No
                 let path = convert_path(p.data());
                 let style = convert_style(p);
                 let mut node = Node::path(p.id().to_string(), path);
-                if let NodeData::Path {
-                    style: s, ..
-                } = &mut node.data
-                {
+                if let NodeData::Path { style: s, .. } = &mut node.data {
                     *s = style;
                 }
                 scene.insert(parent, node);
@@ -40,7 +37,10 @@ fn import_group(group: &usvg::Group, scene: &mut Scene, parent: vector_scene::No
                 log::warn!("Image nodes not yet supported, skipping");
             }
             usvg::Node::Text(t) => {
-                log::warn!("Text node '{}' not yet fully supported, importing as group", t.id());
+                log::warn!(
+                    "Text node '{}' not yet fully supported, importing as group",
+                    t.id()
+                );
             }
         }
     }
@@ -148,10 +148,13 @@ fn convert_style(path: &usvg::Path) -> Style {
                     usvg::LineJoin::Bevel => vector_scene::LineJoin::Bevel,
                 },
                 miter_limit: s.miterlimit().get() as f64,
-                dash: s.dasharray().as_ref().map(|d| vector_scene::style::DashPattern {
-                    array: d.iter().map(|v| *v as f64).collect(),
-                    offset: s.dashoffset() as f64,
-                }),
+                dash: s
+                    .dasharray()
+                    .as_ref()
+                    .map(|d| vector_scene::style::DashPattern {
+                        array: d.iter().map(|v| *v as f64).collect(),
+                        offset: s.dashoffset() as f64,
+                    }),
             },
             opacity: s.opacity().get(),
         }

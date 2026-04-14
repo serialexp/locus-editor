@@ -1,6 +1,6 @@
 use vector_geom::{Affine, Color, Point, Segment};
 use vector_scene::{NodeData, Scene};
-use vector_tess::{tessellate_path, Vertex};
+use vector_tess::{Vertex, tessellate_path};
 use vector_tools::{PointKind, SelectState, VertexRef};
 
 use crate::pipeline;
@@ -18,9 +18,11 @@ const GRID_MAJOR_SPACING: f32 = 10.0;
 const GRID_MINOR_MIN_SCREEN_PX: f32 = 4.0;
 
 /// The main renderer — owns the wgpu pipeline state and draws the scene.
+#[allow(clippy::struct_field_names)]
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    // Kept alive — wgpu requires the layout to outlive bind groups created from it.
+    _bind_group_layout: wgpu::BindGroupLayout,
     /// Uniform buffer holding the view-projection matrix.
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -79,7 +81,7 @@ impl Renderer {
 
         Self {
             pipeline,
-            bind_group_layout,
+            _bind_group_layout: bind_group_layout,
             globals_buffer,
             globals_bind_group,
             vertex_buffer: None,
@@ -150,50 +152,59 @@ impl Renderer {
 
         // Walk the visible tree (skip defs) and tessellate each path
         let root = scene.root();
-        scene.walk_depth_first(root, Affine::IDENTITY, &mut |_id, node, _world_transform| {
-            if !node.visible {
-                return;
-            }
-            if let NodeData::Path { ref path, ref style } = node.data {
-                let fill_color = style.fill.as_ref().map(|f| match &f.paint {
-                    vector_scene::PaintRef::Solid(c) => *c,
-                    _ => Color::BLACK, // TODO: gradient/pattern rendering
-                });
-
-                let stroke = style.stroke.as_ref().map(|s| {
-                    let color = match &s.paint {
+        scene.walk_depth_first(
+            root,
+            Affine::IDENTITY,
+            &mut |_id, node, _world_transform| {
+                if !node.visible {
+                    return;
+                }
+                if let NodeData::Path {
+                    ref path,
+                    ref style,
+                } = node.data
+                {
+                    let fill_color = style.fill.as_ref().map(|f| match &f.paint {
                         vector_scene::PaintRef::Solid(c) => *c,
-                        _ => Color::BLACK,
-                    };
-                    (color, s.style.width)
-                });
+                        _ => Color::BLACK, // TODO: gradient/pattern rendering
+                    });
 
-                let mesh = tessellate_path(path, fill_color, stroke);
+                    let stroke = style.stroke.as_ref().map(|s| {
+                        let color = match &s.paint {
+                            vector_scene::PaintRef::Solid(c) => *c,
+                            _ => Color::BLACK,
+                        };
+                        (color, s.style.width)
+                    });
 
-                let base = all_vertices.len() as u32;
-                all_vertices.extend_from_slice(&mesh.vertices);
-                all_indices.extend(mesh.indices.iter().map(|i| i + base));
-            }
-        });
+                    let mesh = tessellate_path(path, fill_color, stroke);
+
+                    let base = all_vertices.len() as u32;
+                    all_vertices.extend_from_slice(&mesh.vertices);
+                    all_indices.extend(mesh.indices.iter().map(|i| i + base));
+                }
+            },
+        );
 
         self.num_indices = all_indices.len() as u32;
 
         if self.num_indices > 0 {
             use wgpu::util::DeviceExt;
-            self.vertex_buffer =
-                Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            self.vertex_buffer = Some(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
                     label: Some("vector vertices"),
                     contents: bytemuck::cast_slice(&all_vertices),
                     usage: wgpu::BufferUsages::VERTEX,
-                }));
-            self.index_buffer =
-                Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                },
+            ));
+            self.index_buffer = Some(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
                     label: Some("vector indices"),
                     contents: bytemuck::cast_slice(&all_indices),
                     usage: wgpu::BufferUsages::INDEX,
-                }));
+                },
+            ));
         }
-
     }
 
     /// Build grid line geometry covering the visible canvas area.
@@ -230,9 +241,7 @@ impl Renderer {
         let show_minor = GRID_MINOR_SPACING * zoom >= GRID_MINOR_MIN_SCREEN_PX;
 
         // Helper: snap `lo` down to nearest multiple of `spacing`
-        let snap_down = |val: f32, spacing: f32| -> f32 {
-            (val / spacing).floor() * spacing
-        };
+        let snap_down = |val: f32, spacing: f32| -> f32 { (val / spacing).floor() * spacing };
 
         // --- Minor grid lines (drawn first, behind major) ---
         if show_minor {
@@ -244,9 +253,12 @@ impl Renderer {
                 let on_major = (x / GRID_MAJOR_SPACING).round() * GRID_MAJOR_SPACING;
                 if (x - on_major).abs() > minor * 0.01 {
                     push_quad(
-                        &mut verts, &mut idxs,
-                        x, (canvas_top + canvas_bottom) * 0.5,
-                        thickness, (canvas_bottom - canvas_top) * 0.5,
+                        &mut verts,
+                        &mut idxs,
+                        x,
+                        (canvas_top + canvas_bottom) * 0.5,
+                        thickness,
+                        (canvas_bottom - canvas_top) * 0.5,
                         minor_color,
                     );
                 }
@@ -258,9 +270,12 @@ impl Renderer {
                 let on_major = (y / GRID_MAJOR_SPACING).round() * GRID_MAJOR_SPACING;
                 if (y - on_major).abs() > minor * 0.01 {
                     push_quad(
-                        &mut verts, &mut idxs,
-                        (canvas_left + canvas_right) * 0.5, y,
-                        (canvas_right - canvas_left) * 0.5, thickness,
+                        &mut verts,
+                        &mut idxs,
+                        (canvas_left + canvas_right) * 0.5,
+                        y,
+                        (canvas_right - canvas_left) * 0.5,
+                        thickness,
                         minor_color,
                     );
                 }
@@ -276,9 +291,12 @@ impl Renderer {
             let mut x = snap_down(canvas_left, major);
             while x <= canvas_right {
                 push_quad(
-                    &mut verts, &mut idxs,
-                    x, (canvas_top + canvas_bottom) * 0.5,
-                    major_thickness, (canvas_bottom - canvas_top) * 0.5,
+                    &mut verts,
+                    &mut idxs,
+                    x,
+                    (canvas_top + canvas_bottom) * 0.5,
+                    major_thickness,
+                    (canvas_bottom - canvas_top) * 0.5,
                     major_color,
                 );
                 x += major;
@@ -287,9 +305,12 @@ impl Renderer {
             let mut y = snap_down(canvas_top, major);
             while y <= canvas_bottom {
                 push_quad(
-                    &mut verts, &mut idxs,
-                    (canvas_left + canvas_right) * 0.5, y,
-                    (canvas_right - canvas_left) * 0.5, major_thickness,
+                    &mut verts,
+                    &mut idxs,
+                    (canvas_left + canvas_right) * 0.5,
+                    y,
+                    (canvas_right - canvas_left) * 0.5,
+                    major_thickness,
                     major_color,
                 );
                 y += major;
@@ -300,18 +321,20 @@ impl Renderer {
 
         if self.grid_num_indices > 0 {
             use wgpu::util::DeviceExt;
-            self.grid_vertex_buffer =
-                Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            self.grid_vertex_buffer = Some(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
                     label: Some("grid vertices"),
                     contents: bytemuck::cast_slice(&verts),
                     usage: wgpu::BufferUsages::VERTEX,
-                }));
-            self.grid_index_buffer =
-                Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                },
+            ));
+            self.grid_index_buffer = Some(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
                     label: Some("grid indices"),
                     contents: bytemuck::cast_slice(&idxs),
                     usage: wgpu::BufferUsages::INDEX,
-                }));
+                },
+            ));
         } else {
             self.grid_vertex_buffer = None;
             self.grid_index_buffer = None;
@@ -320,7 +343,13 @@ impl Renderer {
 
     /// Generate small quads at each path vertex for the handle overlay.
     /// `zoom` is used to keep handles at constant screen-pixel size.
-    fn build_handles(&mut self, device: &wgpu::Device, scene: &Scene, selection: &SelectState, zoom: f32) {
+    fn build_handles(
+        &mut self,
+        device: &wgpu::Device,
+        scene: &Scene,
+        selection: &SelectState,
+        zoom: f32,
+    ) {
         let mut verts: Vec<Vertex> = Vec::new();
         let mut idxs: Vec<u32> = Vec::new();
 
@@ -340,6 +369,7 @@ impl Renderer {
 
         /// Pick the (fill, border) colors and size for a handle based on its state.
         #[inline]
+        #[allow(clippy::too_many_arguments)]
         fn pick_style(
             is_ctrl: bool,
             selected: bool,
@@ -387,71 +417,163 @@ impl Renderer {
                     // Start point
                     let vr = make_vr(PointKind::SubpathStart, 0);
                     let (fill, border) = pick_style(
-                        false, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                        anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                        selected_fill, selected_border, hovered_fill, hovered_border,
+                        false,
+                        selection.is_highlighted(&vr),
+                        selection.is_hovered(&vr),
+                        anchor_fill,
+                        anchor_border,
+                        ctrl_fill,
+                        ctrl_border,
+                        selected_fill,
+                        selected_border,
+                        hovered_fill,
+                        hovered_border,
                     );
-                    push_handle(&mut verts, &mut idxs, subpath.start, handle_size, fill, border);
+                    push_handle(
+                        &mut verts,
+                        &mut idxs,
+                        subpath.start,
+                        handle_size,
+                        fill,
+                        border,
+                    );
 
                     for (seg_idx, seg) in subpath.segments.iter().enumerate() {
                         match seg {
                             Segment::Line { to } => {
                                 let vr = make_vr(PointKind::Endpoint, seg_idx);
                                 let (fill, border) = pick_style(
-                                    false, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                                    anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                                    selected_fill, selected_border, hovered_fill, hovered_border,
+                                    false,
+                                    selection.is_highlighted(&vr),
+                                    selection.is_hovered(&vr),
+                                    anchor_fill,
+                                    anchor_border,
+                                    ctrl_fill,
+                                    ctrl_border,
+                                    selected_fill,
+                                    selected_border,
+                                    hovered_fill,
+                                    hovered_border,
                                 );
                                 push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
                             }
                             Segment::Quad { ctrl, to } => {
                                 let vr = make_vr(PointKind::QuadCtrl, seg_idx);
                                 let (fill, border) = pick_style(
-                                    true, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                                    anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                                    selected_fill, selected_border, hovered_fill, hovered_border,
+                                    true,
+                                    selection.is_highlighted(&vr),
+                                    selection.is_hovered(&vr),
+                                    anchor_fill,
+                                    anchor_border,
+                                    ctrl_fill,
+                                    ctrl_border,
+                                    selected_fill,
+                                    selected_border,
+                                    hovered_fill,
+                                    hovered_border,
                                 );
-                                push_handle(&mut verts, &mut idxs, *ctrl, ctrl_handle_size, fill, border);
+                                push_handle(
+                                    &mut verts,
+                                    &mut idxs,
+                                    *ctrl,
+                                    ctrl_handle_size,
+                                    fill,
+                                    border,
+                                );
 
                                 let vr = make_vr(PointKind::Endpoint, seg_idx);
                                 let (fill, border) = pick_style(
-                                    false, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                                    anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                                    selected_fill, selected_border, hovered_fill, hovered_border,
+                                    false,
+                                    selection.is_highlighted(&vr),
+                                    selection.is_hovered(&vr),
+                                    anchor_fill,
+                                    anchor_border,
+                                    ctrl_fill,
+                                    ctrl_border,
+                                    selected_fill,
+                                    selected_border,
+                                    hovered_fill,
+                                    hovered_border,
                                 );
                                 push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
                             }
                             Segment::Cubic { ctrl1, ctrl2, to } => {
                                 let vr = make_vr(PointKind::CubicCtrl1, seg_idx);
                                 let (fill, border) = pick_style(
-                                    true, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                                    anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                                    selected_fill, selected_border, hovered_fill, hovered_border,
+                                    true,
+                                    selection.is_highlighted(&vr),
+                                    selection.is_hovered(&vr),
+                                    anchor_fill,
+                                    anchor_border,
+                                    ctrl_fill,
+                                    ctrl_border,
+                                    selected_fill,
+                                    selected_border,
+                                    hovered_fill,
+                                    hovered_border,
                                 );
-                                push_handle(&mut verts, &mut idxs, *ctrl1, ctrl_handle_size, fill, border);
+                                push_handle(
+                                    &mut verts,
+                                    &mut idxs,
+                                    *ctrl1,
+                                    ctrl_handle_size,
+                                    fill,
+                                    border,
+                                );
 
                                 let vr = make_vr(PointKind::CubicCtrl2, seg_idx);
                                 let (fill, border) = pick_style(
-                                    true, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                                    anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                                    selected_fill, selected_border, hovered_fill, hovered_border,
+                                    true,
+                                    selection.is_highlighted(&vr),
+                                    selection.is_hovered(&vr),
+                                    anchor_fill,
+                                    anchor_border,
+                                    ctrl_fill,
+                                    ctrl_border,
+                                    selected_fill,
+                                    selected_border,
+                                    hovered_fill,
+                                    hovered_border,
                                 );
-                                push_handle(&mut verts, &mut idxs, *ctrl2, ctrl_handle_size, fill, border);
+                                push_handle(
+                                    &mut verts,
+                                    &mut idxs,
+                                    *ctrl2,
+                                    ctrl_handle_size,
+                                    fill,
+                                    border,
+                                );
 
                                 let vr = make_vr(PointKind::Endpoint, seg_idx);
                                 let (fill, border) = pick_style(
-                                    false, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                                    anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                                    selected_fill, selected_border, hovered_fill, hovered_border,
+                                    false,
+                                    selection.is_highlighted(&vr),
+                                    selection.is_hovered(&vr),
+                                    anchor_fill,
+                                    anchor_border,
+                                    ctrl_fill,
+                                    ctrl_border,
+                                    selected_fill,
+                                    selected_border,
+                                    hovered_fill,
+                                    hovered_border,
                                 );
                                 push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
                             }
                             Segment::Arc { to, .. } => {
                                 let vr = make_vr(PointKind::Endpoint, seg_idx);
                                 let (fill, border) = pick_style(
-                                    false, selection.is_highlighted(&vr), selection.is_hovered(&vr),
-                                    anchor_fill, anchor_border, ctrl_fill, ctrl_border,
-                                    selected_fill, selected_border, hovered_fill, hovered_border,
+                                    false,
+                                    selection.is_highlighted(&vr),
+                                    selection.is_hovered(&vr),
+                                    anchor_fill,
+                                    anchor_border,
+                                    ctrl_fill,
+                                    ctrl_border,
+                                    selected_fill,
+                                    selected_border,
+                                    hovered_fill,
+                                    hovered_border,
                                 );
                                 push_handle(&mut verts, &mut idxs, *to, handle_size, fill, border);
                             }
@@ -472,39 +594,76 @@ impl Renderer {
             let t = 1.0; // border thickness
 
             // Fill
-            push_quad(&mut verts, &mut idxs, (x0 + x1) * 0.5, (y0 + y1) * 0.5,
-                (x1 - x0) * 0.5, (y1 - y0) * 0.5, fill);
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                (x0 + x1) * 0.5,
+                (y0 + y1) * 0.5,
+                (x1 - x0) * 0.5,
+                (y1 - y0) * 0.5,
+                fill,
+            );
 
             // Top edge
-            push_quad(&mut verts, &mut idxs, (x0 + x1) * 0.5, y0,
-                (x1 - x0) * 0.5, t * 0.5, border);
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                (x0 + x1) * 0.5,
+                y0,
+                (x1 - x0) * 0.5,
+                t * 0.5,
+                border,
+            );
             // Bottom edge
-            push_quad(&mut verts, &mut idxs, (x0 + x1) * 0.5, y1,
-                (x1 - x0) * 0.5, t * 0.5, border);
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                (x0 + x1) * 0.5,
+                y1,
+                (x1 - x0) * 0.5,
+                t * 0.5,
+                border,
+            );
             // Left edge
-            push_quad(&mut verts, &mut idxs, x0, (y0 + y1) * 0.5,
-                t * 0.5, (y1 - y0) * 0.5, border);
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                x0,
+                (y0 + y1) * 0.5,
+                t * 0.5,
+                (y1 - y0) * 0.5,
+                border,
+            );
             // Right edge
-            push_quad(&mut verts, &mut idxs, x1, (y0 + y1) * 0.5,
-                t * 0.5, (y1 - y0) * 0.5, border);
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                x1,
+                (y0 + y1) * 0.5,
+                t * 0.5,
+                (y1 - y0) * 0.5,
+                border,
+            );
         }
 
         self.handle_num_indices = idxs.len() as u32;
 
         if self.handle_num_indices > 0 {
             use wgpu::util::DeviceExt;
-            self.handle_vertex_buffer =
-                Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            self.handle_vertex_buffer = Some(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
                     label: Some("handle vertices"),
                     contents: bytemuck::cast_slice(&verts),
                     usage: wgpu::BufferUsages::VERTEX,
-                }));
-            self.handle_index_buffer =
-                Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                },
+            ));
+            self.handle_index_buffer = Some(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
                     label: Some("handle indices"),
                     contents: bytemuck::cast_slice(&idxs),
                     usage: wgpu::BufferUsages::INDEX,
-                }));
+                },
+            ));
         } else {
             self.handle_vertex_buffer = None;
             self.handle_index_buffer = None;
@@ -517,32 +676,30 @@ impl Renderer {
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
 
         // Draw grid (behind everything)
-        if self.grid_num_indices > 0 {
-            if let (Some(vb), Some(ib)) = (&self.grid_vertex_buffer, &self.grid_index_buffer) {
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.grid_num_indices, 0, 0..1);
-            }
+        if self.grid_num_indices > 0
+            && let (Some(vb), Some(ib)) = (&self.grid_vertex_buffer, &self.grid_index_buffer)
+        {
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.grid_num_indices, 0, 0..1);
         }
 
         // Draw scene geometry
-        if self.num_indices > 0 {
-            if let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer) {
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.num_indices, 0, 0..1);
-            }
+        if self.num_indices > 0
+            && let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer)
+        {
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         // Draw handle overlay on top
-        if self.handle_num_indices > 0 {
-            if let (Some(vb), Some(ib)) =
-                (&self.handle_vertex_buffer, &self.handle_index_buffer)
-            {
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.handle_num_indices, 0, 0..1);
-            }
+        if self.handle_num_indices > 0
+            && let (Some(vb), Some(ib)) = (&self.handle_vertex_buffer, &self.handle_index_buffer)
+        {
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.handle_num_indices, 0, 0..1);
         }
     }
 }
@@ -581,14 +738,23 @@ fn push_quad(
     color: [f32; 4],
 ) {
     let base = verts.len() as u32;
-    verts.push(Vertex { position: [cx - half_x, cy - half_y], color });
-    verts.push(Vertex { position: [cx + half_x, cy - half_y], color });
-    verts.push(Vertex { position: [cx + half_x, cy + half_y], color });
-    verts.push(Vertex { position: [cx - half_x, cy + half_y], color });
-    idxs.extend_from_slice(&[
-        base, base + 1, base + 2,
-        base, base + 2, base + 3,
-    ]);
+    verts.push(Vertex {
+        position: [cx - half_x, cy - half_y],
+        color,
+    });
+    verts.push(Vertex {
+        position: [cx + half_x, cy - half_y],
+        color,
+    });
+    verts.push(Vertex {
+        position: [cx + half_x, cy + half_y],
+        color,
+    });
+    verts.push(Vertex {
+        position: [cx - half_x, cy + half_y],
+        color,
+    });
+    idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 /// Orthographic projection with pan and zoom.
@@ -606,9 +772,6 @@ fn camera_matrix(width: f32, height: f32, pan: [f32; 2], zoom: f32) -> [f32; 16]
     let ty = -2.0 * pan[1] / height + 1.0;
 
     [
-        sx,   0.0,  0.0, 0.0,
-        0.0,  sy,   0.0, 0.0,
-        0.0,  0.0,  1.0, 0.0,
-        tx,   ty,   0.0, 1.0,
+        sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, tx, ty, 0.0, 1.0,
     ]
 }

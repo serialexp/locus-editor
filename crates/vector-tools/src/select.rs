@@ -82,25 +82,19 @@ impl VertexRef {
                 }
             }
             PointKind::QuadCtrl => {
-                if let Some(Segment::Quad { ctrl, .. }) =
-                    subpath.segments.get_mut(self.segment)
-                {
+                if let Some(Segment::Quad { ctrl, .. }) = subpath.segments.get_mut(self.segment) {
                     ctrl.x += dx;
                     ctrl.y += dy;
                 }
             }
             PointKind::CubicCtrl1 => {
-                if let Some(Segment::Cubic { ctrl1, .. }) =
-                    subpath.segments.get_mut(self.segment)
-                {
+                if let Some(Segment::Cubic { ctrl1, .. }) = subpath.segments.get_mut(self.segment) {
                     ctrl1.x += dx;
                     ctrl1.y += dy;
                 }
             }
             PointKind::CubicCtrl2 => {
-                if let Some(Segment::Cubic { ctrl2, .. }) =
-                    subpath.segments.get_mut(self.segment)
-                {
+                if let Some(Segment::Cubic { ctrl2, .. }) = subpath.segments.get_mut(self.segment) {
                     ctrl2.x += dx;
                     ctrl2.y += dy;
                 }
@@ -209,10 +203,8 @@ impl SelectState {
 
         Self::for_each_vertex_in_nodes(scene, nodes, &mut |vr, pt| {
             let d = target.distance(pt);
-            if d < radius {
-                if best.as_ref().is_none_or(|(_, bd)| d < *bd) {
-                    best = Some((vr, d));
-                }
+            if d < radius && best.as_ref().is_none_or(|(_, bd)| d < *bd) {
+                best = Some((vr, d));
             }
         });
 
@@ -329,10 +321,8 @@ impl SelectState {
 
     /// Find all visible path nodes whose bounding boxes intersect the given rect.
     pub fn objects_in_rect(scene: &Scene, min: [f64; 2], max: [f64; 2]) -> Vec<NodeId> {
-        let query = vector_geom::Bounds::new(
-            Point::new(min[0], min[1]),
-            Point::new(max[0], max[1]),
-        );
+        let query =
+            vector_geom::Bounds::new(Point::new(min[0], min[1]), Point::new(max[0], max[1]));
         let mut result = Vec::new();
 
         let root = scene.root();
@@ -472,25 +462,20 @@ impl SelectState {
 
     /// Handle mouse release — finalize marquee or end vertex drag.
     pub fn on_release(&mut self) {
-        match &self.drag_mode {
-            DragMode::Marquee { shift, .. } => {
-                let shift = *shift;
-                for node_id in self.marquee_preview_nodes.drain(..) {
-                    if shift {
-                        // Toggle: remove if already selected, else add.
-                        if let Some(idx) =
-                            self.selected_nodes.iter().position(|n| *n == node_id)
-                        {
-                            self.selected_nodes.remove(idx);
-                        } else {
-                            self.selected_nodes.push(node_id);
-                        }
-                    } else if !self.selected_nodes.contains(&node_id) {
+        if let DragMode::Marquee { shift, .. } = &self.drag_mode {
+            let shift = *shift;
+            for node_id in self.marquee_preview_nodes.drain(..) {
+                if shift {
+                    // Toggle: remove if already selected, else add.
+                    if let Some(idx) = self.selected_nodes.iter().position(|n| *n == node_id) {
+                        self.selected_nodes.remove(idx);
+                    } else {
                         self.selected_nodes.push(node_id);
                     }
+                } else if !self.selected_nodes.contains(&node_id) {
+                    self.selected_nodes.push(node_id);
                 }
             }
-            _ => {}
         }
         self.marquee_preview_nodes.clear();
         self.drag_mode = DragMode::Idle;
@@ -511,9 +496,9 @@ impl SelectState {
     /// Get the current marquee rectangle in canvas coordinates, if active.
     pub fn marquee(&self) -> Option<([f64; 2], [f64; 2])> {
         match &self.drag_mode {
-            DragMode::Marquee { anchor, current, .. } => {
-                Some(marquee_rect(*anchor, *current))
-            }
+            DragMode::Marquee {
+                anchor, current, ..
+            } => Some(marquee_rect(*anchor, *current)),
             _ => None,
         }
     }
@@ -576,7 +561,8 @@ impl SelectState {
         // removing earlier indices doesn't invalidate later ones.
         let mut vertices = self.selected.clone();
         vertices.sort_by(|a, b| {
-            a.node.cmp(&b.node)
+            a.node
+                .cmp(&b.node)
                 .then(b.subpath.cmp(&a.subpath))
                 .then(b.segment.cmp(&a.segment))
                 .then(b.kind.cmp(&a.kind))
@@ -679,18 +665,16 @@ impl SelectState {
                 let mut current = subpath.start;
                 for (seg_idx, seg) in subpath.segments.iter().enumerate() {
                     let (_t, _pt, dist) = seg.closest_point(current, target);
-                    if dist < radius {
-                        if best.as_ref().is_none_or(|(_, bd)| dist < *bd) {
-                            best = Some((
-                                EdgeHit {
-                                    node: node_id,
-                                    subpath: sp_idx,
-                                    segment: seg_idx,
-                                    t: _t,
-                                },
-                                dist,
-                            ));
-                        }
+                    if dist < radius && best.as_ref().is_none_or(|(_, bd)| dist < *bd) {
+                        best = Some((
+                            EdgeHit {
+                                node: node_id,
+                                subpath: sp_idx,
+                                segment: seg_idx,
+                                t: _t,
+                            },
+                            dist,
+                        ));
                     }
                     current = seg.endpoint();
                 }

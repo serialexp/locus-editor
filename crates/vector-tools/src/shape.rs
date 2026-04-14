@@ -10,6 +10,7 @@ use vector_scene::{NodeData, NodeId, Scene};
 use crate::ToolType;
 
 /// Transient state for the rectangle / ellipse draw interaction.
+#[derive(Default)]
 pub struct ShapeDrawState {
     /// The anchor corner (where the mouse was pressed), in canvas coords.
     anchor: Option<[f64; 2]>,
@@ -17,23 +18,9 @@ pub struct ShapeDrawState {
     preview_node: Option<NodeId>,
 }
 
-impl Default for ShapeDrawState {
-    fn default() -> Self {
-        Self {
-            anchor: None,
-            preview_node: None,
-        }
-    }
-}
-
 impl ShapeDrawState {
     /// Handle mouse press — record anchor and insert a zero-size preview node.
-    pub fn on_press(
-        &mut self,
-        scene: &mut Scene,
-        canvas_pos: [f64; 2],
-        tool: ToolType,
-    ) {
+    pub fn on_press(&mut self, scene: &mut Scene, canvas_pos: [f64; 2], tool: ToolType) {
         // Remove stale preview if any
         self.cancel(scene);
 
@@ -58,12 +45,7 @@ impl ShapeDrawState {
 
     /// Handle mouse drag — update the preview shape to match the new extent.
     /// Returns `true` if the scene changed (caller should mark dirty + redraw).
-    pub fn on_drag(
-        &mut self,
-        scene: &mut Scene,
-        canvas_pos: [f64; 2],
-        tool: ToolType,
-    ) -> bool {
+    pub fn on_drag(&mut self, scene: &mut Scene, canvas_pos: [f64; 2], tool: ToolType) -> bool {
         let Some(anchor) = self.anchor else {
             return false;
         };
@@ -144,9 +126,15 @@ fn build_rect_path(a: [f64; 2], b: [f64; 2]) -> Path {
     path.subpaths.push(SubPath {
         start: Point::new(x0, y0),
         segments: vec![
-            Segment::Line { to: Point::new(x1, y0) },
-            Segment::Line { to: Point::new(x1, y1) },
-            Segment::Line { to: Point::new(x0, y1) },
+            Segment::Line {
+                to: Point::new(x1, y0),
+            },
+            Segment::Line {
+                to: Point::new(x1, y1),
+            },
+            Segment::Line {
+                to: Point::new(x0, y1),
+            },
         ],
         closed: true,
     });

@@ -7,7 +7,7 @@ mod select;
 mod shape;
 
 pub use pen::{PenAction, PenState};
-pub use select::{EdgeHit, VertexRef, PointKind, SelectState};
+pub use select::{EdgeHit, PointKind, SelectState, VertexRef};
 pub use shape::ShapeDrawState;
 
 /// The available editing tools.

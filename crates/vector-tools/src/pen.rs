@@ -56,7 +56,6 @@ pub struct PenState {
 
 // Default is derived — all fields are `None`, `0`, or empty `Vec`.
 
-
 impl PenState {
     /// Whether a path is currently being built.
     pub fn is_building(&self) -> bool {
@@ -71,12 +70,7 @@ impl PenState {
     // ── Press ───────────────────────────────────────────────────────
 
     /// Handle left mouse press at `canvas_pos`.
-    pub fn on_press(
-        &mut self,
-        scene: &mut Scene,
-        canvas_pos: [f64; 2],
-        zoom: f64,
-    ) -> PenAction {
+    pub fn on_press(&mut self, scene: &mut Scene, canvas_pos: [f64; 2], zoom: f64) -> PenAction {
         let pos = Point::new(canvas_pos[0], canvas_pos[1]);
         let radius = CLOSE_RADIUS_SCREEN_PX / zoom;
 
@@ -103,7 +97,8 @@ impl PenState {
 
             // Normal case — place a new anchor.
             self.trim_to_committed(scene);
-            let prev_anchor = self.last_committed_anchor(scene)
+            let prev_anchor = self
+                .last_committed_anchor(scene)
                 .or_else(|| self.subpath_start(scene))
                 .unwrap_or(pos);
             let segment = self.make_segment(prev_anchor, pos);
@@ -147,11 +142,7 @@ impl PenState {
 
     /// Handle mouse move while the left button is held (drag to define handles).
     /// Returns `true` if the scene changed and needs a redraw.
-    pub fn on_drag(
-        &mut self,
-        scene: &mut Scene,
-        canvas_pos: [f64; 2],
-    ) -> bool {
+    pub fn on_drag(&mut self, scene: &mut Scene, canvas_pos: [f64; 2]) -> bool {
         let Some(anchor) = self.drag_anchor else {
             return false;
         };
@@ -167,10 +158,7 @@ impl PenState {
         // Update the last committed segment's ctrl2 (incoming handle of the
         // anchor being dragged). The mirror of the drag position around the
         // anchor gives the incoming handle.
-        let mirror = Point::new(
-            2.0 * anchor.x - drag_pos.x,
-            2.0 * anchor.y - drag_pos.y,
-        );
+        let mirror = Point::new(2.0 * anchor.x - drag_pos.x, 2.0 * anchor.y - drag_pos.y);
 
         let Some(subpath) = self.get_subpath_mut(scene) else {
             return false;
@@ -207,12 +195,7 @@ impl PenState {
 
     /// Handle left mouse release after press (or press-drag).
     /// Returns `true` if the scene changed.
-    pub fn on_release(
-        &mut self,
-        _scene: &mut Scene,
-        canvas_pos: [f64; 2],
-        zoom: f64,
-    ) -> bool {
+    pub fn on_release(&mut self, _scene: &mut Scene, canvas_pos: [f64; 2], zoom: f64) -> bool {
         let Some(anchor) = self.drag_anchor.take() else {
             return false;
         };
@@ -245,17 +228,14 @@ impl PenState {
     /// Handle mouse move when not pressing (hover). Draws a preview segment
     /// from the last committed anchor to the cursor position.
     /// Returns `true` if the scene changed.
-    pub fn on_move(
-        &mut self,
-        scene: &mut Scene,
-        canvas_pos: [f64; 2],
-    ) -> bool {
+    pub fn on_move(&mut self, scene: &mut Scene, canvas_pos: [f64; 2]) -> bool {
         if self.building_node.is_none() || self.drag_anchor.is_some() {
             return false;
         }
 
         let cursor = Point::new(canvas_pos[0], canvas_pos[1]);
-        let prev_anchor = self.last_committed_anchor(scene)
+        let prev_anchor = self
+            .last_committed_anchor(scene)
             .or_else(|| self.subpath_start(scene))
             .unwrap_or(cursor);
 
@@ -336,26 +316,28 @@ impl PenState {
                 && let Some(subpath) = path.subpaths.first_mut()
             {
                 let start = subpath.start;
-                let last_anchor = subpath.segments.last()
+                let last_anchor = subpath
+                    .segments
+                    .last()
                     .map(|s| s.endpoint())
                     .unwrap_or(start);
 
                 let ctrl1 = self.prev_outgoing.unwrap_or(last_anchor);
-                let ctrl2 = self.start_outgoing
+                let ctrl2 = self
+                    .start_outgoing
                     .map(|h| Point::new(2.0 * start.x - h.x, 2.0 * start.y - h.y))
                     .unwrap_or(start);
 
-                let closing_seg = if ctrl1.distance(last_anchor) < 1e-9
-                    && ctrl2.distance(start) < 1e-9
-                {
-                    Segment::Line { to: start }
-                } else {
-                    Segment::Cubic {
-                        ctrl1,
-                        ctrl2,
-                        to: start,
-                    }
-                };
+                let closing_seg =
+                    if ctrl1.distance(last_anchor) < 1e-9 && ctrl2.distance(start) < 1e-9 {
+                        Segment::Line { to: start }
+                    } else {
+                        Segment::Cubic {
+                            ctrl1,
+                            ctrl2,
+                            to: start,
+                        }
+                    };
 
                 subpath.segments.push(closing_seg);
                 subpath.closed = true;
@@ -364,9 +346,10 @@ impl PenState {
 
         // Remove degenerate paths (no segments).
         let is_degenerate = scene.get(node_id).is_some_and(|n| match &n.data {
-            NodeData::Path { path, .. } => {
-                path.subpaths.first().is_none_or(|sp| sp.segments.is_empty())
-            }
+            NodeData::Path { path, .. } => path
+                .subpaths
+                .first()
+                .is_none_or(|sp| sp.segments.is_empty()),
             _ => true,
         });
 
@@ -411,7 +394,9 @@ impl PenState {
     /// Get the start point of the building subpath.
     fn subpath_start(&self, scene: &Scene) -> Option<Point> {
         let node = scene.get(self.building_node?)?;
-        let NodeData::Path { ref path, .. } = node.data else { return None };
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
         path.subpaths.first().map(|sp| sp.start)
     }
 
@@ -422,28 +407,43 @@ impl PenState {
             return None;
         }
         let node = scene.get(self.building_node?)?;
-        let NodeData::Path { ref path, .. } = node.data else { return None };
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
         let subpath = path.subpaths.first()?;
-        subpath.segments.get(self.committed_count - 1).map(|s| s.endpoint())
+        subpath
+            .segments
+            .get(self.committed_count - 1)
+            .map(|s| s.endpoint())
     }
 
     /// Remove any preview segment beyond the committed count.
     fn trim_to_committed(&mut self, scene: &mut Scene) {
-        let Some(node_id) = self.building_node else { return };
+        let Some(node_id) = self.building_node else {
+            return;
+        };
         self.trim_to_committed_with_node(scene, node_id);
     }
 
     fn trim_to_committed_with_node(&self, scene: &mut Scene, node_id: NodeId) {
-        let Some(node) = scene.get_mut(node_id) else { return };
-        let NodeData::Path { ref mut path, .. } = node.data else { return };
-        let Some(subpath) = path.subpaths.first_mut() else { return };
+        let Some(node) = scene.get_mut(node_id) else {
+            return;
+        };
+        let NodeData::Path { ref mut path, .. } = node.data else {
+            return;
+        };
+        let Some(subpath) = path.subpaths.first_mut() else {
+            return;
+        };
         subpath.segments.truncate(self.committed_count);
     }
 
     /// Get a mutable reference to the building subpath.
     fn get_subpath_mut<'a>(&self, scene: &'a mut Scene) -> Option<&'a mut SubPath> {
         let node = scene.get_mut(self.building_node?)?;
-        let NodeData::Path { ref mut path, .. } = node.data else { return None };
+        let NodeData::Path { ref mut path, .. } = node.data else {
+            return None;
+        };
         path.subpaths.first_mut()
     }
 

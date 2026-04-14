@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Bounds, Point};
 use crate::point::Vec2;
+use crate::{Bounds, Point};
 
 /// A single segment in a path. All segments are defined relative to
 /// an implicit "current point" (the endpoint of the previous segment,
@@ -9,15 +9,10 @@ use crate::point::Vec2;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Segment {
     /// Straight line to `to`.
-    Line {
-        to: Point,
-    },
+    Line { to: Point },
 
     /// Quadratic Bezier curve with one control point.
-    Quad {
-        ctrl: Point,
-        to: Point,
-    },
+    Quad { ctrl: Point, to: Point },
 
     /// Cubic Bezier curve with two control points.
     Cubic {
@@ -57,9 +52,7 @@ impl Segment {
         match self {
             Segment::Line { to } => Bounds::from_points([from, *to]),
             Segment::Quad { ctrl, to } => Bounds::from_points([from, *ctrl, *to]),
-            Segment::Cubic { ctrl1, ctrl2, to } => {
-                Bounds::from_points([from, *ctrl1, *ctrl2, *to])
-            }
+            Segment::Cubic { ctrl1, ctrl2, to } => Bounds::from_points([from, *ctrl1, *ctrl2, *to]),
             Segment::Arc { to, .. } => {
                 // TODO: compute tight arc bounds from the ellipse parameters.
                 // For now, control-point hull is a rough overestimate.
@@ -84,7 +77,9 @@ impl Segment {
                 sweep,
                 to,
             } => {
-                if let Some(cp) = ArcCenter::from_endpoint(from, *to, *radii, *x_rotation, *large_arc, *sweep) {
+                if let Some(cp) =
+                    ArcCenter::from_endpoint(from, *to, *radii, *x_rotation, *large_arc, *sweep)
+                {
                     let angle = cp.start_angle + t * cp.sweep_angle;
                     cp.point_at_angle(angle)
                 } else {
@@ -121,9 +116,7 @@ impl Segment {
                 (Segment::Line { to: mid }, Segment::Line { to: *to })
             }
             Segment::Quad { ctrl, to } => split_quad(from, *ctrl, *to, t),
-            Segment::Cubic { ctrl1, ctrl2, to } => {
-                split_cubic(from, *ctrl1, *ctrl2, *to, t)
-            }
+            Segment::Cubic { ctrl1, ctrl2, to } => split_cubic(from, *ctrl1, *ctrl2, *to, t),
             Segment::Arc {
                 radii,
                 x_rotation,
@@ -131,7 +124,9 @@ impl Segment {
                 sweep,
                 to,
             } => {
-                if let Some(cp) = ArcCenter::from_endpoint(from, *to, *radii, *x_rotation, *large_arc, *sweep) {
+                if let Some(cp) =
+                    ArcCenter::from_endpoint(from, *to, *radii, *x_rotation, *large_arc, *sweep)
+                {
                     let mid_angle = cp.start_angle + t * cp.sweep_angle;
                     let mid_point = cp.point_at_angle(mid_angle);
 
@@ -394,13 +389,7 @@ fn split_quad(p0: Point, p1: Point, p2: Point, t: f64) -> (Segment, Segment) {
 }
 
 /// De Casteljau split of a cubic bezier at parameter t.
-fn split_cubic(
-    p0: Point,
-    p1: Point,
-    p2: Point,
-    p3: Point,
-    t: f64,
-) -> (Segment, Segment) {
+fn split_cubic(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> (Segment, Segment) {
     let a = lerp_pt(p0, p1, t);
     let b = lerp_pt(p1, p2, t);
     let c = lerp_pt(p2, p3, t);
@@ -428,7 +417,9 @@ mod tests {
 
     #[test]
     fn line_eval_endpoints() {
-        let seg = Segment::Line { to: Point::new(10.0, 0.0) };
+        let seg = Segment::Line {
+            to: Point::new(10.0, 0.0),
+        };
         let from = Point::new(0.0, 0.0);
         assert_eq!(seg.eval_at(from, 0.0), from);
         assert_eq!(seg.eval_at(from, 1.0), Point::new(10.0, 0.0));
@@ -436,7 +427,9 @@ mod tests {
 
     #[test]
     fn line_eval_midpoint() {
-        let seg = Segment::Line { to: Point::new(10.0, 0.0) };
+        let seg = Segment::Line {
+            to: Point::new(10.0, 0.0),
+        };
         let mid = seg.eval_at(Point::ZERO, 0.5);
         assert!((mid.x - 5.0).abs() < 1e-10);
         assert!(mid.y.abs() < 1e-10);
@@ -444,7 +437,9 @@ mod tests {
 
     #[test]
     fn line_closest_point() {
-        let seg = Segment::Line { to: Point::new(10.0, 0.0) };
+        let seg = Segment::Line {
+            to: Point::new(10.0, 0.0),
+        };
         let (t, pt, dist) = seg.closest_point(Point::ZERO, Point::new(5.0, 3.0));
         assert!((t - 0.5).abs() < 1e-10);
         assert!((pt.x - 5.0).abs() < 1e-10);
@@ -453,7 +448,9 @@ mod tests {
 
     #[test]
     fn line_split() {
-        let seg = Segment::Line { to: Point::new(10.0, 0.0) };
+        let seg = Segment::Line {
+            to: Point::new(10.0, 0.0),
+        };
         let (a, b) = seg.split_at(Point::ZERO, 0.5);
         assert_eq!(a.endpoint().x, 5.0);
         assert_eq!(b.endpoint().x, 10.0);
@@ -551,7 +548,10 @@ mod tests {
 
         // Both halves should be arcs, not lines.
         assert!(matches!(a, Segment::Arc { .. }), "first half should be Arc");
-        assert!(matches!(b, Segment::Arc { .. }), "second half should be Arc");
+        assert!(
+            matches!(b, Segment::Arc { .. }),
+            "second half should be Arc"
+        );
 
         // The midpoint of the split should be on the circle.
         let mid = a.endpoint();

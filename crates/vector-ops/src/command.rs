@@ -7,12 +7,10 @@ pub enum Command {
     /// Insert a node as child of parent.
     Insert {
         parent: NodeId,
-        node: vector_scene::Node,
+        node: Box<vector_scene::Node>,
     },
     /// Delete a node (and its subtree).
-    Delete {
-        id: NodeId,
-    },
+    Delete { id: NodeId },
     /// Batch of commands applied atomically.
     Batch(Vec<Command>),
     // TODO: SetTransform, SetStyle, Reparent, SetPathData, etc.
@@ -23,7 +21,7 @@ impl Command {
     pub fn apply(self, scene: &mut Scene) -> Option<Command> {
         match self {
             Command::Insert { parent, node } => {
-                let id = scene.insert(parent, node)?;
+                let id = scene.insert(parent, *node)?;
                 Some(Command::Delete { id })
             }
             Command::Delete { id } => {
@@ -36,7 +34,10 @@ impl Command {
                 // TODO: handle full subtree re-insertion with correct parent relationships.
                 let (_, node) = removed.into_iter().next()?;
                 let parent = scene.root(); // TODO: remember original parent
-                Some(Command::Insert { parent, node })
+                Some(Command::Insert {
+                    parent,
+                    node: Box::new(node),
+                })
             }
             Command::Batch(cmds) => {
                 let mut undos: Vec<Command> = Vec::new();

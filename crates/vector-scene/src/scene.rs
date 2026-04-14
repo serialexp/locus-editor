@@ -94,10 +94,10 @@ impl Scene {
         self.remove_recursive(id, &mut removed);
 
         // Remove from parent's children list
-        if let Some(parent_id) = self.parents.remove(id) {
-            if let Some(parent) = self.nodes.get_mut(parent_id) {
-                parent.children.retain(|c| *c != id);
-            }
+        if let Some(parent_id) = self.parents.remove(id)
+            && let Some(parent) = self.nodes.get_mut(parent_id)
+        {
+            parent.children.retain(|c| *c != id);
         }
         removed
     }
@@ -120,10 +120,10 @@ impl Scene {
         }
 
         // Remove from old parent
-        if let Some(old_parent) = self.parents.get(id).copied() {
-            if let Some(parent) = self.nodes.get_mut(old_parent) {
-                parent.children.retain(|c| *c != id);
-            }
+        if let Some(old_parent) = self.parents.get(id).copied()
+            && let Some(parent) = self.nodes.get_mut(old_parent)
+        {
+            parent.children.retain(|c| *c != id);
         }
 
         // Add to new parent
@@ -164,17 +164,21 @@ impl Scene {
     /// Compute the bounding box of all visible path content (skipping defs).
     pub fn content_bounds(&self) -> vector_geom::Bounds {
         let mut bounds = vector_geom::Bounds::EMPTY;
-        self.walk_depth_first(self.root, vector_geom::Affine::IDENTITY, &mut |_id, node, _world| {
-            if !node.visible {
-                return;
-            }
-            if let crate::node::NodeData::Path { ref path, .. } = node.data {
-                let path_bounds = path.bounding_box();
-                if !path_bounds.is_empty() {
-                    bounds = bounds.union(path_bounds);
+        self.walk_depth_first(
+            self.root,
+            vector_geom::Affine::IDENTITY,
+            &mut |_id, node, _world| {
+                if !node.visible {
+                    return;
                 }
-            }
-        });
+                if let crate::node::NodeData::Path { ref path, .. } = node.data {
+                    let path_bounds = path.bounding_box();
+                    if !path_bounds.is_empty() {
+                        bounds = bounds.union(path_bounds);
+                    }
+                }
+            },
+        );
         bounds
     }
 }

@@ -26,19 +26,19 @@ impl History {
 
     /// Undo the last command.
     pub fn undo(&mut self, scene: &mut Scene) {
-        if let Some(undo_cmd) = self.undo_stack.pop() {
-            if let Some(redo_cmd) = undo_cmd.apply(scene) {
-                self.redo_stack.push(redo_cmd);
-            }
+        if let Some(undo_cmd) = self.undo_stack.pop()
+            && let Some(redo_cmd) = undo_cmd.apply(scene)
+        {
+            self.redo_stack.push(redo_cmd);
         }
     }
 
     /// Redo the last undone command.
     pub fn redo(&mut self, scene: &mut Scene) {
-        if let Some(redo_cmd) = self.redo_stack.pop() {
-            if let Some(undo_cmd) = redo_cmd.apply(scene) {
-                self.undo_stack.push(undo_cmd);
-            }
+        if let Some(redo_cmd) = self.redo_stack.pop()
+            && let Some(undo_cmd) = redo_cmd.apply(scene)
+        {
+            self.undo_stack.push(undo_cmd);
         }
     }
 
