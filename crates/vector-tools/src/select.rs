@@ -842,9 +842,7 @@ impl SelectState {
                     // Enforce smooth/symmetric constraints on the opposite handle.
                     if matches!(
                         vr.kind,
-                        PointKind::CubicCtrl1
-                            | PointKind::CubicCtrl2
-                            | PointKind::QuadCtrl
+                        PointKind::CubicCtrl1 | PointKind::CubicCtrl2 | PointKind::QuadCtrl
                     ) {
                         enforce_vertex_constraint(vr, scene);
                     }

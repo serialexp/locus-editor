@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use vector_geom::{Affine, Color, Point, Segment};
 use vector_scene::{
-    Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Pattern, Scene, SpreadMethod,
-    Stroke,
+    Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Pattern, Scene, SpreadMethod, Stroke,
 };
 use vector_tess::{
     DashPattern, LineCap, LineJoin, StrokeParams, TessPaint, TessellatedMesh, Vertex,
@@ -459,8 +458,7 @@ impl Renderer {
             let num_patterns = pattern_tiles.len();
             let mut deps: Vec<Vec<usize>> = vec![Vec::new(); num_patterns];
             for (i, (pattern, _)) in pattern_tiles.iter().enumerate() {
-                let refs =
-                    collect_pattern_paint_refs(scene, pattern.content, &pattern_node_ids);
+                let refs = collect_pattern_paint_refs(scene, pattern.content, &pattern_node_ids);
                 for ref_id in refs {
                     if let Some(&idx) = pattern_index_map.get(&ref_id) {
                         deps[i].push(idx as usize);
@@ -564,8 +562,7 @@ impl Renderer {
                     usage: wgpu::BufferUsages::INDEX,
                 });
 
-                let tile_view_proj =
-                    camera_matrix_ortho(tex_w as f32, tex_h as f32, &pattern.rect);
+                let tile_view_proj = camera_matrix_ortho(tex_w as f32, tex_h as f32, &pattern.rect);
                 let tile_globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("pattern tile globals"),
                     contents: bytemuck::cast_slice(&tile_view_proj),
@@ -590,8 +587,7 @@ impl Renderer {
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        usage: wgpu::TextureUsages::COPY_DST
-                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
                     });
                     let mut copy_encoder =
@@ -633,11 +629,7 @@ impl Renderer {
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     });
-                    queue.write_buffer(
-                        &tile_pat_buf,
-                        0,
-                        bytemuck::cast_slice(&gpu_patterns),
-                    );
+                    queue.write_buffer(&tile_pat_buf, 0, bytemuck::cast_slice(&gpu_patterns));
                     tile_pat_tex = tmp_array;
                     tile_pat_view =
                         tile_pat_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -663,10 +655,9 @@ impl Renderer {
                     &self.pattern_sampler,
                 );
 
-                let mut encoder =
-                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("pattern tile encoder"),
-                    });
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pattern tile encoder"),
+                });
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("pattern tile render"),
@@ -710,10 +701,9 @@ impl Renderer {
                 view_formats: &[],
             });
 
-            let mut copy_encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pattern atlas copy"),
-                });
+            let mut copy_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pattern atlas copy"),
+            });
             for (i, tex) in individual_textures.iter().enumerate() {
                 copy_encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -755,11 +745,7 @@ impl Renderer {
                     mapped_at_creation: false,
                 });
             }
-            queue.write_buffer(
-                &self.pattern_buffer,
-                0,
-                bytemuck::cast_slice(&gpu_patterns),
-            );
+            queue.write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&gpu_patterns));
         }
 
         // Always rebuild bind group (buffers/textures may have changed).
@@ -863,11 +849,8 @@ impl Renderer {
                     push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
                 }
                 NodeData::Text(ref text) => {
-                    let shaped = font_db.shape_text(
-                        &text.content,
-                        &text.font_family,
-                        text.font_size,
-                    );
+                    let shaped =
+                        font_db.shape_text(&text.content, &text.font_family, text.font_size);
                     let fill = text.style.fill.as_ref().map(|f| resolve_paint(&f.paint));
                     let stroke = text.style.stroke.as_ref().map(&resolve_stroke);
 
@@ -1205,314 +1188,372 @@ impl Renderer {
 
         // ── Vertex handles (Node mode only) ─────────────────────────────
         if selection.mode == SelectionMode::Node {
-        let line_color: [f32; 4] = [0.5, 0.7, 1.0, 0.7];
-        let line_thickness = 1.0 / zoom;
-        let dash_len = 4.0 / zoom;
-        let gap_len = 3.0 / zoom;
+            let line_color: [f32; 4] = [0.5, 0.7, 1.0, 0.7];
+            let line_thickness = 1.0 / zoom;
+            let dash_len = 4.0 / zoom;
+            let gap_len = 3.0 / zoom;
 
-        /// Draw a handle line between an anchor and a control point.
-        /// Solid for Smooth/Symmetric vertices, dashed for Corner.
-        #[allow(clippy::too_many_arguments)]
-        fn draw_handle_line(
-            verts: &mut Vec<Vertex>,
-            idxs: &mut Vec<u32>,
-            anchor: Point,
-            ctrl: Point,
-            mode: vector_geom::VertexMode,
-            thickness: f32,
-            dash_len: f32,
-            gap_len: f32,
-            color: [f32; 4],
-        ) {
-            match mode {
-                vector_geom::VertexMode::Smooth | vector_geom::VertexMode::Symmetric => {
-                    push_line(verts, idxs, anchor, ctrl, thickness, color);
-                }
-                vector_geom::VertexMode::Corner => {
-                    push_dashed_line(verts, idxs, anchor, ctrl, thickness, dash_len, gap_len, color);
-                }
-            }
-        }
-
-        // First pass: draw handle lines (behind the handle squares).
-        let root = scene.root();
-        scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
-            if !node.visible || !selection.is_node_selected(id) {
-                return;
-            }
-            if let NodeData::Path { ref path, .. } = node.data {
-                let xf = |p: Point| -> Point {
-                    if world_transform.is_identity() { p } else { world_transform.apply(p) }
-                };
-
-                for subpath in &path.subpaths {
-                    let mut prev_anchor = subpath.start;
-
-                    for (seg_idx, seg) in subpath.segments.iter().enumerate() {
-                        // Vertex mode of the "from" anchor (index seg_idx for
-                        // prev endpoint, or 0 for the start point).
-                        let from_mode = subpath.vertex_modes.get(seg_idx).copied()
-                            .unwrap_or(vector_geom::VertexMode::Corner);
-                        // Vertex mode of the "to" anchor (index seg_idx + 1).
-                        let to_mode = subpath.vertex_modes.get(seg_idx + 1).copied()
-                            .unwrap_or(vector_geom::VertexMode::Corner);
-
-                        match seg {
-                            Segment::Quad { ctrl, to } => {
-                                draw_handle_line(&mut verts, &mut idxs, xf(prev_anchor), xf(*ctrl), from_mode, line_thickness, dash_len, gap_len, line_color);
-                                draw_handle_line(&mut verts, &mut idxs, xf(*to), xf(*ctrl), to_mode, line_thickness, dash_len, gap_len, line_color);
-                                prev_anchor = *to;
-                            }
-                            Segment::Cubic { ctrl1, ctrl2, to } => {
-                                // ctrl1 belongs to prev_anchor (outgoing handle).
-                                draw_handle_line(&mut verts, &mut idxs, xf(prev_anchor), xf(*ctrl1), from_mode, line_thickness, dash_len, gap_len, line_color);
-                                // ctrl2 belongs to `to` (incoming handle).
-                                draw_handle_line(&mut verts, &mut idxs, xf(*to), xf(*ctrl2), to_mode, line_thickness, dash_len, gap_len, line_color);
-                                prev_anchor = *to;
-                            }
-                            Segment::Line { to } | Segment::Arc { to, .. } => {
-                                prev_anchor = *to;
-                            }
-                        }
+            /// Draw a handle line between an anchor and a control point.
+            /// Solid for Smooth/Symmetric vertices, dashed for Corner.
+            #[allow(clippy::too_many_arguments)]
+            fn draw_handle_line(
+                verts: &mut Vec<Vertex>,
+                idxs: &mut Vec<u32>,
+                anchor: Point,
+                ctrl: Point,
+                mode: vector_geom::VertexMode,
+                thickness: f32,
+                dash_len: f32,
+                gap_len: f32,
+                color: [f32; 4],
+            ) {
+                match mode {
+                    vector_geom::VertexMode::Smooth | vector_geom::VertexMode::Symmetric => {
+                        push_line(verts, idxs, anchor, ctrl, thickness, color);
+                    }
+                    vector_geom::VertexMode::Corner => {
+                        push_dashed_line(
+                            verts, idxs, anchor, ctrl, thickness, dash_len, gap_len, color,
+                        );
                     }
                 }
             }
-        });
 
-        // Second pass: draw handle squares (on top of lines).
-        let root = scene.root();
-        scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
-            if !node.visible {
-                return;
-            }
-            // Only show handles for object-selected nodes.
-            if !selection.is_node_selected(id) {
-                return;
-            }
-            if let NodeData::Path { ref path, .. } = node.data {
-                // Helper: transform a point from local to world coordinates for handle display.
-                let xform = |p: Point| -> Point {
-                    if world_transform.is_identity() {
-                        p
-                    } else {
-                        world_transform.apply(p)
-                    }
-                };
-
-                for (sp_idx, subpath) in path.subpaths.iter().enumerate() {
-                    let make_vr = |kind: PointKind, seg_idx: usize| -> VertexRef {
-                        VertexRef {
-                            node: id,
-                            subpath: sp_idx,
-                            segment: seg_idx,
-                            kind,
+            // First pass: draw handle lines (behind the handle squares).
+            let root = scene.root();
+            scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
+                if !node.visible || !selection.is_node_selected(id) {
+                    return;
+                }
+                if let NodeData::Path { ref path, .. } = node.data {
+                    let xf = |p: Point| -> Point {
+                        if world_transform.is_identity() {
+                            p
+                        } else {
+                            world_transform.apply(p)
                         }
                     };
 
-                    // Start point
-                    let vr = make_vr(PointKind::SubpathStart, 0);
-                    let (fill, border) = pick_style(
-                        false,
-                        selection.is_highlighted(&vr),
-                        selection.is_hovered(&vr),
-                        anchor_fill,
-                        anchor_border,
-                        ctrl_fill,
-                        ctrl_border,
-                        selected_fill,
-                        selected_border,
-                        hovered_fill,
-                        hovered_border,
-                    );
-                    push_handle(
-                        &mut verts,
-                        &mut idxs,
-                        xform(subpath.start),
-                        handle_size,
-                        fill,
-                        border,
-                    );
+                    for subpath in &path.subpaths {
+                        let mut prev_anchor = subpath.start;
 
-                    for (seg_idx, seg) in subpath.segments.iter().enumerate() {
-                        match seg {
-                            Segment::Line { to } => {
-                                let vr = make_vr(PointKind::Endpoint, seg_idx);
-                                let (fill, border) = pick_style(
-                                    false,
-                                    selection.is_highlighted(&vr),
-                                    selection.is_hovered(&vr),
-                                    anchor_fill,
-                                    anchor_border,
-                                    ctrl_fill,
-                                    ctrl_border,
-                                    selected_fill,
-                                    selected_border,
-                                    hovered_fill,
-                                    hovered_border,
-                                );
-                                push_handle(
-                                    &mut verts,
-                                    &mut idxs,
-                                    xform(*to),
-                                    handle_size,
-                                    fill,
-                                    border,
-                                );
-                            }
-                            Segment::Quad { ctrl, to } => {
-                                let vr = make_vr(PointKind::QuadCtrl, seg_idx);
-                                let (fill, border) = pick_style(
-                                    true,
-                                    selection.is_highlighted(&vr),
-                                    selection.is_hovered(&vr),
-                                    anchor_fill,
-                                    anchor_border,
-                                    ctrl_fill,
-                                    ctrl_border,
-                                    selected_fill,
-                                    selected_border,
-                                    hovered_fill,
-                                    hovered_border,
-                                );
-                                push_handle(
-                                    &mut verts,
-                                    &mut idxs,
-                                    xform(*ctrl),
-                                    ctrl_handle_size,
-                                    fill,
-                                    border,
-                                );
+                        for (seg_idx, seg) in subpath.segments.iter().enumerate() {
+                            // Vertex mode of the "from" anchor (index seg_idx for
+                            // prev endpoint, or 0 for the start point).
+                            let from_mode = subpath
+                                .vertex_modes
+                                .get(seg_idx)
+                                .copied()
+                                .unwrap_or(vector_geom::VertexMode::Corner);
+                            // Vertex mode of the "to" anchor (index seg_idx + 1).
+                            let to_mode = subpath
+                                .vertex_modes
+                                .get(seg_idx + 1)
+                                .copied()
+                                .unwrap_or(vector_geom::VertexMode::Corner);
 
-                                let vr = make_vr(PointKind::Endpoint, seg_idx);
-                                let (fill, border) = pick_style(
-                                    false,
-                                    selection.is_highlighted(&vr),
-                                    selection.is_hovered(&vr),
-                                    anchor_fill,
-                                    anchor_border,
-                                    ctrl_fill,
-                                    ctrl_border,
-                                    selected_fill,
-                                    selected_border,
-                                    hovered_fill,
-                                    hovered_border,
-                                );
-                                push_handle(
-                                    &mut verts,
-                                    &mut idxs,
-                                    xform(*to),
-                                    handle_size,
-                                    fill,
-                                    border,
-                                );
-                            }
-                            Segment::Cubic { ctrl1, ctrl2, to } => {
-                                let vr = make_vr(PointKind::CubicCtrl1, seg_idx);
-                                let (fill, border) = pick_style(
-                                    true,
-                                    selection.is_highlighted(&vr),
-                                    selection.is_hovered(&vr),
-                                    anchor_fill,
-                                    anchor_border,
-                                    ctrl_fill,
-                                    ctrl_border,
-                                    selected_fill,
-                                    selected_border,
-                                    hovered_fill,
-                                    hovered_border,
-                                );
-                                push_handle(
-                                    &mut verts,
-                                    &mut idxs,
-                                    xform(*ctrl1),
-                                    ctrl_handle_size,
-                                    fill,
-                                    border,
-                                );
-
-                                let vr = make_vr(PointKind::CubicCtrl2, seg_idx);
-                                let (fill, border) = pick_style(
-                                    true,
-                                    selection.is_highlighted(&vr),
-                                    selection.is_hovered(&vr),
-                                    anchor_fill,
-                                    anchor_border,
-                                    ctrl_fill,
-                                    ctrl_border,
-                                    selected_fill,
-                                    selected_border,
-                                    hovered_fill,
-                                    hovered_border,
-                                );
-                                push_handle(
-                                    &mut verts,
-                                    &mut idxs,
-                                    xform(*ctrl2),
-                                    ctrl_handle_size,
-                                    fill,
-                                    border,
-                                );
-
-                                let vr = make_vr(PointKind::Endpoint, seg_idx);
-                                let (fill, border) = pick_style(
-                                    false,
-                                    selection.is_highlighted(&vr),
-                                    selection.is_hovered(&vr),
-                                    anchor_fill,
-                                    anchor_border,
-                                    ctrl_fill,
-                                    ctrl_border,
-                                    selected_fill,
-                                    selected_border,
-                                    hovered_fill,
-                                    hovered_border,
-                                );
-                                push_handle(
-                                    &mut verts,
-                                    &mut idxs,
-                                    xform(*to),
-                                    handle_size,
-                                    fill,
-                                    border,
-                                );
-                            }
-                            Segment::Arc { to, .. } => {
-                                let vr = make_vr(PointKind::Endpoint, seg_idx);
-                                let (fill, border) = pick_style(
-                                    false,
-                                    selection.is_highlighted(&vr),
-                                    selection.is_hovered(&vr),
-                                    anchor_fill,
-                                    anchor_border,
-                                    ctrl_fill,
-                                    ctrl_border,
-                                    selected_fill,
-                                    selected_border,
-                                    hovered_fill,
-                                    hovered_border,
-                                );
-                                push_handle(
-                                    &mut verts,
-                                    &mut idxs,
-                                    xform(*to),
-                                    handle_size,
-                                    fill,
-                                    border,
-                                );
+                            match seg {
+                                Segment::Quad { ctrl, to } => {
+                                    draw_handle_line(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xf(prev_anchor),
+                                        xf(*ctrl),
+                                        from_mode,
+                                        line_thickness,
+                                        dash_len,
+                                        gap_len,
+                                        line_color,
+                                    );
+                                    draw_handle_line(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xf(*to),
+                                        xf(*ctrl),
+                                        to_mode,
+                                        line_thickness,
+                                        dash_len,
+                                        gap_len,
+                                        line_color,
+                                    );
+                                    prev_anchor = *to;
+                                }
+                                Segment::Cubic { ctrl1, ctrl2, to } => {
+                                    // ctrl1 belongs to prev_anchor (outgoing handle).
+                                    draw_handle_line(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xf(prev_anchor),
+                                        xf(*ctrl1),
+                                        from_mode,
+                                        line_thickness,
+                                        dash_len,
+                                        gap_len,
+                                        line_color,
+                                    );
+                                    // ctrl2 belongs to `to` (incoming handle).
+                                    draw_handle_line(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xf(*to),
+                                        xf(*ctrl2),
+                                        to_mode,
+                                        line_thickness,
+                                        dash_len,
+                                        gap_len,
+                                        line_color,
+                                    );
+                                    prev_anchor = *to;
+                                }
+                                Segment::Line { to } | Segment::Arc { to, .. } => {
+                                    prev_anchor = *to;
+                                }
                             }
                         }
                     }
                 }
+            });
+
+            // Second pass: draw handle squares (on top of lines).
+            let root = scene.root();
+            scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
+                if !node.visible {
+                    return;
+                }
+                // Only show handles for object-selected nodes.
+                if !selection.is_node_selected(id) {
+                    return;
+                }
+                if let NodeData::Path { ref path, .. } = node.data {
+                    // Helper: transform a point from local to world coordinates for handle display.
+                    let xform = |p: Point| -> Point {
+                        if world_transform.is_identity() {
+                            p
+                        } else {
+                            world_transform.apply(p)
+                        }
+                    };
+
+                    for (sp_idx, subpath) in path.subpaths.iter().enumerate() {
+                        let make_vr = |kind: PointKind, seg_idx: usize| -> VertexRef {
+                            VertexRef {
+                                node: id,
+                                subpath: sp_idx,
+                                segment: seg_idx,
+                                kind,
+                            }
+                        };
+
+                        // Start point
+                        let vr = make_vr(PointKind::SubpathStart, 0);
+                        let (fill, border) = pick_style(
+                            false,
+                            selection.is_highlighted(&vr),
+                            selection.is_hovered(&vr),
+                            anchor_fill,
+                            anchor_border,
+                            ctrl_fill,
+                            ctrl_border,
+                            selected_fill,
+                            selected_border,
+                            hovered_fill,
+                            hovered_border,
+                        );
+                        push_handle(
+                            &mut verts,
+                            &mut idxs,
+                            xform(subpath.start),
+                            handle_size,
+                            fill,
+                            border,
+                        );
+
+                        for (seg_idx, seg) in subpath.segments.iter().enumerate() {
+                            match seg {
+                                Segment::Line { to } => {
+                                    let vr = make_vr(PointKind::Endpoint, seg_idx);
+                                    let (fill, border) = pick_style(
+                                        false,
+                                        selection.is_highlighted(&vr),
+                                        selection.is_hovered(&vr),
+                                        anchor_fill,
+                                        anchor_border,
+                                        ctrl_fill,
+                                        ctrl_border,
+                                        selected_fill,
+                                        selected_border,
+                                        hovered_fill,
+                                        hovered_border,
+                                    );
+                                    push_handle(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xform(*to),
+                                        handle_size,
+                                        fill,
+                                        border,
+                                    );
+                                }
+                                Segment::Quad { ctrl, to } => {
+                                    let vr = make_vr(PointKind::QuadCtrl, seg_idx);
+                                    let (fill, border) = pick_style(
+                                        true,
+                                        selection.is_highlighted(&vr),
+                                        selection.is_hovered(&vr),
+                                        anchor_fill,
+                                        anchor_border,
+                                        ctrl_fill,
+                                        ctrl_border,
+                                        selected_fill,
+                                        selected_border,
+                                        hovered_fill,
+                                        hovered_border,
+                                    );
+                                    push_handle(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xform(*ctrl),
+                                        ctrl_handle_size,
+                                        fill,
+                                        border,
+                                    );
+
+                                    let vr = make_vr(PointKind::Endpoint, seg_idx);
+                                    let (fill, border) = pick_style(
+                                        false,
+                                        selection.is_highlighted(&vr),
+                                        selection.is_hovered(&vr),
+                                        anchor_fill,
+                                        anchor_border,
+                                        ctrl_fill,
+                                        ctrl_border,
+                                        selected_fill,
+                                        selected_border,
+                                        hovered_fill,
+                                        hovered_border,
+                                    );
+                                    push_handle(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xform(*to),
+                                        handle_size,
+                                        fill,
+                                        border,
+                                    );
+                                }
+                                Segment::Cubic { ctrl1, ctrl2, to } => {
+                                    let vr = make_vr(PointKind::CubicCtrl1, seg_idx);
+                                    let (fill, border) = pick_style(
+                                        true,
+                                        selection.is_highlighted(&vr),
+                                        selection.is_hovered(&vr),
+                                        anchor_fill,
+                                        anchor_border,
+                                        ctrl_fill,
+                                        ctrl_border,
+                                        selected_fill,
+                                        selected_border,
+                                        hovered_fill,
+                                        hovered_border,
+                                    );
+                                    push_handle(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xform(*ctrl1),
+                                        ctrl_handle_size,
+                                        fill,
+                                        border,
+                                    );
+
+                                    let vr = make_vr(PointKind::CubicCtrl2, seg_idx);
+                                    let (fill, border) = pick_style(
+                                        true,
+                                        selection.is_highlighted(&vr),
+                                        selection.is_hovered(&vr),
+                                        anchor_fill,
+                                        anchor_border,
+                                        ctrl_fill,
+                                        ctrl_border,
+                                        selected_fill,
+                                        selected_border,
+                                        hovered_fill,
+                                        hovered_border,
+                                    );
+                                    push_handle(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xform(*ctrl2),
+                                        ctrl_handle_size,
+                                        fill,
+                                        border,
+                                    );
+
+                                    let vr = make_vr(PointKind::Endpoint, seg_idx);
+                                    let (fill, border) = pick_style(
+                                        false,
+                                        selection.is_highlighted(&vr),
+                                        selection.is_hovered(&vr),
+                                        anchor_fill,
+                                        anchor_border,
+                                        ctrl_fill,
+                                        ctrl_border,
+                                        selected_fill,
+                                        selected_border,
+                                        hovered_fill,
+                                        hovered_border,
+                                    );
+                                    push_handle(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xform(*to),
+                                        handle_size,
+                                        fill,
+                                        border,
+                                    );
+                                }
+                                Segment::Arc { to, .. } => {
+                                    let vr = make_vr(PointKind::Endpoint, seg_idx);
+                                    let (fill, border) = pick_style(
+                                        false,
+                                        selection.is_highlighted(&vr),
+                                        selection.is_hovered(&vr),
+                                        anchor_fill,
+                                        anchor_border,
+                                        ctrl_fill,
+                                        ctrl_border,
+                                        selected_fill,
+                                        selected_border,
+                                        hovered_fill,
+                                        hovered_border,
+                                    );
+                                    push_handle(
+                                        &mut verts,
+                                        &mut idxs,
+                                        xform(*to),
+                                        handle_size,
+                                        fill,
+                                        border,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Ghost vertex on edge hover — shows where a double-click would insert.
+            if let Some(pt) = selection.edge_hover_point {
+                let ghost_fill: [f32; 4] = [1.0, 1.0, 1.0, 0.4];
+                let ghost_border: [f32; 4] = [0.3, 0.5, 1.0, 0.5];
+                push_handle(
+                    &mut verts,
+                    &mut idxs,
+                    pt,
+                    handle_size,
+                    ghost_fill,
+                    ghost_border,
+                );
             }
-        });
-
-        // Ghost vertex on edge hover — shows where a double-click would insert.
-        if let Some(pt) = selection.edge_hover_point {
-            let ghost_fill: [f32; 4] = [1.0, 1.0, 1.0, 0.4];
-            let ghost_border: [f32; 4] = [0.3, 0.5, 1.0, 0.5];
-            push_handle(&mut verts, &mut idxs, pt, handle_size, ghost_fill, ghost_border);
-        }
-
         } // end Node mode vertex handles
 
         // Marquee rectangle (if active)
@@ -1862,43 +1903,39 @@ fn collect_pattern_paint_refs(
 ) -> Vec<NodeId> {
     let mut refs = Vec::new();
 
-    scene.walk_depth_first(
-        content_id,
-        Affine::IDENTITY,
-        &mut |_id, node, _world| {
-            let paint_refs: Vec<&PaintRef> = match &node.data {
-                NodeData::Path { style, .. } => {
-                    let mut p = Vec::new();
-                    if let Some(f) = &style.fill {
-                        p.push(&f.paint);
-                    }
-                    if let Some(s) = &style.stroke {
-                        p.push(&s.paint);
-                    }
-                    p
+    scene.walk_depth_first(content_id, Affine::IDENTITY, &mut |_id, node, _world| {
+        let paint_refs: Vec<&PaintRef> = match &node.data {
+            NodeData::Path { style, .. } => {
+                let mut p = Vec::new();
+                if let Some(f) = &style.fill {
+                    p.push(&f.paint);
                 }
-                NodeData::Text(t) => {
-                    let mut p = Vec::new();
-                    if let Some(f) = &t.style.fill {
-                        p.push(&f.paint);
-                    }
-                    if let Some(s) = &t.style.stroke {
-                        p.push(&s.paint);
-                    }
-                    p
+                if let Some(s) = &style.stroke {
+                    p.push(&s.paint);
                 }
-                _ => Vec::new(),
-            };
-            for paint in paint_refs {
-                if let PaintRef::Ref(ref_id) = paint
-                    && pattern_node_ids.contains(ref_id)
-                    && !refs.contains(ref_id)
-                {
-                    refs.push(*ref_id);
-                }
+                p
             }
-        },
-    );
+            NodeData::Text(t) => {
+                let mut p = Vec::new();
+                if let Some(f) = &t.style.fill {
+                    p.push(&f.paint);
+                }
+                if let Some(s) = &t.style.stroke {
+                    p.push(&s.paint);
+                }
+                p
+            }
+            _ => Vec::new(),
+        };
+        for paint in paint_refs {
+            if let PaintRef::Ref(ref_id) = paint
+                && pattern_node_ids.contains(ref_id)
+                && !refs.contains(ref_id)
+            {
+                refs.push(*ref_id);
+            }
+        }
+    });
 
     refs
 }
@@ -1949,9 +1986,7 @@ fn topological_sort_patterns(
     }
 
     // Any patterns not in `order` are part of a cycle.
-    let cyclic: std::collections::HashSet<usize> = (0..n)
-        .filter(|i| !order.contains(i))
-        .collect();
+    let cyclic: std::collections::HashSet<usize> = (0..n).filter(|i| !order.contains(i)).collect();
 
     (order, cyclic)
 }
@@ -2055,11 +2090,8 @@ fn tessellate_pattern_content(
                     push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
                 }
                 NodeData::Text(ref text) => {
-                    let shaped = font_db.shape_text(
-                        &text.content,
-                        &text.font_family,
-                        text.font_size,
-                    );
+                    let shaped =
+                        font_db.shape_text(&text.content, &text.font_family, text.font_size);
                     let fill = text.style.fill.as_ref().map(|f| resolve_paint(&f.paint));
                     let stroke = text.style.stroke.as_ref().map(&resolve_stroke);
                     let mesh = tessellate_path(&shaped.path, fill, stroke);

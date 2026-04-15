@@ -107,14 +107,7 @@ fn write_node(
                             write_gradient(gradient, svg_id, indent + 1, buf);
                         }
                         NodeData::Paint(Paint::Pattern(pattern)) => {
-                            write_pattern(
-                                pattern,
-                                scene,
-                                svg_id,
-                                indent + 1,
-                                buf,
-                                gradient_ids,
-                            );
+                            write_pattern(pattern, scene, svg_id, indent + 1, buf, gradient_ids);
                         }
                         _ => {}
                     }

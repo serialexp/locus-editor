@@ -243,9 +243,9 @@ fn convert_text(t: &usvg::Text) -> Node {
         .and_then(|span| {
             span.fill().map(|f| {
                 let paint = match f.paint() {
-                    usvg::Paint::Color(c) => {
-                        vector_scene::PaintRef::Solid(Color::from_srgb8(c.red, c.green, c.blue, 255))
-                    }
+                    usvg::Paint::Color(c) => vector_scene::PaintRef::Solid(Color::from_srgb8(
+                        c.red, c.green, c.blue, 255,
+                    )),
                     _ => vector_scene::PaintRef::Solid(Color::BLACK),
                 };
                 vector_scene::style::Fill {
@@ -642,8 +642,14 @@ mod tests {
             let node = scene.get(id)?;
             if let NodeData::Paint(vector_scene::Paint::Pattern(p)) = &node.data {
                 // Verify the tile rect is correct.
-                assert!((p.rect[2] - 20.0).abs() < 1e-4, "pattern width should be 20");
-                assert!((p.rect[3] - 20.0).abs() < 1e-4, "pattern height should be 20");
+                assert!(
+                    (p.rect[2] - 20.0).abs() < 1e-4,
+                    "pattern width should be 20"
+                );
+                assert!(
+                    (p.rect[3] - 20.0).abs() < 1e-4,
+                    "pattern height should be 20"
+                );
                 // The content group should exist and have children.
                 let content = scene.get(p.content)?;
                 assert!(
@@ -726,10 +732,7 @@ mod tests {
                 })
             })
             .count();
-        assert_eq!(
-            ref_count, 2,
-            "both paths should reference the pattern"
-        );
+        assert_eq!(ref_count, 2, "both paths should reference the pattern");
     }
 
     #[test]

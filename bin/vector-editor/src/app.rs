@@ -687,9 +687,8 @@ impl ApplicationHandler for App {
                                     self.state.cursor_pos.map(|c| (now, c));
 
                                 if let Some(cursor) = self.state.cursor_pos {
-                                    let canvas_f64 = self.state.screen_to_canvas_snapped(
-                                        cursor[0], cursor[1],
-                                    );
+                                    let canvas_f64 =
+                                        self.state.screen_to_canvas_snapped(cursor[0], cursor[1]);
                                     match self.state.active_tool {
                                         ToolType::Select => {
                                             let mut handled = false;
@@ -814,7 +813,10 @@ impl ApplicationHandler for App {
                                                 // snapshot for undo.
                                                 if self.state.select_state.is_dragging_vertices() {
                                                     self.state.snapshot_selected_vertex_paths();
-                                                } else if self.state.select_state.is_dragging_objects()
+                                                } else if self
+                                                    .state
+                                                    .select_state
+                                                    .is_dragging_objects()
                                                 {
                                                     self.state.snapshot_selected_transforms();
                                                 }
@@ -855,9 +857,9 @@ impl ApplicationHandler for App {
                                     }
                                     ToolType::Pen => {
                                         if let Some(cursor) = self.state.cursor_pos {
-                                            let canvas_f64 = self.state.screen_to_canvas_snapped(
-                                                cursor[0], cursor[1],
-                                            );
+                                            let canvas_f64 = self
+                                                .state
+                                                .screen_to_canvas_snapped(cursor[0], cursor[1]);
                                             self.state.pen_state.on_release(
                                                 &mut self.state.scene,
                                                 canvas_f64,
@@ -915,8 +917,7 @@ impl ApplicationHandler for App {
                         gpu.window.request_redraw();
                     }
                 } else if self.state.is_left_down && !gpu.egui_ctx.egui_wants_pointer_input() {
-                    let canvas_f64 =
-                        self.state.screen_to_canvas_snapped(new_pos[0], new_pos[1]);
+                    let canvas_f64 = self.state.screen_to_canvas_snapped(new_pos[0], new_pos[1]);
                     let changed = match self.state.active_tool {
                         ToolType::Select => self
                             .state
@@ -943,8 +944,7 @@ impl ApplicationHandler for App {
                     && self.state.pen_state.is_building()
                 {
                     // Pen hover preview: show tentative segment to cursor.
-                    let canvas_f64 =
-                        self.state.screen_to_canvas_snapped(new_pos[0], new_pos[1]);
+                    let canvas_f64 = self.state.screen_to_canvas_snapped(new_pos[0], new_pos[1]);
                     if self
                         .state
                         .pen_state
@@ -1028,8 +1028,7 @@ impl ApplicationHandler for App {
                                 self.state.handle_pen_action(action, &mut gpu.renderer);
                                 gpu.window.request_redraw();
                             } else if self.state.active_tool == ToolType::Select
-                                && self.state.select_state.mode
-                                    == vector_tools::SelectionMode::Node
+                                && self.state.select_state.mode == vector_tools::SelectionMode::Node
                             {
                                 self.state.select_state.exit_node_mode();
                                 gpu.window.request_redraw();
@@ -1560,19 +1559,15 @@ fn show_properties(
                                 if !bounds.is_empty() {
                                     ui.label("W");
                                     ui.add(
-                                        egui::DragValue::new(
-                                            &mut (bounds.width() as f32),
-                                        )
-                                        .speed(0.5)
-                                        .fixed_decimals(1),
+                                        egui::DragValue::new(&mut (bounds.width() as f32))
+                                            .speed(0.5)
+                                            .fixed_decimals(1),
                                     );
                                     ui.label("H");
                                     ui.add(
-                                        egui::DragValue::new(
-                                            &mut (bounds.height() as f32),
-                                        )
-                                        .speed(0.5)
-                                        .fixed_decimals(1),
+                                        egui::DragValue::new(&mut (bounds.height() as f32))
+                                            .speed(0.5)
+                                            .fixed_decimals(1),
                                     );
                                     ui.end_row();
                                 }
@@ -1597,8 +1592,7 @@ fn show_properties(
                                     let mode_idx = match vref.kind {
                                         PointKind::SubpathStart => 0,
                                         PointKind::Endpoint => vref.segment + 1,
-                                        PointKind::CubicCtrl1
-                                        | PointKind::QuadCtrl => vref.segment,
+                                        PointKind::CubicCtrl1 | PointKind::QuadCtrl => vref.segment,
                                         PointKind::CubicCtrl2 => vref.segment + 1,
                                     };
                                     if let Some(mode) = subpath.vertex_modes.get(mode_idx) {
@@ -1641,47 +1635,36 @@ fn show_properties(
                                 }
                             }
                             if !sel_bounds.is_empty() {
-                                ui.small(format!(
-                                    "{} vertices selected",
-                                    selection.selected.len()
-                                ));
+                                ui.small(format!("{} vertices selected", selection.selected.len()));
                                 egui::Grid::new("vertex_sel_grid")
                                     .num_columns(4)
                                     .spacing([4.0, 4.0])
                                     .show(ui, |ui| {
                                         ui.label("X");
                                         ui.add(
-                                            egui::DragValue::new(
-                                                &mut (sel_bounds.min.x as f32),
-                                            )
-                                            .speed(0.5)
-                                            .fixed_decimals(1),
+                                            egui::DragValue::new(&mut (sel_bounds.min.x as f32))
+                                                .speed(0.5)
+                                                .fixed_decimals(1),
                                         );
                                         ui.label("Y");
                                         ui.add(
-                                            egui::DragValue::new(
-                                                &mut (sel_bounds.min.y as f32),
-                                            )
-                                            .speed(0.5)
-                                            .fixed_decimals(1),
+                                            egui::DragValue::new(&mut (sel_bounds.min.y as f32))
+                                                .speed(0.5)
+                                                .fixed_decimals(1),
                                         );
                                         ui.end_row();
 
                                         ui.label("W");
                                         ui.add(
-                                            egui::DragValue::new(
-                                                &mut (sel_bounds.width() as f32),
-                                            )
-                                            .speed(0.5)
-                                            .fixed_decimals(1),
+                                            egui::DragValue::new(&mut (sel_bounds.width() as f32))
+                                                .speed(0.5)
+                                                .fixed_decimals(1),
                                         );
                                         ui.label("H");
                                         ui.add(
-                                            egui::DragValue::new(
-                                                &mut (sel_bounds.height() as f32),
-                                            )
-                                            .speed(0.5)
-                                            .fixed_decimals(1),
+                                            egui::DragValue::new(&mut (sel_bounds.height() as f32))
+                                                .speed(0.5)
+                                                .fixed_decimals(1),
                                         );
                                         ui.end_row();
                                     });
@@ -1744,7 +1727,12 @@ fn show_properties(
 
                         ui.label("Opacity");
                         if ui
-                            .add(egui::DragValue::new(&mut fill.opacity).range(0.0..=1.0).speed(0.01).fixed_decimals(2))
+                            .add(
+                                egui::DragValue::new(&mut fill.opacity)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(2),
+                            )
                             .changed()
                         {
                             changed = true;
@@ -1790,7 +1778,12 @@ fn show_properties(
                         ui.label("Width");
                         let mut width = stroke.style.width as f32;
                         if ui
-                            .add(egui::DragValue::new(&mut width).range(0.0..=50.0).speed(0.5).fixed_decimals(1))
+                            .add(
+                                egui::DragValue::new(&mut width)
+                                    .range(0.0..=50.0)
+                                    .speed(0.5)
+                                    .fixed_decimals(1),
+                            )
                             .changed()
                         {
                             stroke.style.width = width as f64;
@@ -1800,7 +1793,12 @@ fn show_properties(
 
                         ui.label("Opacity");
                         if ui
-                            .add(egui::DragValue::new(&mut stroke.opacity).range(0.0..=1.0).speed(0.01).fixed_decimals(2))
+                            .add(
+                                egui::DragValue::new(&mut stroke.opacity)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(2),
+                            )
                             .changed()
                         {
                             changed = true;
@@ -2134,8 +2132,7 @@ fn show_scene_node(
                     }
 
                     let remaining = ui.available_width();
-                    let desired_size =
-                        egui::vec2(remaining, ui.spacing().interact_size.y);
+                    let desired_size = egui::vec2(remaining, ui.spacing().interact_size.y);
                     let (rect, response) =
                         ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
 

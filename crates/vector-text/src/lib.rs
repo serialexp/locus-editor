@@ -91,10 +91,7 @@ impl FontDb {
             // get a `'static` lifetime — fonts are loaded once and kept for
             // the duration of the editor process.
             let font = self.db.with_face_data(id, |data, face_index| {
-                Font::from_bytes_with_index(
-                    Box::leak(data.to_vec().into_boxed_slice()),
-                    face_index,
-                )
+                Font::from_bytes_with_index(Box::leak(data.to_vec().into_boxed_slice()), face_index)
             });
 
             if let Some(Some(font)) = font {
@@ -102,7 +99,10 @@ impl FontDb {
                 return &self.cache[&id];
             }
 
-            log::warn!("Failed to parse font for family '{}', using fallback", family);
+            log::warn!(
+                "Failed to parse font for family '{}', using fallback",
+                family
+            );
         } else {
             log::debug!("Font family '{}' not found, using fallback", family);
         }
@@ -138,8 +138,7 @@ impl Default for FontDb {
 /// Protected by a Mutex since `FontDb::resolve` takes `&mut self` (cache
 /// mutation). Contention is negligible — font resolution is infrequent
 /// relative to rendering.
-static GLOBAL_FONT_DB: LazyLock<Mutex<FontDb>> =
-    LazyLock::new(|| Mutex::new(FontDb::new()));
+static GLOBAL_FONT_DB: LazyLock<Mutex<FontDb>> = LazyLock::new(|| Mutex::new(FontDb::new()));
 
 /// Get a lock on the global font database.
 ///
@@ -450,7 +449,10 @@ mod tests {
         // A nonsense family name should resolve to the fallback.
         let font = fdb.resolve("NonExistentFont12345");
         let shaped = font.shape_text("X", 100.0);
-        assert!(!shaped.path.is_empty(), "fallback font should produce glyphs");
+        assert!(
+            !shaped.path.is_empty(),
+            "fallback font should produce glyphs"
+        );
     }
 
     #[test]

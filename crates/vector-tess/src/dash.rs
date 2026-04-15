@@ -24,7 +24,12 @@ pub fn dash_path(path: &Path, pattern: &DashPattern) -> Path {
 
     // Normalize: if odd-length, double it per SVG spec.
     let array: Vec<f64> = if !pattern.array.len().is_multiple_of(2) {
-        pattern.array.iter().chain(pattern.array.iter()).copied().collect()
+        pattern
+            .array
+            .iter()
+            .chain(pattern.array.iter())
+            .copied()
+            .collect()
     } else {
         pattern.array.clone()
     };
@@ -77,13 +82,7 @@ fn advance_element(
 }
 
 /// Expand dashes for a single subpath.
-fn dash_subpath(
-    subpath: &SubPath,
-    array: &[f64],
-    offset: f64,
-    pattern_len: f64,
-    out: &mut Path,
-) {
+fn dash_subpath(subpath: &SubPath, array: &[f64], offset: f64, pattern_len: f64, out: &mut Path) {
     if subpath.segments.is_empty() {
         return;
     }
@@ -229,7 +228,12 @@ mod tests {
             offset: 0.0,
         };
         let result = dash_path(&path, &pattern);
-        assert_eq!(result.subpaths.len(), 5, "expected 5 dashes, got {}", result.subpaths.len());
+        assert_eq!(
+            result.subpaths.len(),
+            5,
+            "expected 5 dashes, got {}",
+            result.subpaths.len()
+        );
 
         // Each dash should be ~10 units long.
         for (i, sp) in result.subpaths.iter().enumerate() {
@@ -274,7 +278,12 @@ mod tests {
         // Pattern after doubling: dash=10, gap=5, dash=5, gap=10, dash=5, gap=5
         // On a 40-unit line: dash(10) gap(5) dash(5) gap(10) dash(5) gap(5)
         // = 3 dashes
-        assert_eq!(result.subpaths.len(), 3, "expected 3 dashes, got {}", result.subpaths.len());
+        assert_eq!(
+            result.subpaths.len(),
+            3,
+            "expected 3 dashes, got {}",
+            result.subpaths.len()
+        );
     }
 
     #[test]
@@ -299,7 +308,10 @@ mod tests {
         };
         let result = dash_path(&path, &pattern);
         // Should produce multiple dashes.
-        assert!(result.subpaths.len() >= 3, "expected at least 3 dashes on cubic");
+        assert!(
+            result.subpaths.len() >= 3,
+            "expected at least 3 dashes on cubic"
+        );
 
         // Total drawn length should be roughly 2/3 of the curve.
         let total_dash_len: f64 = result.subpaths.iter().map(|sp| sp.arc_length()).sum();
