@@ -21,7 +21,8 @@ use std::sync::{LazyLock, Mutex};
 use vector_geom::{Bounds, Path, Point, Segment, SubPath, VertexMode};
 
 /// The embedded fallback font (Liberation Sans Regular, SIL OFL license).
-static DEFAULT_FONT_DATA: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
+/// Public so other crates (e.g. vector-svg) can load it into their own font databases.
+pub static DEFAULT_FONT_DATA: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 
 // ── FontDb ──────────────────────────────────────────────────────────
 

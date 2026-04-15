@@ -7,8 +7,10 @@ use vector_scene::{NodeData, NodeId, Scene, Style};
 /// Import an SVG file from bytes into a scene graph.
 pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
     let mut opts = usvg::Options::default();
-    // Load system fonts so usvg can shape text nodes. Without this,
-    // text elements are silently dropped during parsing.
+    // Load the bundled fallback font so text parsing works even without
+    // system fonts (e.g. on CI). Also load system fonts for better coverage.
+    opts.fontdb_mut()
+        .load_font_data(vector_text::DEFAULT_FONT_DATA.to_vec());
     opts.fontdb_mut().load_system_fonts();
     let tree = usvg::Tree::from_data(data, &opts).map_err(ImportError::Parse)?;
 
@@ -739,7 +741,7 @@ mod tests {
     fn import_text_node() {
         let svg = r#"
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
-                <text x="10" y="50" font-family="Arial" font-size="24" fill="red">Hello World</text>
+                <text x="10" y="50" font-family="Liberation Sans" font-size="24" fill="red">Hello World</text>
             </svg>
         "#;
         let scene = import_svg(svg.as_bytes()).unwrap();
