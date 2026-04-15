@@ -14,12 +14,13 @@ pub struct TessellatedMesh {
     pub indices: Vec<u32>,
 }
 
-/// Describes how to paint a fill or stroke — either a solid color or a
-/// reference into the gradient storage buffer.
+/// Describes how to paint a fill or stroke — either a solid color, a
+/// reference into the gradient storage buffer, or a pattern texture.
 #[derive(Debug, Clone, Copy)]
 pub enum TessPaint {
     Solid(Color),
     Gradient { index: i32 },
+    Pattern { index: i32 },
 }
 
 /// Line cap style for stroke ends.
@@ -72,6 +73,7 @@ pub fn tessellate_path(
                             Vertex::solid(pos, [color.r, color.g, color.b, color.a])
                         }
                         TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index),
+                        TessPaint::Pattern { index } => Vertex::pattern(pos, pos, index),
                     }
                 }),
             )
@@ -119,6 +121,7 @@ pub fn tessellate_path(
                                 Vertex::solid(pos, [color.r, color.g, color.b, color.a])
                             }
                             TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index),
+                            TessPaint::Pattern { index } => Vertex::pattern(pos, pos, index),
                         }
                     },
                 ),

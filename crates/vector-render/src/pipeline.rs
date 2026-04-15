@@ -2,7 +2,8 @@ use wgpu::*;
 
 use vector_tess::Vertex;
 
-/// Create the bind group layout for globals (view-projection) and gradient storage.
+/// Create the bind group layout for globals, gradient storage, pattern storage,
+/// pattern texture array, and pattern sampler.
 pub fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("vector globals layout"),
@@ -27,6 +28,35 @@ pub fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
+                count: None,
+            },
+            // Binding 2: pattern descriptor storage buffer (fragment shader)
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Binding 3: pattern texture array (fragment shader)
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // Binding 4: pattern sampler (fragment shader)
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
         ],

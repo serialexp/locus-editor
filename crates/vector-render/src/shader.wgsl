@@ -1,8 +1,10 @@
-// Vector rendering shader with gradient support.
+// Vector rendering shader with gradient and pattern support.
 // Takes 2D positions + RGBA color per vertex, applies an orthographic projection.
 // Gradient vertices carry a gradient_index >= 0 that indexes into a storage
 // buffer of gradient descriptors; the fragment shader evaluates the gradient
 // color per-pixel using the interpolated world_pos.
+// Pattern vertices carry a pattern_index >= 0 that indexes into a storage
+// buffer of pattern descriptors; the fragment shader samples a tiled texture.
 
 // ── Vertex types ────────────────────────────────────────────────────────
 
@@ -11,6 +13,7 @@ struct VertexInput {
     @location(1) color: vec4<f32>,
     @location(2) world_pos: vec2<f32>,
     @location(3) gradient_index: i32,
+    @location(4) pattern_index: i32,
 };
 
 struct VertexOutput {
@@ -18,6 +21,7 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
     @location(1) world_pos: vec2<f32>,
     @location(2) @interpolate(flat) gradient_index: i32,
+    @location(3) @interpolate(flat) pattern_index: i32,
 };
 
 // ── Uniform / storage bindings ──────────────────────────────────────────
@@ -64,11 +68,33 @@ struct GpuGradient {
     stop7: GpuColorStop,
 };
 
+struct GpuPattern {
+    // Inverse pattern transform: same layout as gradient inv0/inv1.
+    inv0: vec4<f32>,
+    inv1: vec4<f32>,
+    // Tile rect: [x, y, width, height]
+    tile_rect: vec4<f32>,
+    // Index into the texture array layer dimension.
+    layer: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
 @group(0) @binding(0)
 var<uniform> globals: Globals;
 
 @group(0) @binding(1)
 var<storage, read> gradients: array<GpuGradient>;
+
+@group(0) @binding(2)
+var<storage, read> patterns: array<GpuPattern>;
+
+@group(0) @binding(3)
+var pattern_texture: texture_2d_array<f32>;
+
+@group(0) @binding(4)
+var pattern_sampler: sampler;
 
 // ── Vertex shader ───────────────────────────────────────────────────────
 
@@ -79,6 +105,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.color = in.color;
     out.world_pos = in.world_pos;
     out.gradient_index = in.gradient_index;
+    out.pattern_index = in.pattern_index;
     return out;
 }
 
@@ -162,10 +189,30 @@ fn sample_gradient(grad: GpuGradient, t: f32) -> vec4<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // ── Pattern path ─────────────────────────────────────────────────
+    if in.pattern_index >= 0 {
+        let pat = patterns[in.pattern_index];
+
+        // Transform world_pos into pattern space via inverse patternTransform.
+        let px = pat.inv0.x * in.world_pos.x + pat.inv0.y * in.world_pos.y + pat.inv0.z;
+        let py = pat.inv1.x * in.world_pos.x + pat.inv1.y * in.world_pos.y + pat.inv1.z;
+
+        // Map into tile UV space: (pos - tile_origin) / tile_size, then wrap.
+        let u = (px - pat.tile_rect.x) / pat.tile_rect.z;
+        let v = (py - pat.tile_rect.y) / pat.tile_rect.w;
+
+        // Tile via fract (repeat).
+        let uv = fract(vec2<f32>(u, v));
+
+        return textureSample(pattern_texture, pattern_sampler, uv, pat.layer);
+    }
+
+    // ── Solid color path ─────────────────────────────────────────────
     if in.gradient_index < 0 {
         return in.color;
     }
 
+    // ── Gradient path ────────────────────────────────────────────────
     let grad = gradients[in.gradient_index];
 
     // Apply inverse gradient transform to world position.

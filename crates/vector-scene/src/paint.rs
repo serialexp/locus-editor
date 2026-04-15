@@ -69,11 +69,23 @@ pub enum SpreadMethod {
     Repeat,
 }
 
+/// A pattern definition. The pattern tile's vector content lives in a
+/// separate Group node (in defs) referenced by `content`. The `rect`
+/// defines the repeating tile region in user space, and `transform` is
+/// the SVG `patternTransform`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pattern {
+    /// Tile rectangle in user space: [x, y, width, height].
+    pub rect: [f64; 4],
+    /// Pattern-space → user-space transform (`patternTransform` in SVG).
+    pub transform: Affine,
+    /// NodeId of the Group node holding the pattern's vector content.
+    pub content: NodeId,
+}
+
 /// Paint data that lives as a node variant in the scene tree.
-/// Patterns are just Group nodes referenced as a paint, so they don't
-/// need a dedicated paint type — they use PaintRef::Ref pointing at
-/// a regular group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Paint {
     Gradient(Gradient),
+    Pattern(Pattern),
 }

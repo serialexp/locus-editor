@@ -383,9 +383,61 @@ fn convert_paint(
                 vector_scene::PaintRef::Solid(Color::BLACK)
             }
         }
-        usvg::Paint::Pattern(_) => {
-            log::warn!("Pattern paints not yet imported, falling back to black");
-            vector_scene::PaintRef::Solid(Color::BLACK)
+        usvg::Paint::Pattern(pat) => {
+            // Dedup by Arc pointer identity (same as gradients).
+            let ptr = std::sync::Arc::as_ptr(pat) as usize;
+            if let Some(&node_id) = gradient_cache.get(&ptr) {
+                return vector_scene::PaintRef::Ref(node_id);
+            }
+
+            // Import pattern content as a group in defs.
+            let content_label = if pat.id().is_empty() {
+                format!("pattern_content_{}", gradient_cache.len())
+            } else {
+                format!("{}_content", pat.id())
+            };
+            let content_group = Node::group(content_label);
+            let defs = scene.defs();
+            let Some(content_id) = scene.insert(defs, content_group) else {
+                log::warn!("Failed to insert pattern content group into defs");
+                return vector_scene::PaintRef::Solid(Color::BLACK);
+            };
+
+            // Recursively import the pattern's children into the content group.
+            import_group(pat.root(), scene, content_id, gradient_cache);
+
+            // Create the Pattern paint node.
+            let rect = pat.rect();
+            let pattern = vector_scene::Pattern {
+                rect: [
+                    rect.x() as f64,
+                    rect.y() as f64,
+                    rect.width() as f64,
+                    rect.height() as f64,
+                ],
+                transform: convert_transform(pat.transform()),
+                content: content_id,
+            };
+            let label = if pat.id().is_empty() {
+                format!("pattern_{}", gradient_cache.len())
+            } else {
+                pat.id().to_string()
+            };
+            let paint_node = Node {
+                label,
+                transform: Affine::IDENTITY,
+                data: NodeData::Paint(vector_scene::Paint::Pattern(pattern)),
+                children: Vec::new(),
+                visible: true,
+                locked: false,
+            };
+            let Some(paint_id) = scene.insert(defs, paint_node) else {
+                log::warn!("Failed to insert pattern paint node into defs");
+                return vector_scene::PaintRef::Solid(Color::BLACK);
+            };
+
+            gradient_cache.insert(ptr, paint_id);
+            vector_scene::PaintRef::Ref(paint_id)
         }
     }
 }
@@ -566,6 +618,117 @@ mod tests {
         assert_eq!(
             gradient_ref_count, 2,
             "both paths should reference gradient via PaintRef::Ref"
+        );
+    }
+
+    #[test]
+    fn import_pattern() {
+        let svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <defs>
+                    <pattern id="dots" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
+                        <circle cx="10" cy="10" r="5" fill="red"/>
+                    </pattern>
+                </defs>
+                <rect x="0" y="0" width="200" height="200" fill="url(#dots)"/>
+            </svg>
+        "#;
+        let scene = import_svg(svg.as_bytes()).unwrap();
+
+        // There should be a pattern paint node in defs.
+        let defs = scene.defs();
+        let defs_node = scene.get(defs).unwrap();
+        let pattern_id = defs_node.children.iter().find_map(|&id| {
+            let node = scene.get(id)?;
+            if let NodeData::Paint(vector_scene::Paint::Pattern(p)) = &node.data {
+                // Verify the tile rect is correct.
+                assert!((p.rect[2] - 20.0).abs() < 1e-4, "pattern width should be 20");
+                assert!((p.rect[3] - 20.0).abs() < 1e-4, "pattern height should be 20");
+                // The content group should exist and have children.
+                let content = scene.get(p.content)?;
+                assert!(
+                    !content.children.is_empty(),
+                    "pattern content group should have children"
+                );
+                Some(id)
+            } else {
+                None
+            }
+        });
+        assert!(
+            pattern_id.is_some(),
+            "should have pattern paint node in defs"
+        );
+
+        // The rect path should reference the pattern via PaintRef::Ref.
+        let root = scene.root();
+        let root_node = scene.get(root).unwrap();
+        let has_pattern_ref = root_node.children.iter().any(|&id| {
+            let node = scene.get(id).unwrap();
+            if let NodeData::Path { style, .. } = &node.data {
+                matches!(&style.fill, Some(f) if matches!(&f.paint, vector_scene::PaintRef::Ref(_)))
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_pattern_ref,
+            "path should reference pattern via PaintRef::Ref"
+        );
+    }
+
+    #[test]
+    fn import_pattern_dedup() {
+        // Two paths using the same pattern should share a single paint node.
+        let svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <defs>
+                    <pattern id="stripes" width="10" height="10" patternUnits="userSpaceOnUse">
+                        <rect width="5" height="10" fill="blue"/>
+                    </pattern>
+                </defs>
+                <rect x="0" y="0" width="100" height="100" fill="url(#stripes)"/>
+                <rect x="100" y="0" width="100" height="100" fill="url(#stripes)"/>
+            </svg>
+        "#;
+        let scene = import_svg(svg.as_bytes()).unwrap();
+
+        // Count pattern paint nodes in defs.
+        let defs = scene.defs();
+        let defs_node = scene.get(defs).unwrap();
+        let pattern_count = defs_node
+            .children
+            .iter()
+            .filter(|&&id| {
+                scene.get(id).is_some_and(|n| {
+                    matches!(&n.data, NodeData::Paint(vector_scene::Paint::Pattern(_)))
+                })
+            })
+            .count();
+        assert_eq!(
+            pattern_count, 1,
+            "should deduplicate to a single pattern paint node"
+        );
+
+        // Both paths should reference via PaintRef::Ref.
+        let root = scene.root();
+        let root_node = scene.get(root).unwrap();
+        let ref_count = root_node
+            .children
+            .iter()
+            .filter(|&&id| {
+                scene.get(id).is_some_and(|n| {
+                    if let NodeData::Path { style, .. } = &n.data {
+                        matches!(&style.fill, Some(f) if matches!(&f.paint, vector_scene::PaintRef::Ref(_)))
+                    } else {
+                        false
+                    }
+                })
+            })
+            .count();
+        assert_eq!(
+            ref_count, 2,
+            "both paths should reference the pattern"
         );
     }
 

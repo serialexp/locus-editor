@@ -3,8 +3,8 @@ use std::fmt::Write;
 
 use vector_geom::{Affine, Color, Segment};
 use vector_scene::{
-    FillRule, Gradient, GradientKind, LineCap, LineJoin, NodeData, NodeId, Paint, PaintRef, Scene,
-    SpreadMethod, Style,
+    FillRule, Gradient, GradientKind, LineCap, LineJoin, NodeData, NodeId, Paint, PaintRef,
+    Pattern, Scene, SpreadMethod, Style,
 };
 
 /// Export a scene graph to an SVG string.
@@ -23,8 +23,8 @@ pub fn export_svg(scene: &Scene) -> String {
         )
     };
 
-    // Build gradient label map: NodeId → SVG id string.
-    let gradient_ids = build_gradient_id_map(scene);
+    // Build paint label map: NodeId → SVG id string (gradients + patterns).
+    let gradient_ids = build_paint_id_map(scene);
 
     let mut buf = String::with_capacity(4096);
     let _ = writeln!(buf, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
@@ -45,9 +45,9 @@ pub fn export_svg(scene: &Scene) -> String {
     buf
 }
 
-/// Build a map from gradient NodeIds to their SVG element id strings.
-/// Ensures unique ids even if labels collide.
-fn build_gradient_id_map(scene: &Scene) -> HashMap<NodeId, String> {
+/// Build a map from paint definition NodeIds (gradients and patterns) to
+/// their SVG element id strings.
+fn build_paint_id_map(scene: &Scene) -> HashMap<NodeId, String> {
     let mut map = HashMap::new();
     let defs = scene.defs();
     let Some(defs_node) = scene.get(defs) else {
@@ -56,16 +56,20 @@ fn build_gradient_id_map(scene: &Scene) -> HashMap<NodeId, String> {
 
     let mut counter = 0usize;
     for &child_id in &defs_node.children {
-        if let Some(child) = scene.get(child_id)
-            && matches!(&child.data, NodeData::Paint(Paint::Gradient(_)))
-        {
-            let id = if child.label.is_empty() {
-                counter += 1;
-                format!("gradient_{counter}")
-            } else {
-                child.label.clone()
-            };
-            map.insert(child_id, id);
+        if let Some(child) = scene.get(child_id) {
+            let is_paint = matches!(
+                &child.data,
+                NodeData::Paint(Paint::Gradient(_)) | NodeData::Paint(Paint::Pattern(_))
+            );
+            if is_paint {
+                let id = if child.label.is_empty() {
+                    counter += 1;
+                    format!("paint_{counter}")
+                } else {
+                    child.label.clone()
+                };
+                map.insert(child_id, id);
+            }
         }
     }
     map
@@ -89,17 +93,31 @@ fn write_node(
 
     match &node.data {
         NodeData::Group { is_defs: true } => {
-            // Emit a <defs> block if there are any gradient definitions.
+            // Emit a <defs> block if there are any paint definitions.
             if gradient_ids.is_empty() {
                 return;
             }
             let _ = writeln!(buf, "{pad}<defs>");
             for &child_id in &node.children {
                 if let Some(child) = scene.get(child_id)
-                    && let NodeData::Paint(Paint::Gradient(gradient)) = &child.data
                     && let Some(svg_id) = gradient_ids.get(&child_id)
                 {
-                    write_gradient(gradient, svg_id, indent + 1, buf);
+                    match &child.data {
+                        NodeData::Paint(Paint::Gradient(gradient)) => {
+                            write_gradient(gradient, svg_id, indent + 1, buf);
+                        }
+                        NodeData::Paint(Paint::Pattern(pattern)) => {
+                            write_pattern(
+                                pattern,
+                                scene,
+                                svg_id,
+                                indent + 1,
+                                buf,
+                                gradient_ids,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             }
             let _ = writeln!(buf, "{pad}</defs>");
@@ -284,6 +302,38 @@ fn write_gradient(gradient: &Gradient, svg_id: &str, indent: usize, buf: &mut St
             let _ = writeln!(buf, "{pad}</radialGradient>");
         }
     }
+}
+
+/// Emit an SVG `<pattern>` definition element.
+fn write_pattern(
+    pattern: &Pattern,
+    scene: &Scene,
+    svg_id: &str,
+    indent: usize,
+    buf: &mut String,
+    gradient_ids: &HashMap<NodeId, String>,
+) {
+    let pad = "  ".repeat(indent);
+    let [x, y, w, h] = pattern.rect;
+    let _ = write!(
+        buf,
+        r#"{pad}<pattern id="{}" x="{x}" y="{y}" width="{w}" height="{h}""#,
+        xml_escape(svg_id)
+    );
+    let _ = write!(buf, r#" patternUnits="userSpaceOnUse""#);
+    if let Some(t) = fmt_transform(pattern.transform) {
+        let _ = write!(buf, r#" patternTransform="{t}""#);
+    }
+    let _ = writeln!(buf, ">");
+
+    // Write pattern content (children of the content group).
+    if let Some(content_node) = scene.get(pattern.content) {
+        for &child_id in &content_node.children {
+            write_node(scene, child_id, indent + 1, buf, gradient_ids);
+        }
+    }
+
+    let _ = writeln!(buf, "{pad}</pattern>");
 }
 
 /// Emit `<stop>` elements for gradient color stops.
@@ -590,5 +640,152 @@ mod tests {
         );
         assert!(svg.contains("<stop"), "should have stop elements");
         assert!(svg.contains("</defs>"), "should close defs section");
+    }
+
+    #[test]
+    fn export_pattern_defs() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let defs = scene.defs();
+
+        // Create a content group with a simple rect (circle approximated as rect).
+        let content_group = vector_scene::Node::group("dots_content");
+        let content_id = scene.insert(defs, content_group).unwrap();
+
+        let mut dot_path = Path::new();
+        dot_path.subpaths.push(SubPath {
+            start: Point::new(5.0, 5.0),
+            segments: vec![
+                Segment::Line {
+                    to: Point::new(15.0, 5.0),
+                },
+                Segment::Line {
+                    to: Point::new(15.0, 15.0),
+                },
+                Segment::Line {
+                    to: Point::new(5.0, 15.0),
+                },
+            ],
+            closed: true,
+            vertex_modes: vec![VertexMode::Corner; 4],
+        });
+        let mut dot_node = vector_scene::Node::path("dot", dot_path);
+        if let NodeData::Path { ref mut style, .. } = dot_node.data {
+            style.fill = Some(vector_scene::style::Fill {
+                paint: PaintRef::Solid(Color::from_srgb8(255, 0, 0, 255)),
+                rule: FillRule::NonZero,
+                opacity: 1.0,
+            });
+        }
+        scene.insert(content_id, dot_node);
+
+        // Create the pattern paint node.
+        let pattern = vector_scene::Pattern {
+            rect: [0.0, 0.0, 20.0, 20.0],
+            transform: Affine::IDENTITY,
+            content: content_id,
+        };
+        let paint_node = vector_scene::Node {
+            label: "my_pattern".into(),
+            transform: Affine::IDENTITY,
+            data: NodeData::Paint(vector_scene::Paint::Pattern(pattern)),
+            children: Vec::new(),
+            visible: true,
+            locked: false,
+        };
+        let pat_id = scene.insert(defs, paint_node).unwrap();
+
+        // Create a path that uses the pattern fill.
+        let mut rect_path = Path::new();
+        rect_path.subpaths.push(SubPath {
+            start: Point::new(0.0, 0.0),
+            segments: vec![
+                Segment::Line {
+                    to: Point::new(200.0, 0.0),
+                },
+                Segment::Line {
+                    to: Point::new(200.0, 200.0),
+                },
+                Segment::Line {
+                    to: Point::new(0.0, 200.0),
+                },
+            ],
+            closed: true,
+            vertex_modes: vec![VertexMode::Corner; 4],
+        });
+        let mut rect_node = vector_scene::Node::path("rect", rect_path);
+        if let NodeData::Path { ref mut style, .. } = rect_node.data {
+            style.fill = Some(vector_scene::style::Fill {
+                paint: PaintRef::Ref(pat_id),
+                rule: FillRule::NonZero,
+                opacity: 1.0,
+            });
+        }
+        scene.insert(root, rect_node);
+
+        let svg = export_svg(&scene);
+        assert!(svg.contains("<defs>"), "should have defs section");
+        assert!(svg.contains("<pattern"), "should have pattern element");
+        assert!(
+            svg.contains(r#"id="my_pattern""#),
+            "pattern should have correct id"
+        );
+        assert!(
+            svg.contains(r#"width="20""#),
+            "pattern should have correct width"
+        );
+        assert!(
+            svg.contains(r#"height="20""#),
+            "pattern should have correct height"
+        );
+        assert!(
+            svg.contains(r#"patternUnits="userSpaceOnUse""#),
+            "pattern should specify units"
+        );
+        assert!(
+            svg.contains("url(#my_pattern)"),
+            "path fill should reference pattern"
+        );
+        assert!(
+            svg.contains("<path"),
+            "pattern content should have path element"
+        );
+        assert!(svg.contains("</pattern>"), "should close pattern element");
+        assert!(svg.contains("</defs>"), "should close defs section");
+    }
+
+    #[test]
+    fn pattern_import_export_roundtrip() {
+        // Import an SVG with a pattern, export it, and verify the pattern survives.
+        let input_svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <defs>
+                    <pattern id="checks" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
+                        <rect x="0" y="0" width="10" height="10" fill="black"/>
+                        <rect x="10" y="10" width="10" height="10" fill="black"/>
+                    </pattern>
+                </defs>
+                <rect x="0" y="0" width="200" height="200" fill="url(#checks)"/>
+            </svg>
+        "#;
+        let scene = crate::import_svg(input_svg.as_bytes()).unwrap();
+        let output_svg = export_svg(&scene);
+
+        assert!(
+            output_svg.contains("<pattern"),
+            "exported SVG should contain pattern"
+        );
+        assert!(
+            output_svg.contains("</pattern>"),
+            "exported SVG should close pattern"
+        );
+        assert!(
+            output_svg.contains("url(#"),
+            "exported SVG should reference pattern"
+        );
+        assert!(
+            output_svg.contains(r#"width="20""#),
+            "exported pattern should have correct width"
+        );
     }
 }

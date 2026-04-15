@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use vector_geom::{Affine, Color, Point, Segment};
 use vector_scene::{
-    Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Scene, SpreadMethod, Stroke,
+    Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Pattern, Scene, SpreadMethod,
+    Stroke,
 };
 use vector_tess::{
     DashPattern, LineCap, LineJoin, StrokeParams, TessPaint, TessellatedMesh, Vertex,
@@ -132,6 +133,53 @@ impl GpuGradient {
     }
 }
 
+// ── GPU-side pattern data structures ──────────────────────────────────
+//
+// Must match the WGSL shader's `GpuPattern` layout exactly.
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct GpuPattern {
+    /// Inverse pattern transform: inv0 = [a, b, tx, 0]
+    inv0: [f32; 4],
+    /// Inverse pattern transform: inv1 = [c, d, ty, 0]
+    inv1: [f32; 4],
+    /// Tile rect: [x, y, width, height]
+    tile_rect: [f32; 4],
+    /// Index into the texture array layer dimension.
+    layer: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+impl GpuPattern {
+    fn from_pattern(pattern: &Pattern, layer: u32) -> Self {
+        let inv = pattern.transform.inverse().unwrap_or(Affine::IDENTITY);
+        Self {
+            inv0: [inv.a as f32, inv.b as f32, inv.tx as f32, 0.0],
+            inv1: [inv.c as f32, inv.d as f32, inv.ty as f32, 0.0],
+            tile_rect: [
+                pattern.rect[0] as f32,
+                pattern.rect[1] as f32,
+                pattern.rect[2] as f32,
+                pattern.rect[3] as f32,
+            ],
+            layer,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+}
+
+/// Maximum pixel dimension for a single pattern tile texture.
+const PATTERN_MAX_TEX_SIZE: u32 = 512;
+/// Minimum pixel dimension for a single pattern tile texture.
+const PATTERN_MIN_TEX_SIZE: u32 = 16;
+/// Scale factor for pattern tile rasterization (2.0 = retina quality).
+const PATTERN_SCALE: f64 = 2.0;
+
 /// The main renderer — owns the wgpu pipeline state and draws the scene.
 #[allow(clippy::struct_field_names)]
 pub struct Renderer {
@@ -142,7 +190,15 @@ pub struct Renderer {
     globals_buffer: wgpu::Buffer,
     /// Storage buffer for gradient descriptors.
     gradient_buffer: wgpu::Buffer,
-    /// Combined bind group: globals uniform + gradient storage.
+    /// Storage buffer for pattern descriptors.
+    pattern_buffer: wgpu::Buffer,
+    /// Texture array holding rasterized pattern tiles.
+    pattern_texture: wgpu::Texture,
+    /// View into the pattern texture array.
+    pattern_texture_view: wgpu::TextureView,
+    /// Sampler for pattern texture lookups.
+    pattern_sampler: wgpu::Sampler,
+    /// Combined bind group: globals + gradients + patterns.
     bind_group: wgpu::BindGroup,
     /// Cached vertex/index buffers for scene geometry. Rebuilt when scene changes.
     vertex_buffer: Option<wgpu::Buffer>,
@@ -201,26 +257,48 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vector bind group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: gradient_buffer.as_entire_binding(),
-                },
-            ],
+        // Create an initial (empty) pattern storage buffer.
+        let pattern_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pattern storage"),
+            size: std::mem::size_of::<GpuPattern>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+
+        // Create a placeholder 1×1×1 texture array so the bind group is valid
+        // even when no patterns exist.
+        let pattern_texture = create_placeholder_pattern_texture(device);
+        let pattern_texture_view =
+            pattern_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let pattern_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pattern sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let bind_group = create_bind_group(
+            device,
+            &bind_group_layout,
+            &globals_buffer,
+            &gradient_buffer,
+            &pattern_buffer,
+            &pattern_texture_view,
+            &pattern_sampler,
+        );
 
         Self {
             pipeline,
             bind_group_layout,
             globals_buffer,
             gradient_buffer,
+            pattern_buffer,
+            pattern_texture,
+            pattern_texture_view,
+            pattern_sampler,
             bind_group,
             vertex_buffer: None,
             index_buffer: None,
@@ -311,32 +389,388 @@ impl Renderer {
 
         let grad_size = (gpu_gradients.len() * std::mem::size_of::<GpuGradient>()) as u64;
         if self.gradient_buffer.size() < grad_size {
-            // Recreate gradient buffer and bind group with new size.
             self.gradient_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("gradient storage"),
                 size: grad_size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("vector bind group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.globals_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.gradient_buffer.as_entire_binding(),
-                    },
-                ],
-            });
         }
         queue.write_buffer(
             &self.gradient_buffer,
             0,
             bytemuck::cast_slice(&gpu_gradients),
+        );
+
+        // ── Collect patterns from defs ─────────────────────────────────
+        let mut gpu_patterns: Vec<GpuPattern> = Vec::new();
+        let mut pattern_index_map: HashMap<NodeId, i32> = HashMap::new();
+        // (pattern_data, paint_node_id) indexed by layer/pattern index
+        let mut pattern_tiles: Vec<(Pattern, NodeId)> = Vec::new();
+        // Set of all pattern paint node IDs (for dependency detection)
+        let mut pattern_node_ids: std::collections::HashSet<NodeId> =
+            std::collections::HashSet::new();
+
+        if let Some(defs_node) = scene.get(defs) {
+            for &child_id in &defs_node.children {
+                if let Some(child) = scene.get(child_id)
+                    && let NodeData::Paint(Paint::Pattern(pattern)) = &child.data
+                {
+                    let layer = pattern_tiles.len() as u32;
+                    let idx = gpu_patterns.len() as i32;
+                    pattern_index_map.insert(child_id, idx);
+                    gpu_patterns.push(GpuPattern::from_pattern(pattern, layer));
+                    pattern_tiles.push((pattern.clone(), child_id));
+                    pattern_node_ids.insert(child_id);
+                }
+            }
+        }
+
+        // ── Render pattern tiles to textures ──────────────────────────
+        if pattern_tiles.is_empty() {
+            // No patterns: upload a dummy and use the placeholder texture.
+            let mut dummy = gpu_patterns;
+            if dummy.is_empty() {
+                dummy.push(GpuPattern::zeroed());
+            }
+            let pat_size = (dummy.len() * std::mem::size_of::<GpuPattern>()) as u64;
+            if self.pattern_buffer.size() < pat_size {
+                self.pattern_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("pattern storage"),
+                    size: pat_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&dummy));
+            if self
+                .pattern_texture
+                .usage()
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            {
+                self.pattern_texture = create_placeholder_pattern_texture(device);
+                self.pattern_texture_view = self
+                    .pattern_texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+            }
+        } else {
+            // ── Build dependency graph and topological sort ───────────
+            // For each pattern, find which other patterns its content references.
+            let num_patterns = pattern_tiles.len();
+            let mut deps: Vec<Vec<usize>> = vec![Vec::new(); num_patterns];
+            for (i, (pattern, _)) in pattern_tiles.iter().enumerate() {
+                let refs =
+                    collect_pattern_paint_refs(scene, pattern.content, &pattern_node_ids);
+                for ref_id in refs {
+                    if let Some(&idx) = pattern_index_map.get(&ref_id) {
+                        deps[i].push(idx as usize);
+                    }
+                }
+            }
+
+            let (render_order, cyclic_set) = topological_sort_patterns(&deps);
+
+            if !cyclic_set.is_empty() {
+                log::warn!(
+                    "Detected circular pattern references; {} pattern(s) will render as transparent",
+                    cyclic_set.len()
+                );
+            }
+
+            // Determine uniform texture dimensions for the atlas.
+            let mut tex_w: u32 = PATTERN_MIN_TEX_SIZE;
+            let mut tex_h: u32 = PATTERN_MIN_TEX_SIZE;
+            for (pat, _) in &pattern_tiles {
+                let pw = ((pat.rect[2] * PATTERN_SCALE).ceil() as u32)
+                    .clamp(PATTERN_MIN_TEX_SIZE, PATTERN_MAX_TEX_SIZE);
+                let ph = ((pat.rect[3] * PATTERN_SCALE).ceil() as u32)
+                    .clamp(PATTERN_MIN_TEX_SIZE, PATTERN_MAX_TEX_SIZE);
+                tex_w = tex_w.max(pw);
+                tex_h = tex_h.max(ph);
+            }
+
+            // Render each pattern to its own individual 2D texture (not the
+            // final array) so that nested patterns can safely sample from
+            // already-completed textures without wgpu subresource conflicts.
+            let individual_textures: Vec<wgpu::Texture> = (0..num_patterns)
+                .map(|i| {
+                    device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(&format!("pattern tile {i}")),
+                        size: wgpu::Extent3d {
+                            width: tex_w,
+                            height: tex_h,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    })
+                })
+                .collect();
+
+            // Track which patterns have been rendered (for building input arrays).
+            let mut rendered: Vec<bool> = vec![false; num_patterns];
+
+            // Render in topological order. Cyclic patterns are skipped (stay transparent).
+            for &pat_idx in &render_order {
+                let (ref pattern, _) = pattern_tiles[pat_idx];
+                let has_pattern_deps = !deps[pat_idx].is_empty();
+
+                let tex_view = individual_textures[pat_idx]
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+
+                // Build the pattern_index_map subset visible during tessellation.
+                // Only already-rendered (non-cyclic) patterns are available.
+                let tess_pattern_map: HashMap<NodeId, i32> = if has_pattern_deps {
+                    pattern_tiles
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| rendered[i])
+                        .map(|(_, (_, node_id))| {
+                            (*node_id, *pattern_index_map.get(node_id).unwrap())
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+
+                let (pat_vertices, pat_indices) = tessellate_pattern_content(
+                    scene,
+                    pattern,
+                    &gradient_index_map,
+                    &tess_pattern_map,
+                    tex_w,
+                    tex_h,
+                );
+
+                if pat_indices.is_empty() {
+                    rendered[pat_idx] = true;
+                    continue;
+                }
+
+                use wgpu::util::DeviceExt;
+                let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pattern tile vb"),
+                    contents: bytemuck::cast_slice(&pat_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pattern tile ib"),
+                    contents: bytemuck::cast_slice(&pat_indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+
+                let tile_view_proj =
+                    camera_matrix_ortho(tex_w as f32, tex_h as f32, &pattern.rect);
+                let tile_globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pattern tile globals"),
+                    contents: bytemuck::cast_slice(&tile_view_proj),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+                // Build the bind group for this pattern's render pass.
+                // If this pattern has deps on other patterns, build a temporary
+                // texture array from the already-completed individual textures
+                // so the fragment shader can sample them.
+                let (tile_pat_buf, tile_pat_tex, tile_pat_view);
+                if has_pattern_deps && rendered.iter().any(|&r| r) {
+                    // Build a temporary texture array from completed textures.
+                    let tmp_array = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("pattern deps array"),
+                        size: wgpu::Extent3d {
+                            width: tex_w,
+                            height: tex_h,
+                            depth_or_array_layers: num_patterns as u32,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        usage: wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    let mut copy_encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("pattern deps copy"),
+                        });
+                    for (i, completed) in rendered.iter().enumerate() {
+                        if *completed {
+                            copy_encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &individual_textures[i],
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &tmp_array,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d {
+                                        x: 0,
+                                        y: 0,
+                                        z: i as u32,
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d {
+                                    width: tex_w,
+                                    height: tex_h,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                        }
+                    }
+                    queue.submit(std::iter::once(copy_encoder.finish()));
+
+                    tile_pat_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("pattern tile pat buf"),
+                        size: (gpu_patterns.len() * std::mem::size_of::<GpuPattern>()) as u64,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    queue.write_buffer(
+                        &tile_pat_buf,
+                        0,
+                        bytemuck::cast_slice(&gpu_patterns),
+                    );
+                    tile_pat_tex = tmp_array;
+                    tile_pat_view =
+                        tile_pat_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                } else {
+                    tile_pat_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("pat tile dummy buf"),
+                        size: std::mem::size_of::<GpuPattern>() as u64,
+                        usage: wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    });
+                    tile_pat_tex = create_placeholder_pattern_texture(device);
+                    tile_pat_view =
+                        tile_pat_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                }
+
+                let tile_bind_group = create_bind_group(
+                    device,
+                    &self.bind_group_layout,
+                    &tile_globals,
+                    &self.gradient_buffer,
+                    &tile_pat_buf,
+                    &tile_pat_view,
+                    &self.pattern_sampler,
+                );
+
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("pattern tile encoder"),
+                    });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("pattern tile render"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &tex_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &tile_bind_group, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..pat_indices.len() as u32, 0, 0..1);
+                }
+                queue.submit(std::iter::once(encoder.finish()));
+                rendered[pat_idx] = true;
+            }
+
+            // ── Copy individual textures into the final array ─────────
+            let layer_count = num_patterns as u32;
+            self.pattern_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("pattern tile atlas"),
+                size: wgpu::Extent3d {
+                    width: tex_w,
+                    height: tex_h,
+                    depth_or_array_layers: layer_count,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+
+            let mut copy_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pattern atlas copy"),
+                });
+            for (i, tex) in individual_textures.iter().enumerate() {
+                copy_encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.pattern_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: i as u32,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: tex_w,
+                        height: tex_h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            queue.submit(std::iter::once(copy_encoder.finish()));
+
+            self.pattern_texture_view = self
+                .pattern_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+
+            // Upload pattern descriptors.
+            let pat_size = (gpu_patterns.len() * std::mem::size_of::<GpuPattern>()) as u64;
+            if self.pattern_buffer.size() < pat_size {
+                self.pattern_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("pattern storage"),
+                    size: pat_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(
+                &self.pattern_buffer,
+                0,
+                bytemuck::cast_slice(&gpu_patterns),
+            );
+        }
+
+        // Always rebuild bind group (buffers/textures may have changed).
+        self.bind_group = create_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.globals_buffer,
+            &self.gradient_buffer,
+            &self.pattern_buffer,
+            &self.pattern_texture_view,
+            &self.pattern_sampler,
         );
 
         // ── Helper: resolve PaintRef → TessPaint ───────────────────────
@@ -346,6 +780,8 @@ impl Renderer {
                 PaintRef::Ref(node_id) => {
                     if let Some(&idx) = gradient_index_map.get(node_id) {
                         TessPaint::Gradient { index: idx }
+                    } else if let Some(&idx) = pattern_index_map.get(node_id) {
+                        TessPaint::Pattern { index: idx }
                     } else {
                         TessPaint::Solid(Color::BLACK)
                     }
@@ -401,7 +837,7 @@ impl Renderer {
                         color: v.color,
                         world_pos: [p.x as f32, p.y as f32],
                         gradient_index: v.gradient_index,
-                        _pad: 0,
+                        pattern_index: v.pattern_index,
                     }
                 }));
             }
@@ -1332,4 +1768,383 @@ fn camera_matrix(width: f32, height: f32, pan: [f32; 2], zoom: f32) -> [f32; 16]
     [
         sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, tx, ty, 0.0, 1.0,
     ]
+}
+
+/// Orthographic projection matrix that maps a tile rect [x, y, w, h] to fill
+/// a viewport of `width × height` pixels. No pan or zoom — just direct mapping.
+fn camera_matrix_ortho(width: f32, height: f32, tile_rect: &[f64; 4]) -> [f32; 16] {
+    let rx = tile_rect[0] as f32;
+    let ry = tile_rect[1] as f32;
+    let rw = tile_rect[2] as f32;
+    let rh = tile_rect[3] as f32;
+
+    // Map [rx, rx+rw] → [-1, 1] horizontally
+    // Map [ry, ry+rh] → [1, -1] vertically (Y-flip for top-left origin)
+    let sx = 2.0 / rw;
+    let sy = -2.0 / rh;
+    let tx = -(2.0 * rx / rw + 1.0);
+    let ty = 2.0 * ry / rh + 1.0;
+
+    // The pattern is rendered at the texture's pixel dimensions, but
+    // geometrically the tile rect may be a different aspect ratio.
+    // We don't need to compensate here because the UV computation in the
+    // shader normalises by tile_rect dimensions.
+    let _ = (width, height); // suppress unused warnings; sizes drive texture creation only
+
+    [
+        sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, tx, ty, 0.0, 1.0,
+    ]
+}
+
+/// Create a 1×1 placeholder pattern texture array (1 layer, transparent pixel).
+fn create_placeholder_pattern_texture(device: &wgpu::Device) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("placeholder pattern texture"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+/// Create the full bind group with all five bindings.
+fn create_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    globals_buffer: &wgpu::Buffer,
+    gradient_buffer: &wgpu::Buffer,
+    pattern_buffer: &wgpu::Buffer,
+    pattern_texture_view: &wgpu::TextureView,
+    pattern_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("vector bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: gradient_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: pattern_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(pattern_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(pattern_sampler),
+            },
+        ],
+    })
+}
+
+/// Walk a subtree and collect all `PaintRef::Ref` node IDs that point to
+/// one of the known pattern paint nodes. Used to build the dependency graph
+/// for topological sorting of pattern rendering.
+fn collect_pattern_paint_refs(
+    scene: &Scene,
+    content_id: NodeId,
+    pattern_node_ids: &std::collections::HashSet<NodeId>,
+) -> Vec<NodeId> {
+    let mut refs = Vec::new();
+
+    scene.walk_depth_first(
+        content_id,
+        Affine::IDENTITY,
+        &mut |_id, node, _world| {
+            let paint_refs: Vec<&PaintRef> = match &node.data {
+                NodeData::Path { style, .. } => {
+                    let mut p = Vec::new();
+                    if let Some(f) = &style.fill {
+                        p.push(&f.paint);
+                    }
+                    if let Some(s) = &style.stroke {
+                        p.push(&s.paint);
+                    }
+                    p
+                }
+                NodeData::Text(t) => {
+                    let mut p = Vec::new();
+                    if let Some(f) = &t.style.fill {
+                        p.push(&f.paint);
+                    }
+                    if let Some(s) = &t.style.stroke {
+                        p.push(&s.paint);
+                    }
+                    p
+                }
+                _ => Vec::new(),
+            };
+            for paint in paint_refs {
+                if let PaintRef::Ref(ref_id) = paint
+                    && pattern_node_ids.contains(ref_id)
+                    && !refs.contains(ref_id)
+                {
+                    refs.push(*ref_id);
+                }
+            }
+        },
+    );
+
+    refs
+}
+
+/// Topological sort of patterns using Kahn's algorithm.
+///
+/// `deps[i]` lists the pattern indices that pattern `i` depends on (i.e.,
+/// pattern `i`'s content references those patterns as fills/strokes).
+///
+/// Returns `(order, cyclic)` where `order` is the rendering order (leaf
+/// patterns first) and `cyclic` is the set of pattern indices that are
+/// part of a dependency cycle. Cyclic patterns are not included in `order`
+/// and their texture layers will stay transparent.
+fn topological_sort_patterns(
+    deps: &[Vec<usize>],
+) -> (Vec<usize>, std::collections::HashSet<usize>) {
+    let n = deps.len();
+
+    // Build in-degree counts and reverse adjacency (who depends on me).
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, d) in deps.iter().enumerate() {
+        for &dep in d {
+            if dep < n {
+                in_degree[i] += 1;
+                dependents[dep].push(i);
+            }
+        }
+    }
+
+    // Seed the queue with patterns that have no dependencies.
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            queue.push_back(i);
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(idx) = queue.pop_front() {
+        order.push(idx);
+        for &dependent in &dependents[idx] {
+            in_degree[dependent] -= 1;
+            if in_degree[dependent] == 0 {
+                queue.push_back(dependent);
+            }
+        }
+    }
+
+    // Any patterns not in `order` are part of a cycle.
+    let cyclic: std::collections::HashSet<usize> = (0..n)
+        .filter(|i| !order.contains(i))
+        .collect();
+
+    (order, cyclic)
+}
+
+/// Tessellate the content of a pattern group into vertices and indices,
+/// with an orthographic camera set up for the tile rect.
+fn tessellate_pattern_content(
+    scene: &Scene,
+    pattern: &Pattern,
+    gradient_index_map: &HashMap<NodeId, i32>,
+    pattern_index_map: &HashMap<NodeId, i32>,
+    _tex_w: u32,
+    _tex_h: u32,
+) -> (Vec<Vertex>, Vec<u32>) {
+    let mut all_vertices: Vec<Vertex> = Vec::new();
+    let mut all_indices: Vec<u32> = Vec::new();
+
+    let resolve_paint = |paint: &PaintRef| -> TessPaint {
+        match paint {
+            PaintRef::Solid(c) => TessPaint::Solid(*c),
+            PaintRef::Ref(node_id) => {
+                if let Some(&idx) = gradient_index_map.get(node_id) {
+                    TessPaint::Gradient { index: idx }
+                } else if let Some(&idx) = pattern_index_map.get(node_id) {
+                    TessPaint::Pattern { index: idx }
+                } else {
+                    // Unresolved ref (cyclic pattern or unknown) → transparent (SVG spec:
+                    // invalid paint server references result in no paint).
+                    TessPaint::Solid(Color::TRANSPARENT)
+                }
+            }
+        }
+    };
+
+    let resolve_stroke = |s: &Stroke| -> StrokeParams {
+        let cap = match s.style.cap {
+            vector_scene::LineCap::Butt => LineCap::Butt,
+            vector_scene::LineCap::Round => LineCap::Round,
+            vector_scene::LineCap::Square => LineCap::Square,
+        };
+        let join = match s.style.join {
+            vector_scene::LineJoin::Miter => LineJoin::Miter,
+            vector_scene::LineJoin::Round => LineJoin::Round,
+            vector_scene::LineJoin::Bevel => LineJoin::Bevel,
+        };
+        let dash = s.style.dash.as_ref().map(|d| DashPattern {
+            array: d.array.clone(),
+            offset: d.offset,
+        });
+        StrokeParams {
+            paint: resolve_paint(&s.paint),
+            width: s.style.width,
+            cap,
+            join,
+            miter_limit: s.style.miter_limit,
+            dash,
+        }
+    };
+
+    let push_mesh = |mesh: TessellatedMesh,
+                     world_transform: &Affine,
+                     all_vertices: &mut Vec<Vertex>,
+                     all_indices: &mut Vec<u32>| {
+        let base = all_vertices.len() as u32;
+        if world_transform.is_identity() {
+            all_vertices.extend_from_slice(&mesh.vertices);
+        } else {
+            all_vertices.extend(mesh.vertices.iter().map(|v| {
+                let p =
+                    world_transform.apply(Point::new(v.position[0] as f64, v.position[1] as f64));
+                Vertex {
+                    position: [p.x as f32, p.y as f32],
+                    color: v.color,
+                    world_pos: [p.x as f32, p.y as f32],
+                    gradient_index: v.gradient_index,
+                    pattern_index: v.pattern_index,
+                }
+            }));
+        }
+        all_indices.extend(mesh.indices.iter().map(|i| i + base));
+    };
+
+    let mut font_db = global_font_db();
+
+    // Walk the pattern content subtree.
+    scene.walk_depth_first(
+        pattern.content,
+        Affine::IDENTITY,
+        &mut |_id, node, world_transform| {
+            if !node.visible {
+                return;
+            }
+            match node.data {
+                NodeData::Path {
+                    ref path,
+                    ref style,
+                } => {
+                    let fill = style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let stroke = style.stroke.as_ref().map(&resolve_stroke);
+                    let mesh = tessellate_path(path, fill, stroke);
+                    push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
+                }
+                NodeData::Text(ref text) => {
+                    let shaped = font_db.shape_text(
+                        &text.content,
+                        &text.font_family,
+                        text.font_size,
+                    );
+                    let fill = text.style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let stroke = text.style.stroke.as_ref().map(&resolve_stroke);
+                    let mesh = tessellate_path(&shaped.path, fill, stroke);
+                    push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
+                }
+                _ => {}
+            }
+        },
+    );
+
+    (all_vertices, all_indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topo_sort_no_deps() {
+        // Three independent patterns.
+        let deps = vec![vec![], vec![], vec![]];
+        let (order, cyclic) = topological_sort_patterns(&deps);
+        assert_eq!(order.len(), 3);
+        assert!(cyclic.is_empty());
+    }
+
+    #[test]
+    fn topo_sort_linear_chain() {
+        // 0 → 1 → 2 (2 depends on 1, 1 depends on 0)
+        let deps = vec![vec![], vec![0], vec![1]];
+        let (order, cyclic) = topological_sort_patterns(&deps);
+        assert_eq!(order.len(), 3);
+        assert!(cyclic.is_empty());
+        // 0 must come before 1, and 1 must come before 2.
+        let pos = |x: usize| order.iter().position(|&v| v == x).unwrap();
+        assert!(pos(0) < pos(1));
+        assert!(pos(1) < pos(2));
+    }
+
+    #[test]
+    fn topo_sort_direct_cycle() {
+        // 0 ↔ 1 (mutual dependency)
+        let deps = vec![vec![1], vec![0]];
+        let (order, cyclic) = topological_sort_patterns(&deps);
+        assert!(order.is_empty());
+        assert_eq!(cyclic.len(), 2);
+        assert!(cyclic.contains(&0));
+        assert!(cyclic.contains(&1));
+    }
+
+    #[test]
+    fn topo_sort_self_reference() {
+        // 0 → 0 (self-reference)
+        let deps = vec![vec![0]];
+        let (order, cyclic) = topological_sort_patterns(&deps);
+        assert!(order.is_empty());
+        assert_eq!(cyclic.len(), 1);
+        assert!(cyclic.contains(&0));
+    }
+
+    #[test]
+    fn topo_sort_partial_cycle() {
+        // 0 is independent, 1 ↔ 2 are cyclic, 3 depends on 0.
+        let deps = vec![vec![], vec![2], vec![1], vec![0]];
+        let (order, cyclic) = topological_sort_patterns(&deps);
+        assert_eq!(order.len(), 2); // 0 and 3
+        assert_eq!(cyclic.len(), 2); // 1 and 2
+        assert!(cyclic.contains(&1));
+        assert!(cyclic.contains(&2));
+        assert!(order.contains(&0));
+        assert!(order.contains(&3));
+        let pos = |x: usize| order.iter().position(|&v| v == x).unwrap();
+        assert!(pos(0) < pos(3));
+    }
+
+    #[test]
+    fn topo_sort_diamond() {
+        // 0 and 1 are leaves; 2 depends on both; 3 depends on 2.
+        let deps = vec![vec![], vec![], vec![0, 1], vec![2]];
+        let (order, cyclic) = topological_sort_patterns(&deps);
+        assert_eq!(order.len(), 4);
+        assert!(cyclic.is_empty());
+        let pos = |x: usize| order.iter().position(|&v| v == x).unwrap();
+        assert!(pos(0) < pos(2));
+        assert!(pos(1) < pos(2));
+        assert!(pos(2) < pos(3));
+    }
 }

@@ -42,7 +42,7 @@ pub enum NodeData {
     /// A vector path with fill/stroke styling.
     Path { path: Path, style: Style },
 
-    /// A paint definition (gradient). Lives in the defs subtree
+    /// A paint definition (gradient or pattern). Lives in the defs subtree
     /// and is referenced via `PaintRef::Ref`.
     Paint(Paint),
 
