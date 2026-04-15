@@ -572,10 +572,10 @@ mod tests {
         let defs_node = scene.get(defs).unwrap();
         let grad_id = defs_node.children.iter().find_map(|&id| {
             let node = scene.get(id)?;
-            if let NodeData::Paint(vector_scene::Paint::Gradient(g)) = &node.data {
-                if matches!(g.kind, vector_scene::GradientKind::Radial { .. }) {
-                    return Some(id);
-                }
+            if let NodeData::Paint(vector_scene::Paint::Gradient(g)) = &node.data
+                && matches!(g.kind, vector_scene::GradientKind::Radial { .. })
+            {
+                return Some(id);
             }
             None
         });
