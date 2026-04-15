@@ -267,8 +267,7 @@ impl Renderer {
         // Create a placeholder 1×1×1 texture array so the bind group is valid
         // even when no patterns exist.
         let pattern_texture = create_placeholder_pattern_texture(device);
-        let pattern_texture_view =
-            pattern_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let pattern_texture_view = pattern_array_view(&pattern_texture);
 
         let pattern_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("pattern sampler"),
@@ -448,9 +447,7 @@ impl Renderer {
                 .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
             {
                 self.pattern_texture = create_placeholder_pattern_texture(device);
-                self.pattern_texture_view = self
-                    .pattern_texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
+                self.pattern_texture_view = pattern_array_view(&self.pattern_texture);
             }
         } else {
             // ── Build dependency graph and topological sort ───────────
@@ -631,8 +628,7 @@ impl Renderer {
                     });
                     queue.write_buffer(&tile_pat_buf, 0, bytemuck::cast_slice(&gpu_patterns));
                     tile_pat_tex = tmp_array;
-                    tile_pat_view =
-                        tile_pat_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    tile_pat_view = pattern_array_view(&tile_pat_tex);
                 } else {
                     tile_pat_buf = device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("pat tile dummy buf"),
@@ -641,8 +637,7 @@ impl Renderer {
                         mapped_at_creation: false,
                     });
                     tile_pat_tex = create_placeholder_pattern_texture(device);
-                    tile_pat_view =
-                        tile_pat_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    tile_pat_view = pattern_array_view(&tile_pat_tex);
                 }
 
                 let tile_bind_group = create_bind_group(
@@ -731,9 +726,7 @@ impl Renderer {
             }
             queue.submit(std::iter::once(copy_encoder.finish()));
 
-            self.pattern_texture_view = self
-                .pattern_texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.pattern_texture_view = pattern_array_view(&self.pattern_texture);
 
             // Upload pattern descriptors.
             let pat_size = (gpu_patterns.len() * std::mem::size_of::<GpuPattern>()) as u64;
@@ -1852,6 +1845,16 @@ fn create_placeholder_pattern_texture(device: &wgpu::Device) -> wgpu::Texture {
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
+    })
+}
+
+/// Create a texture view with `D2Array` dimension. wgpu defaults to `D2`
+/// when `depth_or_array_layers == 1`, but the shader always expects
+/// `texture_2d_array`, so we must be explicit.
+fn pattern_array_view(texture: &wgpu::Texture) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
     })
 }
 
