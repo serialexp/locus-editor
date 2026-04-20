@@ -117,6 +117,29 @@ impl FontDb {
         font.shape_text(text, font_size)
     }
 
+    /// Compute cursor positions with the font matching the given family name.
+    pub fn cursor_positions(
+        &mut self,
+        text: &str,
+        font_family: &str,
+        font_size: f64,
+    ) -> CursorPositions {
+        let font = self.resolve(font_family);
+        font.cursor_positions(text, font_size)
+    }
+
+    /// Return a sorted, deduplicated list of available font family names.
+    pub fn family_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .db
+            .faces()
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Compute text bounds with the font matching the given family name.
     pub fn text_bounds(&mut self, content: &str, font_family: &str, font_size: f64) -> Bounds {
         if content.is_empty() {
@@ -159,6 +182,11 @@ pub fn text_bounds(content: &str, font_family: &str, font_size: f64) -> Bounds {
     global_font_db().text_bounds(content, font_family, font_size)
 }
 
+/// Convenience: compute cursor positions using the global font database.
+pub fn cursor_positions(text: &str, font_family: &str, font_size: f64) -> CursorPositions {
+    global_font_db().cursor_positions(text, font_family, font_size)
+}
+
 // ── Font ────────────────────────────────────────────────────────────
 
 /// A font loaded and ready for shaping + glyph extraction.
@@ -191,22 +219,72 @@ impl<'a> Font<'a> {
         Self::from_bytes(DEFAULT_FONT_DATA).expect("embedded font should be valid")
     }
 
+    /// Compute cursor X positions for each character boundary.
+    ///
+    /// Returns one X value per cursor position: before the first character,
+    /// between each pair of characters, and after the last character.
+    pub fn cursor_positions(&self, text: &str, font_size: f64) -> CursorPositions {
+        if text.is_empty() {
+            return CursorPositions {
+                x_positions: vec![0.0],
+            };
+        }
+
+        let scale = font_size / self.units_per_em;
+        let char_count = text.chars().count();
+
+        // Shape to get glyph advances.
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        let output = rustybuzz::shape(&self.buzz_face, &[], buffer);
+
+        let infos = output.glyph_infos();
+        let positions = output.glyph_positions();
+
+        // Build a map from character index → cumulative advance after that char.
+        // Glyphs reference their source character via the `cluster` field.
+        let mut char_advances = vec![0.0_f64; char_count];
+
+        for (info, pos) in infos.iter().zip(positions.iter()) {
+            let cluster = info.cluster as usize;
+            // Map byte offset (cluster) to char index.
+            let char_idx = text[..cluster.min(text.len())].chars().count();
+            let advance = pos.x_advance as f64 * scale;
+            if char_idx < char_count {
+                char_advances[char_idx] = advance;
+            }
+        }
+
+        // Build cumulative positions.
+        let mut x_positions = Vec::with_capacity(char_count + 1);
+        x_positions.push(0.0);
+        let mut x = 0.0;
+        for adv in &char_advances {
+            x += adv;
+            x_positions.push(x);
+        }
+
+        CursorPositions { x_positions }
+    }
+
     /// Shape a string of text and return glyph outlines as a single `Path`.
     ///
     /// The resulting path is positioned with the baseline at y=0, text
     /// flowing left-to-right from x=0. Scale is in the coordinate system
     /// where 1 unit = 1 SVG user unit (i.e. `font_size` determines height).
     pub fn shape_text(&self, text: &str, font_size: f64) -> ShapedText {
+        let scale = font_size / self.units_per_em;
+        let ascent = self.ttf_face.ascender() as f64 * scale;
+        let descent = self.ttf_face.descender() as f64 * scale;
+
         if text.is_empty() {
             return ShapedText {
                 path: Path::new(),
                 advance_width: 0.0,
-                ascent: 0.0,
-                descent: 0.0,
+                ascent,
+                descent,
             };
         }
-
-        let scale = font_size / self.units_per_em;
 
         // Shape with rustybuzz.
         let mut buffer = rustybuzz::UnicodeBuffer::new();
@@ -237,15 +315,38 @@ impl<'a> Font<'a> {
             cursor_y += pos.y_advance as f64 * scale;
         }
 
-        let ascent = self.ttf_face.ascender() as f64 * scale;
-        let descent = self.ttf_face.descender() as f64 * scale;
-
         ShapedText {
             path,
             advance_width: cursor_x,
             ascent,
             descent,
         }
+    }
+}
+
+/// Cursor position information for interactive text editing.
+pub struct CursorPositions {
+    /// X position for each cursor location (0..=char_count).
+    /// Index 0 is before the first character, index N is after the last.
+    pub x_positions: Vec<f64>,
+}
+
+impl CursorPositions {
+    /// Find the closest cursor index for a given local X coordinate.
+    pub fn hit_test(&self, local_x: f64) -> usize {
+        if self.x_positions.is_empty() {
+            return 0;
+        }
+        let mut best = 0;
+        let mut best_dist = f64::MAX;
+        for (i, &x) in self.x_positions.iter().enumerate() {
+            let dist = (x - local_x).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = i;
+            }
+        }
+        best
     }
 }
 

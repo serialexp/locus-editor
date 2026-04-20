@@ -4,6 +4,7 @@ mod vertex;
 
 pub use dash::{DashPattern, dash_path};
 pub use tessellator::{
-    LineCap, LineJoin, StrokeParams, TessPaint, TessellatedMesh, tessellate_path,
+    FillParams, LineCap, LineJoin, StrokeBoundsParams, StrokeParams, TessPaint, TessellatedMesh,
+    path_visual_bounds, tessellate_path,
 };
 pub use vertex::Vertex;

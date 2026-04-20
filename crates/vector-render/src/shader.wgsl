@@ -204,7 +204,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Tile via fract (repeat).
         let uv = fract(vec2<f32>(u, v));
 
-        return textureSample(pattern_texture, pattern_sampler, uv, pat.layer);
+        var pat_color = textureSample(pattern_texture, pattern_sampler, uv, pat.layer);
+        pat_color.a *= in.color.a; // apply fill/stroke opacity
+        return pat_color;
     }
 
     // ── Solid color path ─────────────────────────────────────────────
@@ -273,5 +275,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     t = apply_spread(t, grad.spread);
-    return sample_gradient(grad, t);
+    var grad_color = sample_gradient(grad, t);
+    grad_color.a *= in.color.a; // apply fill/stroke opacity
+    return grad_color;
 }

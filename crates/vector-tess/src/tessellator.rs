@@ -3,7 +3,7 @@ use lyon_tessellation::{
     BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
 };
 
-use vector_geom::{Color, Path, Segment};
+use vector_geom::{Bounds, Color, Path, Point, Segment};
 
 use crate::dash::{DashPattern, dash_path};
 use crate::vertex::Vertex;
@@ -48,19 +48,95 @@ pub struct StrokeParams {
     pub join: LineJoin,
     pub miter_limit: f64,
     pub dash: Option<DashPattern>,
+    /// Fill/stroke opacity (0.0–1.0). Multiplied into vertex alpha.
+    pub opacity: f32,
+}
+
+/// Parameters for a fill operation: paint type + opacity.
+#[derive(Debug, Clone, Copy)]
+pub struct FillParams {
+    pub paint: TessPaint,
+    /// Fill opacity (0.0–1.0). Multiplied into vertex alpha.
+    pub opacity: f32,
+}
+
+/// Geometry-only stroke parameters for bounds computation.
+/// Has no `paint` / `opacity` because those don't affect the stroked region.
+#[derive(Debug, Clone)]
+pub struct StrokeBoundsParams {
+    pub width: f64,
+    pub cap: LineCap,
+    pub join: LineJoin,
+    pub miter_limit: f64,
+    pub dash: Option<DashPattern>,
+}
+
+/// Compute the exact axis-aligned bounding box of a path's visible
+/// geometry by tessellating it and taking the AABB of all vertex
+/// positions.
+///
+/// This is more accurate than `path.bounding_box()` because:
+/// - It uses the actual flattened curve geometry (no control-point hull
+///   overestimate).
+/// - It accounts for the stroked region exactly (correct perpendicular
+///   expansion, miter joins subject to `miter_limit` fallback, round/square
+///   caps, dash patterns).
+///
+/// Falls back to `path.bounding_box()` when neither fill nor stroke is
+/// present, since there's no visible geometry to tessellate.
+pub fn path_visual_bounds(
+    path: &Path,
+    has_fill: bool,
+    stroke: Option<&StrokeBoundsParams>,
+) -> Bounds {
+    if !has_fill && stroke.is_none() {
+        return path.bounding_box();
+    }
+
+    // Dummy paint — bounds only cares about geometry.
+    let dummy = TessPaint::Solid(Color::BLACK);
+
+    let fill_params = has_fill.then_some(FillParams {
+        paint: dummy,
+        opacity: 1.0,
+    });
+    let stroke_params = stroke.map(|s| StrokeParams {
+        paint: dummy,
+        width: s.width,
+        cap: s.cap,
+        join: s.join,
+        miter_limit: s.miter_limit,
+        dash: s.dash.clone(),
+        opacity: 1.0,
+    });
+
+    let mesh = tessellate_path(path, fill_params, stroke_params);
+    let mut bounds = Bounds::EMPTY;
+    for v in &mesh.vertices {
+        bounds = bounds.include_point(Point::new(v.position[0] as f64, v.position[1] as f64));
+    }
+    if bounds.is_empty() {
+        // Tessellation may produce no vertices for degenerate paths
+        // (empty path, zero-length stroke, etc). Fall back to geometry.
+        path.bounding_box()
+    } else {
+        bounds
+    }
 }
 
 /// Tessellate a path's fill and/or stroke into triangles.
 pub fn tessellate_path(
     path: &Path,
-    fill: Option<TessPaint>,
+    fill: Option<FillParams>,
     stroke: Option<StrokeParams>,
 ) -> TessellatedMesh {
     let lyon_path = to_lyon_path(path);
 
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
 
-    if let Some(paint) = fill {
+    if let Some(fill) = fill {
+        let paint = fill.paint;
+        let opacity = fill.opacity;
         let mut tessellator = FillTessellator::new();
         tessellator
             .tessellate_path(
@@ -70,10 +146,10 @@ pub fn tessellate_path(
                     let pos = [vertex.position().x, vertex.position().y];
                     match paint {
                         TessPaint::Solid(color) => {
-                            Vertex::solid(pos, [color.r, color.g, color.b, color.a])
+                            Vertex::solid(pos, [color.r, color.g, color.b, color.a * opacity])
                         }
-                        TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index),
-                        TessPaint::Pattern { index } => Vertex::pattern(pos, pos, index),
+                        TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index, opacity),
+                        TessPaint::Pattern { index } => Vertex::pattern(pos, pos, index, opacity),
                     }
                 }),
             )
@@ -107,6 +183,7 @@ pub fn tessellate_path(
         };
 
         let paint = params.paint;
+        let opacity = params.opacity;
         let mut tessellator = StrokeTessellator::new();
         tessellator
             .tessellate_path(
@@ -118,10 +195,14 @@ pub fn tessellate_path(
                         let pos = [vertex.position().x, vertex.position().y];
                         match paint {
                             TessPaint::Solid(color) => {
-                                Vertex::solid(pos, [color.r, color.g, color.b, color.a])
+                                Vertex::solid(pos, [color.r, color.g, color.b, color.a * opacity])
                             }
-                            TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index),
-                            TessPaint::Pattern { index } => Vertex::pattern(pos, pos, index),
+                            TessPaint::Gradient { index } => {
+                                Vertex::gradient(pos, pos, index, opacity)
+                            }
+                            TessPaint::Pattern { index } => {
+                                Vertex::pattern(pos, pos, index, opacity)
+                            }
                         }
                     },
                 ),

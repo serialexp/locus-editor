@@ -1,16 +1,10 @@
 use vector_geom::{Affine, Bounds, Point, Segment, VertexMode};
 use vector_scene::{NodeData, NodeId, Scene};
 
-/// Compute the world-space bounding box for a node's visual content.
+/// Compute the world-space bounding box for a node's visual content,
+/// including the visible stroke area around the geometry.
 fn node_bounds(data: &NodeData, world: Affine) -> Bounds {
-    match data {
-        NodeData::Path { path, .. } => path.bounding_box().transform(world),
-        NodeData::Text(text) => {
-            vector_text::text_bounds(&text.content, &text.font_family, text.font_size)
-                .transform(world)
-        }
-        _ => Bounds::EMPTY,
-    }
+    data.visual_bounds(world)
 }
 
 /// Which specific point within a segment we're referring to.
@@ -152,11 +146,19 @@ fn enforce_vertex_constraint(vr: &VertexRef, scene: &mut Scene) {
                 _ => return,
             };
 
-            // The opposite handle is ctrl2 of segment[seg-1] (incoming to anchor).
-            if vr.segment == 0 {
-                return; // No previous segment to constrain.
-            }
-            let prev = &mut subpath.segments[vr.segment - 1];
+            // The opposite handle is ctrl2 of the previous segment (incoming to anchor).
+            // For closed paths, segment 0's anchor wraps to the last segment.
+            let prev_idx = if vr.segment > 0 {
+                Some(vr.segment - 1)
+            } else if subpath.closed && !subpath.segments.is_empty() {
+                Some(subpath.segments.len() - 1)
+            } else {
+                None
+            };
+            let Some(prev_idx) = prev_idx else {
+                return;
+            };
+            let prev = &mut subpath.segments[prev_idx];
             match prev {
                 Segment::Cubic { ctrl2, .. } => {
                     mirror_handle(anchor, ctrl1, ctrl2, anchor_mode);
@@ -184,12 +186,20 @@ fn enforce_vertex_constraint(vr: &VertexRef, scene: &mut Scene) {
                 _ => return,
             };
 
-            // The opposite handle is ctrl1 of segment[seg+1] (outgoing from anchor).
+            // The opposite handle is ctrl1 of the next segment (outgoing from anchor).
+            // For closed paths, the last segment's anchor wraps to segment 0.
             let next_idx = vr.segment + 1;
-            if next_idx >= subpath.segments.len() {
-                return; // No next segment to constrain.
-            }
-            let next = &mut subpath.segments[next_idx];
+            let wrap_idx = if next_idx < subpath.segments.len() {
+                Some(next_idx)
+            } else if subpath.closed && !subpath.segments.is_empty() {
+                Some(0)
+            } else {
+                None
+            };
+            let Some(wrap_idx) = wrap_idx else {
+                return;
+            };
+            let next = &mut subpath.segments[wrap_idx];
             match next {
                 Segment::Cubic { ctrl1, .. } => {
                     mirror_handle(anchor, ctrl2, ctrl1, anchor_mode);
@@ -280,6 +290,24 @@ fn ensure_cubic_handles(subpath: &mut vector_geom::SubPath, mode_idx: usize) {
                     to: *to,
                 };
             }
+            Segment::Quad { ctrl, to } => {
+                // Degree-elevate: Quad → Cubic (exact shape preservation).
+                // ctrl1 = from + 2/3*(ctrl - from)
+                // ctrl2 = to   + 2/3*(ctrl - to)
+                let c1 = Point::new(
+                    from.x + 2.0 / 3.0 * (ctrl.x - from.x),
+                    from.y + 2.0 / 3.0 * (ctrl.y - from.y),
+                );
+                let c2 = Point::new(
+                    to.x + 2.0 / 3.0 * (ctrl.x - to.x),
+                    to.y + 2.0 / 3.0 * (ctrl.y - to.y),
+                );
+                *seg = Segment::Cubic {
+                    ctrl1: c1,
+                    ctrl2: c2,
+                    to: *to,
+                };
+            }
             Segment::Cubic { ctrl2, .. } => {
                 let d = ((ctrl2.x - anchor.x).powi(2) + (ctrl2.y - anchor.y).powi(2)).sqrt();
                 if d < 1e-6 {
@@ -296,17 +324,31 @@ fn ensure_cubic_handles(subpath: &mut vector_geom::SubPath, mode_idx: usize) {
     // --- Outgoing segment: our handle is ctrl1 ---
     // ctrl2 belongs to the next vertex → collapse it at `to`.
     if let Some(seg_idx) = outgoing_idx {
+        let from = anchor;
         let seg = &mut subpath.segments[seg_idx];
         match seg {
             Segment::Line { to } => {
-                let dx = to.x - anchor.x;
-                let dy = to.y - anchor.y;
+                let dx = to.x - from.x;
+                let dy = to.y - from.y;
                 *seg = Segment::Cubic {
-                    ctrl1: Point::new(
-                        anchor.x + dx * HANDLE_FRACTION,
-                        anchor.y + dy * HANDLE_FRACTION,
-                    ),
+                    ctrl1: Point::new(from.x + dx * HANDLE_FRACTION, from.y + dy * HANDLE_FRACTION),
                     ctrl2: *to,
+                    to: *to,
+                };
+            }
+            Segment::Quad { ctrl, to } => {
+                // Degree-elevate: Quad → Cubic (exact shape preservation).
+                let c1 = Point::new(
+                    from.x + 2.0 / 3.0 * (ctrl.x - from.x),
+                    from.y + 2.0 / 3.0 * (ctrl.y - from.y),
+                );
+                let c2 = Point::new(
+                    to.x + 2.0 / 3.0 * (ctrl.x - to.x),
+                    to.y + 2.0 / 3.0 * (ctrl.y - to.y),
+                );
+                *seg = Segment::Cubic {
+                    ctrl1: c1,
+                    ctrl2: c2,
                     to: *to,
                 };
             }
@@ -395,6 +437,73 @@ fn translate_endpoint(seg: &mut Segment, dx: f64, dy: f64) {
     }
 }
 
+/// Which scale handle on the bounding box is being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleHandle {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
+
+impl ScaleHandle {
+    /// All eight handles in order.
+    pub const ALL: [Self; 8] = [
+        Self::TopLeft,
+        Self::Top,
+        Self::TopRight,
+        Self::Right,
+        Self::BottomRight,
+        Self::Bottom,
+        Self::BottomLeft,
+        Self::Left,
+    ];
+
+    /// Position of this handle on a bounding box, as (x, y).
+    pub fn position(self, bounds: Bounds) -> Point {
+        let cx = (bounds.min.x + bounds.max.x) * 0.5;
+        let cy = (bounds.min.y + bounds.max.y) * 0.5;
+        match self {
+            Self::TopLeft => bounds.min,
+            Self::Top => Point::new(cx, bounds.min.y),
+            Self::TopRight => Point::new(bounds.max.x, bounds.min.y),
+            Self::Right => Point::new(bounds.max.x, cy),
+            Self::BottomRight => bounds.max,
+            Self::Bottom => Point::new(cx, bounds.max.y),
+            Self::BottomLeft => Point::new(bounds.min.x, bounds.max.y),
+            Self::Left => Point::new(bounds.min.x, cy),
+        }
+    }
+
+    /// The anchor point for scaling — the opposite corner/edge.
+    pub fn anchor(self, bounds: Bounds) -> Point {
+        match self {
+            Self::TopLeft => bounds.max,
+            Self::Top => Point::new((bounds.min.x + bounds.max.x) * 0.5, bounds.max.y),
+            Self::TopRight => Point::new(bounds.min.x, bounds.max.y),
+            Self::Right => Point::new(bounds.min.x, (bounds.min.y + bounds.max.y) * 0.5),
+            Self::BottomRight => bounds.min,
+            Self::Bottom => Point::new((bounds.min.x + bounds.max.x) * 0.5, bounds.min.y),
+            Self::BottomLeft => Point::new(bounds.max.x, bounds.min.y),
+            Self::Left => Point::new(bounds.max.x, (bounds.min.y + bounds.max.y) * 0.5),
+        }
+    }
+
+    /// Whether this handle scales horizontally.
+    pub fn scales_x(self) -> bool {
+        !matches!(self, Self::Top | Self::Bottom)
+    }
+
+    /// Whether this handle scales vertically.
+    pub fn scales_y(self) -> bool {
+        !matches!(self, Self::Left | Self::Right)
+    }
+}
+
 /// What the select tool is currently doing.
 enum DragMode {
     /// Not dragging.
@@ -403,6 +512,29 @@ enum DragMode {
     MoveVertices { prev: [f64; 2] },
     /// Dragging entire objects by translating their transforms.
     MoveObjects { prev: [f64; 2] },
+    /// Rotating selected objects around their combined center.
+    RotateObjects {
+        /// Center of rotation in canvas (world) coordinates.
+        center: [f64; 2],
+        /// The angle (radians) from center to the initial mouse press.
+        /// Kept for future snap-to-angle support (e.g. 15° increments).
+        #[expect(dead_code)]
+        start_angle: f64,
+        /// Accumulated rotation applied so far (for incremental updates).
+        prev_angle: f64,
+    },
+    /// Scaling selected objects by dragging a bounding box handle.
+    ScaleObjects {
+        /// Which handle is being dragged.
+        handle: ScaleHandle,
+        /// The fixed anchor point in world space (opposite the dragged handle).
+        anchor: [f64; 2],
+        /// The original bounding box at drag start.
+        orig_bounds: Bounds,
+        /// Original local transforms for each selected node at drag start,
+        /// so we can recompute the absolute scale each frame.
+        orig_transforms: Vec<(NodeId, Affine)>,
+    },
     /// Drawing a marquee rectangle. Stores the anchor corner in canvas coords
     /// and whether shift was held at the start.
     Marquee {
@@ -466,6 +598,7 @@ impl Default for SelectState {
 const HIT_RADIUS_SCREEN_PX: f64 = 8.0;
 
 /// A hit on a path edge (between vertices), used for inserting new points.
+#[derive(Debug, Clone)]
 pub struct EdgeHit {
     /// Which node.
     pub node: NodeId,
@@ -644,6 +777,88 @@ impl SelectState {
         result
     }
 
+    // ── Rotation zone hit-testing ─────────────────────────────────────
+
+    /// Compute the combined world-space bounding box of all object-selected nodes.
+    pub fn selection_bounds(&self, scene: &Scene) -> Bounds {
+        let mut combined = Bounds::EMPTY;
+        for &id in &self.selected_nodes {
+            if let Some(node) = scene.get(id) {
+                let world = scene.world_transform(id);
+                let b = node.data.visual_bounds(world);
+                if !b.is_empty() {
+                    combined = combined.union(b);
+                }
+            }
+        }
+        combined
+    }
+
+    /// Test whether `canvas_pos` is in the rotation zone: near a corner of
+    /// the selection bounding box but outside the box itself. Returns true if
+    /// the cursor should show a rotation indicator and a press should start
+    /// rotating.
+    ///
+    /// `zone_radius` is in canvas units (typically `HIT_RADIUS_SCREEN_PX * 2 / zoom`).
+    pub fn hit_rotation_zone(&self, scene: &Scene, canvas_pos: [f64; 2], zoom: f64) -> bool {
+        if self.mode != SelectionMode::Object || self.selected_nodes.is_empty() {
+            return false;
+        }
+        let bounds = self.selection_bounds(scene);
+        if bounds.is_empty() {
+            return false;
+        }
+
+        let zone_radius = HIT_RADIUS_SCREEN_PX * 2.0 / zoom;
+        let p = Point::new(canvas_pos[0], canvas_pos[1]);
+
+        // The four corners of the bounding box.
+        let corners = [
+            Point::new(bounds.min.x, bounds.min.y),
+            Point::new(bounds.max.x, bounds.min.y),
+            Point::new(bounds.min.x, bounds.max.y),
+            Point::new(bounds.max.x, bounds.max.y),
+        ];
+
+        // Must be outside the box (with a small tolerance).
+        let tolerance = 1.0 / zoom;
+        let inside = p.x > bounds.min.x + tolerance
+            && p.x < bounds.max.x - tolerance
+            && p.y > bounds.min.y + tolerance
+            && p.y < bounds.max.y - tolerance;
+        if inside {
+            return false;
+        }
+
+        // Must be within zone_radius of at least one corner.
+        corners.iter().any(|c| p.distance(*c) < zone_radius)
+    }
+
+    /// Test whether `canvas_pos` is near one of the 8 scale handles on the
+    /// selection bounding box. Returns the handle if hit.
+    pub fn hit_scale_handle(
+        &self,
+        scene: &Scene,
+        canvas_pos: [f64; 2],
+        zoom: f64,
+    ) -> Option<ScaleHandle> {
+        if self.mode != SelectionMode::Object || self.selected_nodes.is_empty() {
+            return None;
+        }
+        let bounds = self.selection_bounds(scene);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let radius = HIT_RADIUS_SCREEN_PX / zoom;
+        let p = Point::new(canvas_pos[0], canvas_pos[1]);
+
+        ScaleHandle::ALL
+            .iter()
+            .find(|h| p.distance(h.position(bounds)) < radius)
+            .copied()
+    }
+
     // ── Hover ────────────────────────────────────────────────────────
 
     /// Update the hover state for vertices within object-selected nodes.
@@ -698,11 +913,32 @@ impl SelectState {
         self.hovered = None;
     }
 
+    /// Whether `canvas_pos` falls inside the world-space visual bounds of
+    /// any currently object-selected node. Used to decide whether an
+    /// empty-space click in node mode should drop back to object mode.
+    fn click_inside_selection_bounds(&self, scene: &Scene, canvas_pos: [f64; 2]) -> bool {
+        let target = Point::new(canvas_pos[0], canvas_pos[1]);
+        self.selected_nodes.iter().any(|&id| {
+            let Some(node) = scene.get(id) else {
+                return false;
+            };
+            let world = scene.world_transform(id);
+            let bounds = node_bounds(&node.data, world);
+            !bounds.is_empty() && bounds.contains_point(target)
+        })
+    }
+
     /// Cycle the vertex mode of the anchor vertex at `vr` through
     /// Corner → Smooth → Symmetric → Corner.
     /// Only applies to anchor points (SubpathStart or Endpoint).
     /// Returns the new mode, or None if inapplicable.
-    pub fn cycle_vertex_mode(scene: &mut Scene, vr: &VertexRef) -> Option<VertexMode> {
+    /// Set a vertex's mode to a specific value. Returns the new mode if
+    /// successful, or `None` if the vertex reference is invalid.
+    pub fn set_vertex_mode(
+        scene: &mut Scene,
+        vr: &VertexRef,
+        new_mode: VertexMode,
+    ) -> Option<VertexMode> {
         let node = scene.get_mut(vr.node)?;
         let NodeData::Path { ref mut path, .. } = node.data else {
             return None;
@@ -713,19 +949,17 @@ impl SelectState {
         let mode_idx = match vr.kind {
             PointKind::SubpathStart => 0,
             PointKind::Endpoint => vr.segment + 1,
-            // Control points aren't anchors — cycle the anchor they belong to.
+            // Control points aren't anchors — set the anchor they belong to.
             PointKind::CubicCtrl1 | PointKind::QuadCtrl => vr.segment,
             PointKind::CubicCtrl2 => vr.segment + 1,
         };
 
         let mode = subpath.vertex_modes.get_mut(mode_idx)?;
         let old_mode = *mode;
-        *mode = match *mode {
-            VertexMode::Corner => VertexMode::Smooth,
-            VertexMode::Smooth => VertexMode::Symmetric,
-            VertexMode::Symmetric => VertexMode::Corner,
-        };
-        let new_mode = *mode;
+        if old_mode == new_mode {
+            return Some(new_mode);
+        }
+        *mode = new_mode;
 
         // When switching FROM Corner TO Smooth/Symmetric, ensure adjacent
         // segments are cubics with handles spread out from the anchor.
@@ -736,6 +970,29 @@ impl SelectState {
         }
 
         Some(new_mode)
+    }
+
+    /// Cycle a vertex's mode: Corner → Smooth → Symmetric → Corner.
+    pub fn cycle_vertex_mode(scene: &mut Scene, vr: &VertexRef) -> Option<VertexMode> {
+        // Read current mode first.
+        let node = scene.get(vr.node)?;
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
+        let subpath = path.subpaths.get(vr.subpath)?;
+        let mode_idx = match vr.kind {
+            PointKind::SubpathStart => 0,
+            PointKind::Endpoint => vr.segment + 1,
+            PointKind::CubicCtrl1 | PointKind::QuadCtrl => vr.segment,
+            PointKind::CubicCtrl2 => vr.segment + 1,
+        };
+        let current = *subpath.vertex_modes.get(mode_idx)?;
+        let next = match current {
+            VertexMode::Corner => VertexMode::Smooth,
+            VertexMode::Smooth => VertexMode::Symmetric,
+            VertexMode::Symmetric => VertexMode::Corner,
+        };
+        Self::set_vertex_mode(scene, vr, next)
     }
 
     /// Handle a mouse press at `canvas_pos`.
@@ -771,9 +1028,53 @@ impl SelectState {
                 return;
             }
 
-            // Clicked outside vertices — exit node mode, fall through to
-            // object-level handling below.
+            // Clicked in empty space while in node mode. Only drop back to
+            // object mode if the click is outside every selected object's
+            // visual bounds — clicks inside the bounding box stay in node
+            // mode (they just deselect vertices), so accidentally clicking
+            // the interior of a path doesn't kick you out of editing.
+            if self.click_inside_selection_bounds(scene, canvas_pos) {
+                if !shift {
+                    self.selected.clear();
+                }
+                self.drag_mode = DragMode::Idle;
+                return;
+            }
+
             self.exit_node_mode();
+        }
+
+        // Object mode: check scale handles, then rotation zone, then object hit.
+        if let Some(handle) = self.hit_scale_handle(scene, canvas_pos, zoom) {
+            let bounds = self.selection_bounds(scene);
+            let anchor_pt = handle.anchor(bounds);
+            let orig_transforms: Vec<(NodeId, Affine)> = self
+                .selected_nodes
+                .iter()
+                .filter_map(|&id| scene.get(id).map(|n| (id, n.transform)))
+                .collect();
+            self.drag_mode = DragMode::ScaleObjects {
+                handle,
+                anchor: [anchor_pt.x, anchor_pt.y],
+                orig_bounds: bounds,
+                orig_transforms,
+            };
+            return;
+        }
+
+        if self.hit_rotation_zone(scene, canvas_pos, zoom) {
+            let bounds = self.selection_bounds(scene);
+            let center = [
+                (bounds.min.x + bounds.max.x) * 0.5,
+                (bounds.min.y + bounds.max.y) * 0.5,
+            ];
+            let start_angle = (canvas_pos[1] - center[1]).atan2(canvas_pos[0] - center[0]);
+            self.drag_mode = DragMode::RotateObjects {
+                center,
+                start_angle,
+                prev_angle: start_angle,
+            };
+            return;
         }
 
         // Object mode: try object hit.
@@ -881,6 +1182,102 @@ impl SelectState {
                 *prev = canvas_pos;
                 true
             }
+            DragMode::RotateObjects {
+                center, prev_angle, ..
+            } => {
+                let current_angle = (canvas_pos[1] - center[1]).atan2(canvas_pos[0] - center[0]);
+                let delta = current_angle - *prev_angle;
+
+                if delta.abs() < 1e-10 {
+                    return false;
+                }
+
+                let center_pt = Point::new(center[0], center[1]);
+
+                // Apply incremental rotation around the combined center.
+                for &node_id in &self.selected_nodes {
+                    // Get the node's world-space position and compute where
+                    // it should move after rotating around center_pt.
+                    let parent_world = scene.parent_world_transform(node_id);
+                    let Some(node) = scene.get_mut(node_id) else {
+                        continue;
+                    };
+
+                    // The node's world position comes from parent_world * node.transform.
+                    // We want to apply a rotation delta around center_pt in world space.
+                    // New world transform = rotate_around(delta, center) * old_world.
+                    // So: parent * new_local = rotate_around * parent * old_local
+                    //     new_local = parent^-1 * rotate_around * parent * old_local
+                    let rot = Affine::rotate_around(delta, center_pt);
+                    let old_local = node.transform;
+                    let world = parent_world.then(old_local);
+                    let new_world = rot.then(world);
+                    if let Some(inv_parent) = parent_world.inverse() {
+                        node.transform = inv_parent.then(new_world);
+                    }
+                }
+
+                *prev_angle = current_angle;
+                true
+            }
+            DragMode::ScaleObjects {
+                handle,
+                anchor,
+                orig_bounds,
+                orig_transforms,
+            } => {
+                let handle = *handle;
+                let anchor_pt = Point::new(anchor[0], anchor[1]);
+                let orig = *orig_bounds;
+
+                // Scale factor = distance from anchor to mouse / distance
+                // from anchor to original handle position.
+                let orig_handle = handle.position(orig);
+                let sx = if handle.scales_x() && (orig_handle.x - anchor_pt.x).abs() > 1e-10 {
+                    (canvas_pos[0] - anchor_pt.x) / (orig_handle.x - anchor_pt.x)
+                } else {
+                    1.0
+                };
+
+                let sy = if handle.scales_y() && (orig_handle.y - anchor_pt.y).abs() > 1e-10 {
+                    (canvas_pos[1] - anchor_pt.y) / (orig_handle.y - anchor_pt.y)
+                } else {
+                    1.0
+                };
+
+                // Clamp scale to avoid collapsing to zero.
+                let sx = if sx.abs() < 0.01 {
+                    0.01_f64.copysign(sx)
+                } else {
+                    sx
+                };
+                let sy = if sy.abs() < 0.01 {
+                    0.01_f64.copysign(sy)
+                } else {
+                    sy
+                };
+
+                // Build a world-space transform: translate anchor to origin,
+                // scale, translate back.
+                let scale_world = Affine::translate(anchor_pt.x, anchor_pt.y)
+                    .then(Affine::scale(sx, sy))
+                    .then(Affine::translate(-anchor_pt.x, -anchor_pt.y));
+
+                // Reapply from the original transforms each frame (absolute,
+                // not incremental) so the total scale is always correct.
+                for &(node_id, orig_local) in orig_transforms.iter() {
+                    let parent_world = scene.parent_world_transform(node_id);
+                    let orig_world = parent_world.then(orig_local);
+                    let new_world = scale_world.then(orig_world);
+                    if let Some(inv_parent) = parent_world.inverse()
+                        && let Some(node) = scene.get_mut(node_id)
+                    {
+                        node.transform = inv_parent.then(new_world);
+                    }
+                }
+
+                true
+            }
             DragMode::Marquee {
                 anchor, current, ..
             } => {
@@ -923,6 +1320,16 @@ impl SelectState {
     /// Whether we're currently dragging whole objects.
     pub fn is_dragging_objects(&self) -> bool {
         matches!(self.drag_mode, DragMode::MoveObjects { .. })
+    }
+
+    /// Whether we're currently rotating objects.
+    pub fn is_rotating(&self) -> bool {
+        matches!(self.drag_mode, DragMode::RotateObjects { .. })
+    }
+
+    /// Whether we're currently scaling objects via a handle.
+    pub fn is_scaling(&self) -> bool {
+        matches!(self.drag_mode, DragMode::ScaleObjects { .. })
     }
 
     /// Whether we're currently in any drag operation.
@@ -1136,6 +1543,28 @@ impl SelectState {
                     }
                     current = seg.endpoint();
                 }
+
+                // Closed paths have an implicit straight closing edge from
+                // the last segment's endpoint back to `subpath.start`. It
+                // isn't stored in `segments`, so we have to test it
+                // separately. We encode a hit on it as
+                // `segment: subpath.segments.len()` (one past the last
+                // real segment), which `insert_point_on_edge` recognizes.
+                if subpath.closed && !subpath.segments.is_empty() && current != subpath.start {
+                    let closing = Segment::Line { to: subpath.start };
+                    let (t, _pt, dist) = closing.closest_point(current, target);
+                    if dist < radius && best.as_ref().is_none_or(|(_, bd)| dist < *bd) {
+                        best = Some((
+                            EdgeHit {
+                                node: node_id,
+                                subpath: sp_idx,
+                                segment: subpath.segments.len(),
+                                t,
+                            },
+                            dist,
+                        ));
+                    }
+                }
             }
         }
 
@@ -1190,6 +1619,22 @@ impl SelectState {
                     }
                     current = seg.endpoint();
                 }
+
+                // Implicit closing edge for closed paths (see `edge_hit_test`
+                // for the rationale).
+                if subpath.closed && !subpath.segments.is_empty() && current != subpath.start {
+                    let closing = Segment::Line { to: subpath.start };
+                    let (t, _pt, dist) = closing.closest_point(current, target);
+                    if dist < radius && best.as_ref().is_none_or(|(_, bd)| dist < *bd) {
+                        let local_pt = closing.eval_at(current, t);
+                        let world_pt = if world.is_identity() {
+                            local_pt
+                        } else {
+                            world.apply(local_pt)
+                        };
+                        best = Some((world_pt, dist));
+                    }
+                }
             }
         }
 
@@ -1198,6 +1643,12 @@ impl SelectState {
 
     /// Insert a new anchor point on the edge described by `hit`, splitting
     /// the segment in two. Returns a `VertexRef` to the newly created point.
+    ///
+    /// Special case: a `hit.segment == subpath.segments.len()` indicates a
+    /// hit on the implicit closing edge of a closed subpath (the line from
+    /// the last segment's endpoint back to `subpath.start`). We materialize
+    /// it as a new explicit `Line` segment appended to the subpath; the new
+    /// closing line then runs from the inserted vertex back to start.
     pub fn insert_point_on_edge(scene: &mut Scene, hit: &EdgeHit) -> Option<VertexRef> {
         let node = scene.get_mut(hit.node)?;
         let NodeData::Path { ref mut path, .. } = node.data else {
@@ -1205,6 +1656,28 @@ impl SelectState {
         };
         let subpath = path.subpaths.get_mut(hit.subpath)?;
         let seg_idx = hit.segment;
+
+        // Closing-edge case: hit is on the virtual line from the last
+        // endpoint back to subpath.start. Append a Line segment ending at
+        // the split point so the implicit closing line still terminates at
+        // subpath.start, just from the new vertex.
+        if seg_idx == subpath.segments.len() {
+            if !subpath.closed || subpath.segments.is_empty() {
+                return None;
+            }
+            let from = subpath.segments[seg_idx - 1].endpoint();
+            let closing = Segment::Line { to: subpath.start };
+            let (first, _second) = closing.split_at(from, hit.t);
+            subpath.segments.push(first);
+            subpath.vertex_modes.insert(seg_idx + 1, VertexMode::Corner);
+            return Some(VertexRef {
+                node: hit.node,
+                subpath: hit.subpath,
+                segment: seg_idx,
+                kind: PointKind::Endpoint,
+            });
+        }
+
         if seg_idx >= subpath.segments.len() {
             return None;
         }
@@ -1233,6 +1706,161 @@ impl SelectState {
             kind: PointKind::Endpoint,
         })
     }
+
+    /// Convert a segment to a Line (straight between its endpoints).
+    /// Returns true if the segment was changed.
+    pub fn convert_segment_to_line(scene: &mut Scene, hit: &EdgeHit) -> bool {
+        let Some(node) = scene.get_mut(hit.node) else {
+            return false;
+        };
+        let NodeData::Path { ref mut path, .. } = node.data else {
+            return false;
+        };
+        let Some(subpath) = path.subpaths.get_mut(hit.subpath) else {
+            return false;
+        };
+        let Some(seg) = subpath.segments.get_mut(hit.segment) else {
+            return false;
+        };
+        if matches!(seg, Segment::Line { .. }) {
+            return false; // already a line
+        }
+        let to = seg.endpoint();
+        *seg = Segment::Line { to };
+        true
+    }
+
+    /// Convert a segment to a Quad. For Cubics, the control point is the
+    /// average of ctrl1 and ctrl2. For Lines, the control point is the
+    /// midpoint of the segment. Returns true if the segment was changed.
+    pub fn convert_segment_to_quad(scene: &mut Scene, hit: &EdgeHit) -> bool {
+        let Some(node) = scene.get_mut(hit.node) else {
+            return false;
+        };
+        let NodeData::Path { ref mut path, .. } = node.data else {
+            return false;
+        };
+        let Some(subpath) = path.subpaths.get_mut(hit.subpath) else {
+            return false;
+        };
+        // Determine the "from" point for this segment.
+        let from = if hit.segment == 0 {
+            subpath.start
+        } else {
+            subpath.segments[hit.segment - 1].endpoint()
+        };
+        let Some(seg) = subpath.segments.get_mut(hit.segment) else {
+            return false;
+        };
+        if matches!(seg, Segment::Quad { .. }) {
+            return false; // already a quad
+        }
+        match seg {
+            Segment::Line { to } => {
+                let mid = Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+                *seg = Segment::Quad { ctrl: mid, to: *to };
+            }
+            Segment::Cubic { ctrl1, ctrl2, to } => {
+                let ctrl = Point::new((ctrl1.x + ctrl2.x) * 0.5, (ctrl1.y + ctrl2.y) * 0.5);
+                *seg = Segment::Quad { ctrl, to: *to };
+            }
+            Segment::Arc { to, .. } => {
+                let mid = Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+                *seg = Segment::Quad { ctrl: mid, to: *to };
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Convert a segment to a Cubic. Quads are degree-elevated (exact shape
+    /// preservation). Lines get handles at 1/3 of the segment length.
+    /// Returns true if the segment was changed.
+    pub fn convert_segment_to_cubic(scene: &mut Scene, hit: &EdgeHit) -> bool {
+        let Some(node) = scene.get_mut(hit.node) else {
+            return false;
+        };
+        let NodeData::Path { ref mut path, .. } = node.data else {
+            return false;
+        };
+        let Some(subpath) = path.subpaths.get_mut(hit.subpath) else {
+            return false;
+        };
+        let from = if hit.segment == 0 {
+            subpath.start
+        } else {
+            subpath.segments[hit.segment - 1].endpoint()
+        };
+        let Some(seg) = subpath.segments.get_mut(hit.segment) else {
+            return false;
+        };
+        if matches!(seg, Segment::Cubic { .. }) {
+            return false; // already a cubic
+        }
+        match seg {
+            Segment::Line { to } => {
+                let dx = to.x - from.x;
+                let dy = to.y - from.y;
+                *seg = Segment::Cubic {
+                    ctrl1: Point::new(from.x + dx / 3.0, from.y + dy / 3.0),
+                    ctrl2: Point::new(from.x + 2.0 * dx / 3.0, from.y + 2.0 * dy / 3.0),
+                    to: *to,
+                };
+            }
+            Segment::Quad { ctrl, to } => {
+                // Degree elevation: exact shape preservation.
+                let c1 = Point::new(
+                    from.x + 2.0 / 3.0 * (ctrl.x - from.x),
+                    from.y + 2.0 / 3.0 * (ctrl.y - from.y),
+                );
+                let c2 = Point::new(
+                    to.x + 2.0 / 3.0 * (ctrl.x - to.x),
+                    to.y + 2.0 / 3.0 * (ctrl.y - to.y),
+                );
+                *seg = Segment::Cubic {
+                    ctrl1: c1,
+                    ctrl2: c2,
+                    to: *to,
+                };
+            }
+            Segment::Arc { to, .. } => {
+                let dx = to.x - from.x;
+                let dy = to.y - from.y;
+                *seg = Segment::Cubic {
+                    ctrl1: Point::new(from.x + dx / 3.0, from.y + dy / 3.0),
+                    ctrl2: Point::new(from.x + 2.0 * dx / 3.0, from.y + 2.0 * dy / 3.0),
+                    to: *to,
+                };
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Return the current type of a segment identified by an `EdgeHit`.
+    pub fn segment_type(scene: &Scene, hit: &EdgeHit) -> Option<SegmentKind> {
+        let node = scene.get(hit.node)?;
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
+        let subpath = path.subpaths.get(hit.subpath)?;
+        let seg = subpath.segments.get(hit.segment)?;
+        Some(match seg {
+            Segment::Line { .. } => SegmentKind::Line,
+            Segment::Quad { .. } => SegmentKind::Quad,
+            Segment::Cubic { .. } => SegmentKind::Cubic,
+            Segment::Arc { .. } => SegmentKind::Arc,
+        })
+    }
+}
+
+/// Identifies the type of a segment without carrying its data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentKind {
+    Line,
+    Quad,
+    Cubic,
+    Arc,
 }
 
 /// Normalize two corners into (min, max).
@@ -1241,4 +1869,152 @@ fn marquee_rect(a: [f64; 2], b: [f64; 2]) -> ([f64; 2], [f64; 2]) {
         [a[0].min(b[0]), a[1].min(b[1])],
         [a[0].max(b[0]), a[1].max(b[1])],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vector_geom::{Path, SubPath};
+    use vector_scene::Node;
+
+    /// Build a 10x10 closed square path:
+    ///   start (0,0) → (10,0) → (10,10) → (0,10) → [implicit close back to (0,0)]
+    fn closed_square_node(scene: &mut Scene) -> NodeId {
+        let mut sp = SubPath::new(Point::new(0.0, 0.0));
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(10.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(10.0, 10.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(0.0, 10.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.closed = true;
+        let mut path = Path::new();
+        path.subpaths.push(sp);
+        let root = scene.root();
+        scene.insert(root, Node::path("square", path)).unwrap()
+    }
+
+    #[test]
+    fn edge_hit_test_finds_closing_edge_of_closed_path() {
+        let mut scene = Scene::new();
+        let id = closed_square_node(&mut scene);
+
+        // The closing edge runs from (0,10) → (0,0). A click near (0, 5)
+        // should land on it. Use a high zoom so the screen-pixel hit
+        // radius shrinks to ~2 world units — comfortably catching the
+        // closing edge but missing every other side of the square.
+        let hit = SelectState::edge_hit_test(&scene, [0.5, 5.0], 4.0, &[id])
+            .expect("should hit the closing edge");
+
+        assert_eq!(hit.subpath, 0);
+        // The closing edge is encoded as one past the last real segment.
+        assert_eq!(hit.segment, 3);
+        assert!((hit.t - 0.5).abs() < 1e-9, "hit.t {} should be ~0.5", hit.t);
+    }
+
+    #[test]
+    fn edge_hit_test_skips_closing_edge_on_open_path() {
+        let mut scene = Scene::new();
+        let mut sp = SubPath::new(Point::new(0.0, 0.0));
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(10.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(10.0, 10.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(0.0, 10.0),
+            },
+            VertexMode::Corner,
+        );
+        // Note: NOT closed.
+        let mut path = Path::new();
+        path.subpaths.push(sp);
+        let root = scene.root();
+        let id = scene.insert(root, Node::path("open", path)).unwrap();
+
+        // Same click location and zoom as the closed-path test — should
+        // miss because there's no implicit closing edge to hit.
+        let hit = SelectState::edge_hit_test(&scene, [0.5, 5.0], 4.0, &[id]);
+        assert!(hit.is_none(), "open path shouldn't have a closing edge");
+    }
+
+    #[test]
+    fn insert_point_on_closing_edge_appends_segment() {
+        let mut scene = Scene::new();
+        let id = closed_square_node(&mut scene);
+
+        let hit = EdgeHit {
+            node: id,
+            subpath: 0,
+            segment: 3, // closing edge
+            t: 0.5,
+        };
+
+        let vr = SelectState::insert_point_on_edge(&mut scene, &hit)
+            .expect("insert on closing edge should succeed");
+
+        assert_eq!(vr.segment, 3);
+        assert_eq!(vr.kind, PointKind::Endpoint);
+
+        // Verify the subpath now has 4 segments and the new endpoint is at (0, 5).
+        let node = scene.get(id).unwrap();
+        let NodeData::Path { ref path, .. } = node.data else {
+            panic!("expected path");
+        };
+        let sp = &path.subpaths[0];
+        assert_eq!(sp.segments.len(), 4);
+        assert_eq!(sp.vertex_modes.len(), 5);
+        assert!(sp.closed);
+        assert_eq!(sp.segments[3].endpoint(), Point::new(0.0, 5.0));
+        // The implicit closing line still terminates at subpath.start.
+        assert_eq!(sp.start, Point::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn insert_point_on_closing_edge_of_open_path_returns_none() {
+        let mut scene = Scene::new();
+        let mut sp = SubPath::new(Point::new(0.0, 0.0));
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(10.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+        let mut path = Path::new();
+        path.subpaths.push(sp);
+        let root = scene.root();
+        let id = scene.insert(root, Node::path("open", path)).unwrap();
+
+        let hit = EdgeHit {
+            node: id,
+            subpath: 0,
+            segment: 1, // would be the closing edge if the path were closed
+            t: 0.5,
+        };
+
+        assert!(
+            SelectState::insert_point_on_edge(&mut scene, &hit).is_none(),
+            "open path has no closing edge to insert into"
+        );
+    }
 }

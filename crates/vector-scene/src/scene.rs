@@ -184,6 +184,20 @@ impl Scene {
 }
 
 impl Scene {
+    /// Returns true if `ancestor` is an ancestor of `descendant`
+    /// (i.e. `descendant` is somewhere in the subtree of `ancestor`).
+    /// A node is NOT considered its own ancestor.
+    pub fn is_ancestor(&self, ancestor: NodeId, descendant: NodeId) -> bool {
+        let mut current = descendant;
+        while let Some(parent) = self.parents.get(current).copied() {
+            if parent == ancestor {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
     /// Compute the accumulated world transform for a node by walking up
     /// the parent chain. Returns `Affine::IDENTITY` for the root.
     pub fn world_transform(&self, id: NodeId) -> vector_geom::Affine {
@@ -219,7 +233,8 @@ impl Scene {
     }
 
     /// Compute the bounding box of all visible content (paths and text),
-    /// skipping defs, taking group transforms into account.
+    /// skipping defs, taking group transforms into account. Includes the
+    /// visible stroke area around each shape.
     pub fn content_bounds(&self) -> vector_geom::Bounds {
         let mut bounds = vector_geom::Bounds::EMPTY;
         self.walk_depth_first(
@@ -229,16 +244,7 @@ impl Scene {
                 if !node.visible {
                     return;
                 }
-                let node_bounds = match node.data {
-                    crate::node::NodeData::Path { ref path, .. } => {
-                        path.bounding_box().transform(world)
-                    }
-                    crate::node::NodeData::Text(ref text) => {
-                        vector_text::text_bounds(&text.content, &text.font_family, text.font_size)
-                            .transform(world)
-                    }
-                    _ => return,
-                };
+                let node_bounds = node.data.visual_bounds(world);
                 if !node_bounds.is_empty() {
                     bounds = bounds.union(node_bounds);
                 }

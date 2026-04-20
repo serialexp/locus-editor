@@ -13,7 +13,9 @@ pub fn export_svg(scene: &Scene) -> String {
     let (vx, vy, vw, vh) = if bounds.is_empty() {
         (0.0, 0.0, 800.0, 600.0)
     } else {
-        // Add 1px margin to avoid clipping strokes at the edge.
+        // content_bounds() already includes stroke visual expansion;
+        // add a small extra margin as a safety buffer for anti-aliasing
+        // and acute-angle miter joins (which can exceed width/2).
         let margin = 1.0;
         (
             bounds.min.x - margin,

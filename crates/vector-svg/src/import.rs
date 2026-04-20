@@ -150,7 +150,179 @@ fn convert_path(data: &usvg::tiny_skia_path::Path) -> Path {
         path.subpaths.push(sp);
     }
 
+    // Post-process: detect smooth/symmetric junctions from control point geometry.
+    for sp in &mut path.subpaths {
+        detect_smooth_junctions(sp);
+    }
+
     path
+}
+
+/// Tolerance for the cross product test: handles are considered collinear
+/// when |cross| < COLLINEAR_EPS * (|a| * |b|).  This is the sine of the
+/// angle between them — 1e-3 is ≈ 0.06°.
+const COLLINEAR_EPS: f64 = 1e-3;
+
+/// Tolerance for comparing handle lengths for symmetry detection.
+/// Two handles are "equidistant" when their lengths differ by less than
+/// this fraction of the longer one.
+const SYMMETRIC_EPS: f64 = 1e-3;
+
+/// Examine each anchor vertex in a subpath and upgrade its `VertexMode`
+/// from `Corner` to `Smooth` or `Symmetric` when the incoming and outgoing
+/// control-point handles are collinear through the anchor.
+///
+/// For cubic segments this checks `ctrl2` (incoming) and `ctrl1` (outgoing).
+/// Quad segments use their single `ctrl` as both the incoming and outgoing
+/// handle on their respective sides of the junction.
+///
+/// On a closed subpath, the start↔last junction is also checked.
+fn detect_smooth_junctions(sp: &mut SubPath) {
+    let n = sp.segments.len();
+    if n == 0 {
+        return;
+    }
+
+    // Number of anchor vertices: n+1 (start + each segment endpoint).
+    // vertex_modes[0] = start, vertex_modes[i+1] = endpoint of segment i.
+    //
+    // For each anchor we need the incoming handle vector (from the previous
+    // segment) and the outgoing handle vector (from the next segment).
+
+    // Check interior junctions: vertex_modes[1] through vertex_modes[n-1].
+    // These are endpoints of segment[i-1] and start points of segment[i].
+    for i in 1..n {
+        let anchor = sp.segments[i - 1].endpoint();
+        let incoming = incoming_handle_vec(&sp.segments[i - 1], anchor);
+        let outgoing = outgoing_handle_vec(&sp.segments[i], anchor);
+        if let Some(mode) = classify_junction(incoming, outgoing) {
+            sp.vertex_modes[i] = mode;
+        }
+    }
+
+    // For closed paths, also check the start↔last junction (vertex_modes[0])
+    // and the last-endpoint↔start junction (vertex_modes[n]).
+    if sp.closed && n > 0 {
+        // vertex_modes[0]: anchor = start, incoming = last segment, outgoing = first segment.
+        let anchor = sp.start;
+        let incoming = incoming_handle_vec(&sp.segments[n - 1], anchor);
+        let outgoing = outgoing_handle_vec(&sp.segments[0], anchor);
+        if let Some(mode) = classify_junction(incoming, outgoing) {
+            sp.vertex_modes[0] = mode;
+        }
+
+        // vertex_modes[n]: anchor = last segment endpoint.
+        // This is the same geometric point as start on a closed path,
+        // but it's a separate vertex-mode entry.
+        // incoming = last segment, outgoing = first segment (same pair).
+        // So vertex_modes[n] gets the same classification as vertex_modes[0].
+        let anchor_last = sp.segments[n - 1].endpoint();
+        let incoming_last = incoming_handle_vec(&sp.segments[n - 1], anchor_last);
+        let outgoing_last = outgoing_handle_vec(&sp.segments[0], anchor_last);
+        if let Some(mode) = classify_junction(incoming_last, outgoing_last) {
+            sp.vertex_modes[n] = mode;
+        }
+    }
+}
+
+/// Compute the incoming handle vector for a segment, pointing from the
+/// segment's endpoint (the anchor) towards the last control point.
+/// Returns `None` if the segment has no handle (Line, Arc).
+fn incoming_handle_vec(seg: &Segment, anchor: Point) -> Option<[f64; 2]> {
+    match seg {
+        Segment::Cubic { ctrl2, .. } => {
+            let dx = ctrl2.x - anchor.x;
+            let dy = ctrl2.y - anchor.y;
+            // Degenerate handle (sitting on anchor) — treat as no handle.
+            if dx.abs() < 1e-12 && dy.abs() < 1e-12 {
+                None
+            } else {
+                Some([dx, dy])
+            }
+        }
+        Segment::Quad { ctrl, .. } => {
+            let dx = ctrl.x - anchor.x;
+            let dy = ctrl.y - anchor.y;
+            if dx.abs() < 1e-12 && dy.abs() < 1e-12 {
+                None
+            } else {
+                Some([dx, dy])
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Compute the outgoing handle vector for a segment, pointing from the
+/// segment's start point (the anchor) towards the first control point.
+/// Returns `None` if the segment has no handle (Line, Arc).
+fn outgoing_handle_vec(seg: &Segment, anchor: Point) -> Option<[f64; 2]> {
+    match seg {
+        Segment::Cubic { ctrl1, .. } => {
+            let dx = ctrl1.x - anchor.x;
+            let dy = ctrl1.y - anchor.y;
+            if dx.abs() < 1e-12 && dy.abs() < 1e-12 {
+                None
+            } else {
+                Some([dx, dy])
+            }
+        }
+        Segment::Quad { ctrl, .. } => {
+            let dx = ctrl.x - anchor.x;
+            let dy = ctrl.y - anchor.y;
+            if dx.abs() < 1e-12 && dy.abs() < 1e-12 {
+                None
+            } else {
+                Some([dx, dy])
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Given two handle vectors (incoming and outgoing, both relative to the
+/// anchor), determine whether they form a smooth or symmetric junction.
+///
+/// - **Collinear + equidistant** → `Symmetric`
+/// - **Collinear only** → `Smooth`
+/// - Otherwise → `None` (stays `Corner`)
+fn classify_junction(incoming: Option<[f64; 2]>, outgoing: Option<[f64; 2]>) -> Option<VertexMode> {
+    let (inc, out) = match (incoming, outgoing) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return None,
+    };
+
+    let len_inc = (inc[0] * inc[0] + inc[1] * inc[1]).sqrt();
+    let len_out = (out[0] * out[0] + out[1] * out[1]).sqrt();
+
+    // Cross product — zero when collinear.
+    let cross = inc[0] * out[1] - inc[1] * out[0];
+
+    // Normalize cross product by the product of lengths to get sine of angle.
+    let denom = len_inc * len_out;
+    if denom < 1e-12 {
+        return None;
+    }
+    let sin_angle = (cross / denom).abs();
+    if sin_angle > COLLINEAR_EPS {
+        return None; // Not collinear.
+    }
+
+    // Collinear — but they must point in opposite directions (dot < 0).
+    // If they point in the same direction, it's not a smooth junction (the
+    // curve doubles back on itself).
+    let dot = inc[0] * out[0] + inc[1] * out[1];
+    if dot >= 0.0 {
+        return None;
+    }
+
+    // Check equidistance for symmetric classification.
+    let max_len = len_inc.max(len_out);
+    if (len_inc - len_out).abs() / max_len < SYMMETRIC_EPS {
+        Some(VertexMode::Symmetric)
+    } else {
+        Some(VertexMode::Smooth)
+    }
 }
 
 fn convert_style(
@@ -764,5 +936,247 @@ mod tests {
         assert_eq!(text.font_size, 24.0);
         // Fill should be red (or close to it).
         assert!(text.style.fill.is_some(), "text should have a fill");
+    }
+
+    // ── Smooth junction detection tests ─────────────────────────────
+
+    #[test]
+    fn classify_junction_symmetric() {
+        // Two handles pointing in opposite directions, same length.
+        let inc = Some([-3.0, 0.0]);
+        let out = Some([3.0, 0.0]);
+        assert_eq!(classify_junction(inc, out), Some(VertexMode::Symmetric));
+    }
+
+    #[test]
+    fn classify_junction_smooth() {
+        // Collinear but different lengths.
+        let inc = Some([-2.0, 0.0]);
+        let out = Some([5.0, 0.0]);
+        assert_eq!(classify_junction(inc, out), Some(VertexMode::Smooth));
+    }
+
+    #[test]
+    fn classify_junction_corner() {
+        // 90° angle — definitely a corner.
+        let inc = Some([0.0, -3.0]);
+        let out = Some([3.0, 0.0]);
+        assert_eq!(classify_junction(inc, out), None);
+    }
+
+    #[test]
+    fn classify_junction_same_direction() {
+        // Both handles point the same way — not smooth (cusp / loop).
+        let inc = Some([3.0, 0.0]);
+        let out = Some([3.0, 0.0]);
+        assert_eq!(classify_junction(inc, out), None);
+    }
+
+    #[test]
+    fn classify_junction_missing_handle() {
+        // One side is a line — no handle to compare.
+        assert_eq!(classify_junction(None, Some([3.0, 0.0])), None);
+        assert_eq!(classify_junction(Some([3.0, 0.0]), None), None);
+        assert_eq!(classify_junction(None, None), None);
+    }
+
+    #[test]
+    fn classify_junction_diagonal_symmetric() {
+        // Handles at 45° in opposite directions, same length.
+        let inc = Some([-1.0, -1.0]);
+        let out = Some([1.0, 1.0]);
+        assert_eq!(classify_junction(inc, out), Some(VertexMode::Symmetric));
+    }
+
+    #[test]
+    fn detect_smooth_on_subpath() {
+        // Three cubics forming a smooth S-curve.
+        // Anchor at (10,0) has symmetric handles, anchor at (20,0) has smooth handles.
+        let mut sp = SubPath::new(Point::new(0.0, 0.0));
+
+        // Segment 0: cubic from (0,0) to (10,0) with ctrl2 at (8,2)
+        sp.push_segment(
+            Segment::Cubic {
+                ctrl1: Point::new(2.0, -2.0),
+                ctrl2: Point::new(8.0, 2.0),
+                to: Point::new(10.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+
+        // Segment 1: cubic from (10,0) to (20,0)
+        // ctrl1 at (12,-2) → symmetric with ctrl2 of segment 0 (both length ≈ 2.83)
+        sp.push_segment(
+            Segment::Cubic {
+                ctrl1: Point::new(12.0, -2.0),
+                ctrl2: Point::new(17.0, 3.0),
+                to: Point::new(20.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+
+        // Segment 2: cubic from (20,0) to (30,0)
+        // ctrl1 at (22,-2) — different length from ctrl2=(17,3),
+        // but let's make them collinear: ctrl2 direction from (20,0) is (-3,3),
+        // so outgoing should be in direction (1,-1). Use (22,-2) which is (2,-2).
+        // Direction of incoming: (17,3)-(20,0) = (-3,3) → normalized (-1,1)
+        // Direction of outgoing: (22,-2)-(20,0) = (2,-2) → normalized (1,-1)
+        // These are opposite directions: dot = -1-1 = -2 < 0 ✓
+        // Cross = (-1)(-1) - (1)(1) = 1-1 = 0 ✓ collinear!
+        // But lengths differ: |(-3,3)| ≈ 4.24, |(2,-2)| ≈ 2.83 → Smooth
+        sp.push_segment(
+            Segment::Cubic {
+                ctrl1: Point::new(22.0, -2.0),
+                ctrl2: Point::new(28.0, 0.0),
+                to: Point::new(30.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+
+        detect_smooth_junctions(&mut sp);
+
+        // vertex_modes: [start, seg0_end, seg1_end, seg2_end]
+        assert_eq!(
+            sp.vertex_modes[0],
+            VertexMode::Corner,
+            "start has no incoming"
+        );
+        assert_eq!(
+            sp.vertex_modes[1],
+            VertexMode::Symmetric,
+            "junction at (10,0) should be symmetric"
+        );
+        assert_eq!(
+            sp.vertex_modes[2],
+            VertexMode::Smooth,
+            "junction at (20,0) should be smooth"
+        );
+        assert_eq!(
+            sp.vertex_modes[3],
+            VertexMode::Corner,
+            "end has no outgoing"
+        );
+    }
+
+    #[test]
+    fn detect_smooth_closed_path() {
+        // A closed path (like a circle approximation) where all junctions
+        // are symmetric.
+        let mut sp = SubPath::new(Point::new(50.0, 0.0));
+        let k = 27.614; // ~= 4/3 * (sqrt(2) - 1) * 50 for quarter-circle approx
+
+        sp.push_segment(
+            Segment::Cubic {
+                ctrl1: Point::new(50.0, k),
+                ctrl2: Point::new(k, 50.0),
+                to: Point::new(0.0, 50.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Cubic {
+                ctrl1: Point::new(-k, 50.0),
+                ctrl2: Point::new(-50.0, k),
+                to: Point::new(-50.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Cubic {
+                ctrl1: Point::new(-50.0, -k),
+                ctrl2: Point::new(-k, -50.0),
+                to: Point::new(0.0, -50.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Cubic {
+                ctrl1: Point::new(k, -50.0),
+                ctrl2: Point::new(50.0, -k),
+                to: Point::new(50.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.closed = true;
+
+        detect_smooth_junctions(&mut sp);
+
+        // All 4 interior junctions should be symmetric.
+        for i in 1..=3 {
+            assert_eq!(
+                sp.vertex_modes[i],
+                VertexMode::Symmetric,
+                "interior junction {i} should be symmetric"
+            );
+        }
+        // Start vertex wraps — also symmetric.
+        assert_eq!(
+            sp.vertex_modes[0],
+            VertexMode::Symmetric,
+            "start junction on closed circle should be symmetric"
+        );
+    }
+
+    #[test]
+    fn detect_smooth_lines_stay_corner() {
+        // A path made of straight lines — all junctions stay Corner.
+        let mut sp = SubPath::new(Point::new(0.0, 0.0));
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(10.0, 0.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.push_segment(
+            Segment::Line {
+                to: Point::new(10.0, 10.0),
+            },
+            VertexMode::Corner,
+        );
+        sp.closed = true;
+
+        detect_smooth_junctions(&mut sp);
+
+        for (i, mode) in sp.vertex_modes.iter().enumerate() {
+            assert_eq!(*mode, VertexMode::Corner, "vertex {i} should stay Corner");
+        }
+    }
+
+    #[test]
+    fn import_circle_detects_symmetric() {
+        // Import an SVG circle — usvg converts it to 4 cubics.
+        // All junctions should be detected as Symmetric.
+        let svg = r#"
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+                <circle cx="100" cy="100" r="50"/>
+            </svg>
+        "#;
+        let scene = import_svg(svg.as_bytes()).unwrap();
+
+        let root = scene.root();
+        let root_node = scene.get(root).unwrap();
+        let path_node = root_node.children.iter().find_map(|&id| {
+            let node = scene.get(id)?;
+            if let NodeData::Path { path, .. } = &node.data {
+                Some(path.clone())
+            } else {
+                None
+            }
+        });
+
+        let path = path_node.expect("should have a path node");
+        assert!(!path.subpaths.is_empty(), "path should have subpaths");
+        let sp = &path.subpaths[0];
+        assert!(sp.closed, "circle should be a closed path");
+
+        // All vertex modes (except possibly the last which duplicates the
+        // start on a closed path) should be Symmetric.
+        for (i, mode) in sp.vertex_modes.iter().enumerate() {
+            assert_eq!(
+                *mode,
+                VertexMode::Symmetric,
+                "vertex {i} of imported circle should be Symmetric, got {mode:?}"
+            );
+        }
     }
 }

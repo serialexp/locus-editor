@@ -48,6 +48,31 @@ pub struct StrokeStyle {
     pub dash: Option<DashPattern>,
 }
 
+impl StrokeStyle {
+    /// Convert to tessellator-level stroke params (geometry only, no paint).
+    /// Used for exact tessellation-based visual bounds.
+    pub fn bounds_params(&self) -> vector_tess::StrokeBoundsParams {
+        vector_tess::StrokeBoundsParams {
+            width: self.width,
+            cap: match self.cap {
+                LineCap::Butt => vector_tess::LineCap::Butt,
+                LineCap::Round => vector_tess::LineCap::Round,
+                LineCap::Square => vector_tess::LineCap::Square,
+            },
+            join: match self.join {
+                LineJoin::Miter => vector_tess::LineJoin::Miter,
+                LineJoin::Round => vector_tess::LineJoin::Round,
+                LineJoin::Bevel => vector_tess::LineJoin::Bevel,
+            },
+            miter_limit: self.miter_limit,
+            dash: self.dash.as_ref().map(|d| vector_tess::DashPattern {
+                array: d.array.clone(),
+                offset: d.offset,
+            }),
+        }
+    }
+}
+
 impl Default for StrokeStyle {
     fn default() -> Self {
         Self {

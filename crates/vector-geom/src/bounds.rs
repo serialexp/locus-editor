@@ -85,10 +85,51 @@ impl Bounds {
         ];
         Self::from_points(corners)
     }
+
+    /// Expand this bounding box uniformly by `amount` on all four sides.
+    /// Empty bounds stay empty. Negative values shrink the box.
+    pub fn expand(self, amount: f64) -> Self {
+        if self.is_empty() {
+            return self;
+        }
+        Self {
+            min: Point::new(self.min.x - amount, self.min.y - amount),
+            max: Point::new(self.max.x + amount, self.max.y + amount),
+        }
+    }
 }
 
 impl Default for Bounds {
     fn default() -> Self {
         Self::EMPTY
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_grows_on_all_sides() {
+        let b = Bounds::new(Point::new(0.0, 0.0), Point::new(10.0, 20.0));
+        let e = b.expand(2.5);
+        assert_eq!(e.min, Point::new(-2.5, -2.5));
+        assert_eq!(e.max, Point::new(12.5, 22.5));
+        assert_eq!(e.width(), 15.0);
+        assert_eq!(e.height(), 25.0);
+    }
+
+    #[test]
+    fn expand_empty_stays_empty() {
+        let e = Bounds::EMPTY.expand(5.0);
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn expand_negative_shrinks() {
+        let b = Bounds::new(Point::new(0.0, 0.0), Point::new(10.0, 10.0));
+        let e = b.expand(-1.0);
+        assert_eq!(e.min, Point::new(1.0, 1.0));
+        assert_eq!(e.max, Point::new(9.0, 9.0));
     }
 }

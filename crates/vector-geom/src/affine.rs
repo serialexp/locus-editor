@@ -110,6 +110,37 @@ impl Affine {
     pub fn is_identity(self) -> bool {
         self == Self::IDENTITY
     }
+
+    /// Extract the rotation angle (in radians) from the linear part of this
+    /// affine. For a pure translate+rotate+uniform-scale transform, this
+    /// returns the exact angle. For non-uniform scale or skew, this returns
+    /// the angle of the first basis vector (the column [a, c]).
+    pub fn rotation_rad(self) -> f64 {
+        self.c.atan2(self.a)
+    }
+
+    /// Extract the rotation angle in degrees.
+    pub fn rotation_deg(self) -> f64 {
+        self.rotation_rad().to_degrees()
+    }
+
+    /// Extract the scale factors (sx, sy) from the linear part.
+    /// For a transform composed as Scale * Rotate, this returns the
+    /// magnitudes of the two basis vectors.
+    pub fn scale_factors(self) -> (f64, f64) {
+        let sx = (self.a * self.a + self.c * self.c).sqrt();
+        let sy = (self.b * self.b + self.d * self.d).sqrt();
+        // Preserve sign via determinant — negative det means a flip.
+        let sign = if self.determinant() < 0.0 { -1.0 } else { 1.0 };
+        (sx, sy * sign)
+    }
+
+    /// Build a transform that rotates `angle_rad` around a given center point.
+    pub fn rotate_around(angle_rad: f64, center: Point) -> Self {
+        Self::translate(center.x, center.y)
+            .then(Self::rotate(angle_rad))
+            .then(Self::translate(-center.x, -center.y))
+    }
 }
 
 impl Default for Affine {

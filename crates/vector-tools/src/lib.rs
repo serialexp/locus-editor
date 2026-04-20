@@ -5,10 +5,14 @@
 mod pen;
 mod select;
 mod shape;
+mod text;
 
 pub use pen::{PenAction, PenState};
-pub use select::{EdgeHit, PointKind, SelectState, SelectionMode, VertexRef};
+pub use select::{
+    EdgeHit, PointKind, ScaleHandle, SegmentKind, SelectState, SelectionMode, VertexRef,
+};
 pub use shape::ShapeDrawState;
+pub use text::{TextAction, TextToolState};
 
 /// The available editing tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

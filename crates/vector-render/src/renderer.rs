@@ -6,7 +6,7 @@ use vector_scene::{
     Gradient, GradientKind, NodeData, NodeId, Paint, PaintRef, Pattern, Scene, SpreadMethod, Stroke,
 };
 use vector_tess::{
-    DashPattern, LineCap, LineJoin, StrokeParams, TessPaint, TessellatedMesh, Vertex,
+    DashPattern, FillParams, LineCap, LineJoin, StrokeParams, TessPaint, TessellatedMesh, Vertex,
     tessellate_path,
 };
 use vector_text::global_font_db;
@@ -225,6 +225,29 @@ pub struct Renderer {
     pub grid_minor_spacing: f32,
     /// Major grid spacing in canvas units (default 10.0).
     pub grid_major_spacing: f32,
+    /// When true, the checkerboard uses a fixed screen-pixel size instead of
+    /// scaling with zoom.
+    pub checker_fixed_size: bool,
+    /// Screen-pixel size of each checkerboard square when `checker_fixed_size`
+    /// is true.
+    pub checker_screen_px: f32,
+    /// Text editing cursor to render (set by the app each frame).
+    pub text_cursor: Option<TextCursorInfo>,
+    /// Node currently being text-edited (for drawing a distinct bounding box).
+    pub text_editing_node: Option<NodeId>,
+}
+
+/// Information needed to render a text editing cursor (caret).
+#[derive(Clone)]
+pub struct TextCursorInfo {
+    /// X position in the text node's local space.
+    pub local_x: f32,
+    /// Top of the caret line in local space (ascent, typically negative).
+    pub local_top: f32,
+    /// Bottom of the caret line in local space (descent).
+    pub local_bottom: f32,
+    /// The text node's world transform.
+    pub world_transform: [f32; 6],
 }
 
 impl Renderer {
@@ -315,6 +338,10 @@ impl Renderer {
             dirty: true,
             grid_minor_spacing: GRID_MINOR_SPACING,
             grid_major_spacing: GRID_MAJOR_SPACING,
+            checker_fixed_size: true,
+            checker_screen_px: 24.0,
+            text_cursor: None,
+            text_editing_node: None,
         }
     }
 
@@ -795,6 +822,7 @@ impl Renderer {
                 join,
                 miter_limit: s.style.miter_limit,
                 dash,
+                opacity: s.opacity,
             }
         };
 
@@ -835,7 +863,10 @@ impl Renderer {
                     ref path,
                     ref style,
                 } => {
-                    let fill = style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let fill = style.fill.as_ref().map(|f| FillParams {
+                        paint: resolve_paint(&f.paint),
+                        opacity: f.opacity,
+                    });
                     let stroke = style.stroke.as_ref().map(&resolve_stroke);
 
                     let mesh = tessellate_path(path, fill, stroke);
@@ -844,7 +875,10 @@ impl Renderer {
                 NodeData::Text(ref text) => {
                     let shaped =
                         font_db.shape_text(&text.content, &text.font_family, text.font_size);
-                    let fill = text.style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let fill = text.style.fill.as_ref().map(|f| FillParams {
+                        paint: resolve_paint(&f.paint),
+                        opacity: f.opacity,
+                    });
                     let stroke = text.style.stroke.as_ref().map(&resolve_stroke);
 
                     let mesh = tessellate_path(&shaped.path, fill, stroke);
@@ -881,6 +915,10 @@ impl Renderer {
     /// Minor lines appear every `GRID_MINOR_SPACING` canvas units, but only
     /// when zoomed in enough that they are at least `GRID_MINOR_MIN_SCREEN_PX`
     /// screen pixels apart.
+    ///
+    /// A two-tone checkerboard is also drawn behind the lines so that
+    /// transparent fills in the scene visibly composite over a "missing
+    /// pixels" pattern (the same convention used by Photoshop, Krita, etc).
     fn build_grid(&mut self, device: &wgpu::Device) {
         let mut verts: Vec<Vertex> = Vec::new();
         let mut idxs: Vec<u32> = Vec::new();
@@ -900,12 +938,122 @@ impl Renderer {
         // Line thickness in canvas units (1 screen pixel wide)
         let thickness = 0.5 / zoom;
 
-        // Colors
-        let minor_color: [f32; 4] = [1.0, 1.0, 1.0, 0.06];
-        let major_color: [f32; 4] = [1.0, 1.0, 1.0, 0.15];
+        // Grid line colors. A slight blue tint ensures lines remain
+        // visible against both checkerboard tones (dark 0.18, light 0.28).
+        // Pure-black lines with low alpha blend to ~0.18 on the light
+        // checks, making them invisible against the dark checks.
+        let minor_color: [f32; 4] = [0.25, 0.35, 0.55, 0.25];
+        let major_color: [f32; 4] = [0.30, 0.45, 0.70, 0.45];
 
         let minor_spacing = self.grid_minor_spacing;
         let major_spacing = self.grid_major_spacing;
+
+        // ── Checkerboard background ──────────────────────────────────
+        // Two modes:
+        //  • Fixed: each square is a constant screen-pixel size (like
+        //    GIMP/Figma/Inkscape) — the pattern is a viewport UI element.
+        //  • Scaled: squares are 2.5× the major-grid spacing so they
+        //    scale with zoom but never align with grid lines.
+        //
+        // When zoomed out far enough that cells would be smaller than a
+        // few pixels, fall back to a single solid quad — drawing
+        // thousands of sub-pixel quads is wasteful and just averages out
+        // to a flat tone anyway.
+        let cell_a: [f32; 4] = [0.18, 0.18, 0.18, 1.0]; // darker
+        let cell_b: [f32; 4] = [0.28, 0.28, 0.28, 1.0]; // lighter
+
+        // In fixed mode the cell size is expressed in canvas units so
+        // that it maps to the desired number of screen pixels.
+        let cell_size = if self.checker_fixed_size {
+            self.checker_screen_px / zoom
+        } else {
+            major_spacing * 2.5
+        };
+        let cell_screen_px = cell_size * zoom;
+        const MIN_CELL_SCREEN_PX: f32 = 4.0;
+
+        if cell_screen_px < MIN_CELL_SCREEN_PX {
+            // Solid average fill across the whole viewport.
+            let avg = [
+                (cell_a[0] + cell_b[0]) * 0.5,
+                (cell_a[1] + cell_b[1]) * 0.5,
+                (cell_a[2] + cell_b[2]) * 0.5,
+                1.0,
+            ];
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                (canvas_left + canvas_right) * 0.5,
+                (canvas_top + canvas_bottom) * 0.5,
+                (canvas_right - canvas_left) * 0.5,
+                (canvas_bottom - canvas_top) * 0.5,
+                avg,
+            );
+        } else if self.checker_fixed_size {
+            // Fixed mode: anchor the checkerboard to the screen viewport so
+            // it never moves when panning or zooming. We compute cell
+            // positions in screen space (multiples of checker_screen_px from
+            // screen origin 0,0) and convert each position to canvas space
+            // for the vertex data.
+            let spx = self.checker_screen_px;
+
+            // Screen-space bounds of the visible area: [0, vw) × [0, vh).
+            // Snap to cell boundaries in screen space.
+            let start_col = 0_i32; // screen left is always 0
+            let start_row = 0_i32;
+            let cols = (vw / spx).ceil() as i32 + 1;
+            let rows = (vh / spx).ceil() as i32 + 1;
+
+            for r in 0..rows {
+                for c in 0..cols {
+                    let parity = ((start_col + c) + (start_row + r)).rem_euclid(2);
+                    let color = if parity == 0 { cell_a } else { cell_b };
+
+                    // Screen-space position of this cell's top-left corner.
+                    let sx = c as f32 * spx;
+                    let sy = r as f32 * spx;
+
+                    // Convert screen centre of the cell to canvas coords.
+                    // canvas = (screen - pan) / zoom
+                    let cx = (sx + spx * 0.5 - pan[0]) / zoom;
+                    let cy = (sy + spx * 0.5 - pan[1]) / zoom;
+                    let half = spx * 0.5 / zoom;
+
+                    push_quad(&mut verts, &mut idxs, cx, cy, half, half, color);
+                }
+            }
+        } else {
+            // Scaled mode: snap visible region to cell boundaries so cells
+            // stay aligned to the canvas origin (and to the major grid).
+            let start_col = (canvas_left / cell_size).floor() as i32;
+            let start_row = (canvas_top / cell_size).floor() as i32;
+            let start_x = start_col as f32 * cell_size;
+            let start_y = start_row as f32 * cell_size;
+
+            let mut row: i32 = 0;
+            let mut y = start_y;
+            while y < canvas_bottom {
+                let mut col: i32 = 0;
+                let mut x = start_x;
+                while x < canvas_right {
+                    let parity = (start_col + col + start_row + row).rem_euclid(2);
+                    let color = if parity == 0 { cell_a } else { cell_b };
+                    push_quad(
+                        &mut verts,
+                        &mut idxs,
+                        x + cell_size * 0.5,
+                        y + cell_size * 0.5,
+                        cell_size * 0.5,
+                        cell_size * 0.5,
+                        color,
+                    );
+                    x += cell_size;
+                    col += 1;
+                }
+                y += cell_size;
+                row += 1;
+            }
+        }
 
         // Determine whether minor lines are visible:
         // minor spacing in screen pixels = minor_spacing * zoom
@@ -954,8 +1102,11 @@ impl Renderer {
         }
 
         // --- Major grid lines ---
+        // When minor lines are visible, major lines are thicker to
+        // distinguish them. When minor lines are hidden (zoomed out),
+        // use the thinner weight so the grid stays subtle.
         {
-            let major_thickness = 1.0 / zoom;
+            let major_thickness = if show_minor { 1.0 / zoom } else { thickness };
             // Vertical major lines
             let mut x = snap_down(canvas_left, major_spacing);
             while x <= canvas_right {
@@ -1094,9 +1245,17 @@ impl Renderer {
         // ── Selection bounding boxes (Object mode only) ─────────────
         // Draw a thin outline around each object-selected node's world-space
         // bounding box. For groups, this encompasses all children.
+        //
+        // The outline is a fixed width in screen pixels regardless of camera
+        // zoom: we divide `BBOX_THICKNESS_PX` by the current zoom so that
+        // the world-space thickness shrinks proportionally as you zoom in
+        // and grows as you zoom out, keeping the rendered bar ~constant.
         if selection.mode == SelectionMode::Object {
             let bbox_color: [f32; 4] = [0.3, 0.6, 1.0, 0.6]; // selection blue
-            let bbox_thickness = 1.0 / zoom;
+
+            const BBOX_THICKNESS_PX: f32 = 1.5;
+            let thickness = BBOX_THICKNESS_PX / zoom; // full thickness, world units
+            let half_thickness = thickness * 0.5;
 
             let root = scene.root();
             scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
@@ -1104,9 +1263,9 @@ impl Renderer {
                     return;
                 }
 
-                // Compute the world-space bounding box for this node.
+                // Compute the world-space bounding box for this node,
+                // including the visible stroke area.
                 let bounds = match &node.data {
-                    NodeData::Path { path, .. } => path.bounding_box().transform(world_transform),
                     NodeData::Group { .. } => {
                         // For groups, walk the subtree to get the aggregate bounds.
                         let mut b = vector_geom::Bounds::EMPTY;
@@ -1114,16 +1273,14 @@ impl Renderer {
                             if !cnode.visible {
                                 return;
                             }
-                            if let NodeData::Path { ref path, .. } = cnode.data {
-                                let pb = path.bounding_box().transform(cworld);
-                                if !pb.is_empty() {
-                                    b = b.union(pb);
-                                }
+                            let cb = cnode.data.visual_bounds(cworld);
+                            if !cb.is_empty() {
+                                b = b.union(cb);
                             }
                         });
                         b
                     }
-                    _ => vector_geom::Bounds::EMPTY,
+                    _ => node.data.visual_bounds(world_transform),
                 };
 
                 if bounds.is_empty() {
@@ -1134,7 +1291,16 @@ impl Renderer {
                 let y0 = bounds.min.y as f32;
                 let x1 = bounds.max.x as f32;
                 let y1 = bounds.max.y as f32;
-                let t = bbox_thickness * 0.5;
+
+                // Corner-cover strategy: horizontal (top/bottom) bars are
+                // stretched past the bounds by half a thickness on each
+                // end, while vertical (left/right) bars are shortened by
+                // half a thickness on each end so they fit between the
+                // horizontal bars. No overlap, no notch. Equivalent to
+                // "draw the horizontal borders half a border width longer"
+                // from the user's description.
+                let horiz_half_width = (x1 - x0) * 0.5 + half_thickness;
+                let vert_half_height = ((y1 - y0) * 0.5 - half_thickness).max(0.0);
 
                 // Top edge
                 push_quad(
@@ -1142,8 +1308,8 @@ impl Renderer {
                     &mut idxs,
                     (x0 + x1) * 0.5,
                     y0,
-                    (x1 - x0) * 0.5 + t,
-                    t,
+                    horiz_half_width,
+                    half_thickness,
                     bbox_color,
                 );
                 // Bottom edge
@@ -1152,8 +1318,8 @@ impl Renderer {
                     &mut idxs,
                     (x0 + x1) * 0.5,
                     y1,
-                    (x1 - x0) * 0.5 + t,
-                    t,
+                    horiz_half_width,
+                    half_thickness,
                     bbox_color,
                 );
                 // Left edge
@@ -1162,8 +1328,8 @@ impl Renderer {
                     &mut idxs,
                     x0,
                     (y0 + y1) * 0.5,
-                    t,
-                    (y1 - y0) * 0.5 + t,
+                    half_thickness,
+                    vert_half_height,
                     bbox_color,
                 );
                 // Right edge
@@ -1172,11 +1338,154 @@ impl Renderer {
                     &mut idxs,
                     x1,
                     (y0 + y1) * 0.5,
-                    t,
-                    (y1 - y0) * 0.5 + t,
+                    half_thickness,
+                    vert_half_height,
                     bbox_color,
                 );
             });
+
+            // ── Scale handles (8 squares on the combined selection bbox) ──
+            // Compute the combined bounds of all selected nodes.
+            let mut combined_bounds = vector_geom::Bounds::EMPTY;
+            for &id in &selection.selected_nodes {
+                if let Some(node) = scene.get(id) {
+                    if !node.visible {
+                        continue;
+                    }
+                    let world = scene.world_transform(id);
+                    let b = match &node.data {
+                        NodeData::Group { .. } => {
+                            let mut gb = vector_geom::Bounds::EMPTY;
+                            scene.walk_depth_first(id, world, &mut |_cid, cnode, cworld| {
+                                if !cnode.visible {
+                                    return;
+                                }
+                                let cb = cnode.data.visual_bounds(cworld);
+                                if !cb.is_empty() {
+                                    gb = gb.union(cb);
+                                }
+                            });
+                            gb
+                        }
+                        _ => node.data.visual_bounds(world),
+                    };
+                    if !b.is_empty() {
+                        combined_bounds = combined_bounds.union(b);
+                    }
+                }
+            }
+
+            if !combined_bounds.is_empty() {
+                use vector_tools::ScaleHandle;
+                let handle_half = HANDLE_SIZE / zoom;
+                let handle_fill: [f32; 4] = [1.0, 1.0, 1.0, 1.0]; // white
+                let handle_border: [f32; 4] = [0.3, 0.6, 1.0, 0.9]; // selection blue
+
+                for handle in ScaleHandle::ALL {
+                    let pos = handle.position(combined_bounds);
+                    push_handle(
+                        &mut verts,
+                        &mut idxs,
+                        pos,
+                        handle_half,
+                        handle_fill,
+                        handle_border,
+                    );
+                }
+            }
+        }
+
+        // ── Text-editing bounding box ────────────────────────────────────
+        // When a text node is being edited, draw an amber bounding box
+        // regardless of selection mode so the node stays visible.
+        if let Some(edit_id) = self.text_editing_node {
+            let text_bbox_color: [f32; 4] = [1.0, 0.7, 0.2, 0.7]; // amber
+
+            const TEXT_BBOX_THICKNESS_PX: f32 = 1.5;
+            let thickness = TEXT_BBOX_THICKNESS_PX / zoom;
+            let half_thickness = thickness * 0.5;
+
+            scene.walk_depth_first(
+                scene.root(),
+                Affine::IDENTITY,
+                &mut |id, node, world_transform| {
+                    if id != edit_id || !node.visible {
+                        return;
+                    }
+                    let bounds = node.data.visual_bounds(world_transform);
+                    // For empty text, use font metrics to show a minimal box.
+                    let bounds = if bounds.is_empty() {
+                        if let NodeData::Text(text) = &node.data {
+                            let shaped = vector_text::shape_text(
+                                &text.content,
+                                &text.font_family,
+                                text.font_size,
+                            );
+                            let local = vector_geom::Bounds {
+                                min: vector_geom::Point::new(0.0, -shaped.ascent),
+                                max: vector_geom::Point::new(
+                                    shaped.advance_width.max(text.font_size * 0.5),
+                                    -shaped.descent,
+                                ),
+                            };
+                            local.transform(world_transform)
+                        } else {
+                            return;
+                        }
+                    } else {
+                        bounds
+                    };
+
+                    let x0 = bounds.min.x as f32;
+                    let y0 = bounds.min.y as f32;
+                    let x1 = bounds.max.x as f32;
+                    let y1 = bounds.max.y as f32;
+
+                    let horiz_half_width = (x1 - x0) * 0.5 + half_thickness;
+                    let vert_half_height = ((y1 - y0) * 0.5 - half_thickness).max(0.0);
+
+                    // Top
+                    push_quad(
+                        &mut verts,
+                        &mut idxs,
+                        (x0 + x1) * 0.5,
+                        y0,
+                        horiz_half_width,
+                        half_thickness,
+                        text_bbox_color,
+                    );
+                    // Bottom
+                    push_quad(
+                        &mut verts,
+                        &mut idxs,
+                        (x0 + x1) * 0.5,
+                        y1,
+                        horiz_half_width,
+                        half_thickness,
+                        text_bbox_color,
+                    );
+                    // Left
+                    push_quad(
+                        &mut verts,
+                        &mut idxs,
+                        x0,
+                        (y0 + y1) * 0.5,
+                        half_thickness,
+                        vert_half_height,
+                        text_bbox_color,
+                    );
+                    // Right
+                    push_quad(
+                        &mut verts,
+                        &mut idxs,
+                        x1,
+                        (y0 + y1) * 0.5,
+                        half_thickness,
+                        vert_half_height,
+                        text_bbox_color,
+                    );
+                },
+            );
         }
 
         // ── Vertex handles (Node mode only) ─────────────────────────────
@@ -1609,6 +1918,32 @@ impl Renderer {
                 t * 0.5,
                 (y1 - y0) * 0.5,
                 border,
+            );
+        }
+
+        // ── Text editing cursor (caret) ─────────────────────────────
+        if let Some(tc) = &self.text_cursor {
+            let [a, b, c, d, e, f] = tc.world_transform;
+            // Transform local caret endpoints to world space.
+            let top_x = a * tc.local_x + c * tc.local_top + e;
+            let top_y = b * tc.local_x + d * tc.local_top + f;
+            let bot_x = a * tc.local_x + c * tc.local_bottom + e;
+            let bot_y = b * tc.local_x + d * tc.local_bottom + f;
+
+            let cx = (top_x + bot_x) * 0.5;
+            let cy = (top_y + bot_y) * 0.5;
+            let half_h = ((bot_x - top_x).powi(2) + (bot_y - top_y).powi(2)).sqrt() * 0.5;
+            let caret_thickness = 1.0 / self.zoom;
+            let caret_color: [f32; 4] = [1.0, 1.0, 1.0, 0.9];
+
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                cx,
+                cy,
+                caret_thickness,
+                half_h,
+                caret_color,
             );
         }
 
@@ -2046,6 +2381,7 @@ fn tessellate_pattern_content(
             join,
             miter_limit: s.style.miter_limit,
             dash,
+            opacity: s.opacity,
         }
     };
 
@@ -2087,7 +2423,10 @@ fn tessellate_pattern_content(
                     ref path,
                     ref style,
                 } => {
-                    let fill = style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let fill = style.fill.as_ref().map(|f| FillParams {
+                        paint: resolve_paint(&f.paint),
+                        opacity: f.opacity,
+                    });
                     let stroke = style.stroke.as_ref().map(&resolve_stroke);
                     let mesh = tessellate_path(path, fill, stroke);
                     push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
@@ -2095,7 +2434,10 @@ fn tessellate_pattern_content(
                 NodeData::Text(ref text) => {
                     let shaped =
                         font_db.shape_text(&text.content, &text.font_family, text.font_size);
-                    let fill = text.style.fill.as_ref().map(|f| resolve_paint(&f.paint));
+                    let fill = text.style.fill.as_ref().map(|f| FillParams {
+                        paint: resolve_paint(&f.paint),
+                        opacity: f.opacity,
+                    });
                     let stroke = text.style.stroke.as_ref().map(&resolve_stroke);
                     let mesh = tessellate_path(&shaped.path, fill, stroke);
                     push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);

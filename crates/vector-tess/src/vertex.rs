@@ -45,24 +45,36 @@ impl Vertex {
         }
     }
 
-    /// Create a gradient vertex.
+    /// Create a gradient vertex. `opacity` is stored in `color.a` for the
+    /// fragment shader to apply to the gradient sample.
     #[inline]
-    pub fn gradient(position: [f32; 2], world_pos: [f32; 2], gradient_index: i32) -> Self {
+    pub fn gradient(
+        position: [f32; 2],
+        world_pos: [f32; 2],
+        gradient_index: i32,
+        opacity: f32,
+    ) -> Self {
         Self {
             position,
-            color: [0.0, 0.0, 0.0, 1.0],
+            color: [0.0, 0.0, 0.0, opacity],
             world_pos,
             gradient_index,
             pattern_index: -1,
         }
     }
 
-    /// Create a pattern vertex.
+    /// Create a pattern vertex. `opacity` is stored in `color.a` for the
+    /// fragment shader to apply to the pattern sample.
     #[inline]
-    pub fn pattern(position: [f32; 2], world_pos: [f32; 2], pattern_index: i32) -> Self {
+    pub fn pattern(
+        position: [f32; 2],
+        world_pos: [f32; 2],
+        pattern_index: i32,
+        opacity: f32,
+    ) -> Self {
         Self {
             position,
-            color: [0.0, 0.0, 0.0, 1.0],
+            color: [0.0, 0.0, 0.0, opacity],
             world_pos,
             gradient_index: -1,
             pattern_index,

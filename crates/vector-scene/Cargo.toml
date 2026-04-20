@@ -9,5 +9,6 @@ authors.workspace = true
 [dependencies]
 vector-geom = { path = "../vector-geom" }
 vector-text = { path = "../vector-text" }
+vector-tess = { path = "../vector-tess" }
 slotmap = { workspace = true }
 serde = { workspace = true }

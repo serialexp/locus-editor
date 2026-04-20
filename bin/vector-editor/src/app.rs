@@ -10,7 +10,10 @@ use vector_geom::{Affine, Path};
 use vector_ops::{Command, History};
 use vector_render::Renderer;
 use vector_scene::{NodeData, NodeId, Scene};
-use vector_tools::{PenAction, PenState, SelectState, ShapeDrawState, ToolType};
+use vector_tools::{
+    EdgeHit, PenAction, PenState, PointKind, SelectState, ShapeDrawState, TextAction,
+    TextToolState, ToolType, VertexRef,
+};
 
 /// Camera state for canvas pan/zoom.
 struct Camera {
@@ -125,6 +128,24 @@ impl SnapSettings {
     }
 }
 
+/// What kind of canvas element was right-clicked, driving the context menu.
+enum CanvasContextTarget {
+    /// Right-clicked on a vertex (anchor or control point).
+    Vertex(VertexRef),
+    /// Right-clicked on a segment edge.
+    Segment(EdgeHit),
+}
+
+/// Persistent state for a canvas right-click context menu.
+struct CanvasContextMenu {
+    /// What was right-clicked.
+    target: CanvasContextTarget,
+    /// Screen-space position where the menu should appear.
+    screen_pos: egui::Pos2,
+    /// Whether this is the first frame (used to spawn the Area).
+    first_frame: bool,
+}
+
 /// All editor state except the GPU resources. Extracted as a struct so it
 /// can be passed as a single `&mut EditorState` to free functions that need
 /// disjoint borrows from `GpuState`.
@@ -135,8 +156,12 @@ struct EditorState {
     select_state: SelectState,
     shape_draw: ShapeDrawState,
     pen_state: PenState,
+    text_tool: TextToolState,
     camera: Camera,
     snap: SnapSettings,
+    /// When true, the checkerboard background uses a fixed screen-pixel size
+    /// instead of scaling with zoom.
+    checker_fixed_size: bool,
     /// The canvas area in screen pixels (excluding egui panels), updated each frame.
     canvas_rect: [f32; 4],
     /// Current cursor position in screen pixels.
@@ -155,6 +180,8 @@ struct EditorState {
     /// Snapshots of transforms captured at the start of an object drag,
     /// so we can record undo commands when the drag finishes.
     drag_transform_snapshots: Vec<(NodeId, Affine)>,
+    /// Active canvas context menu (right-click on vertex/segment).
+    canvas_context_menu: Option<CanvasContextMenu>,
 }
 
 impl Default for EditorState {
@@ -166,8 +193,10 @@ impl Default for EditorState {
             select_state: SelectState::default(),
             shape_draw: ShapeDrawState::default(),
             pen_state: PenState::default(),
+            text_tool: TextToolState::default(),
             camera: Camera::default(),
             snap: SnapSettings::default(),
+            checker_fixed_size: true,
             canvas_rect: [0.0, 0.0, 1280.0, 800.0],
             cursor_pos: None,
             is_panning: false,
@@ -176,6 +205,7 @@ impl Default for EditorState {
             last_left_press: None,
             drag_path_snapshots: Vec::new(),
             drag_transform_snapshots: Vec::new(),
+            canvas_context_menu: None,
         }
     }
 }
@@ -212,6 +242,42 @@ impl EditorState {
                 renderer.mark_dirty();
             }
             PenAction::Cancelled => {
+                self.select_state.selected_nodes.clear();
+                renderer.mark_dirty();
+            }
+        }
+    }
+
+    /// Process a TextAction result — record undo, update selection, mark dirty.
+    fn handle_text_action(&mut self, action: TextAction, renderer: &mut Renderer) {
+        match action {
+            TextAction::None => {}
+            TextAction::Continue => {
+                if let Some(node_id) = self.text_tool.editing_node()
+                    && !self.select_state.selected_nodes.contains(&node_id)
+                {
+                    self.select_state.selected_nodes.clear();
+                    self.select_state.selected_nodes.push(node_id);
+                }
+                renderer.mark_dirty();
+            }
+            TextAction::Committed(node_id, original) => {
+                self.history.record_undo(Command::SetTextData {
+                    id: node_id,
+                    text: original,
+                });
+                self.select_state.selected_nodes.clear();
+                self.select_state.selected_nodes.push(node_id);
+                renderer.mark_dirty();
+            }
+            TextAction::Created(node_id) => {
+                // Undo = delete the newly created node.
+                self.history.record_undo(Command::Delete { id: node_id });
+                self.select_state.selected_nodes.clear();
+                self.select_state.selected_nodes.push(node_id);
+                renderer.mark_dirty();
+            }
+            TextAction::Cancelled => {
                 self.select_state.selected_nodes.clear();
                 renderer.mark_dirty();
             }
@@ -429,13 +495,45 @@ impl EditorState {
                     gpu.window.request_redraw();
                 }
 
-                // Cursor: grab for selected vertex, pointer for clickable object, default otherwise
-                if self
+                // Cursor: grab for selected vertex, resize for scale handles,
+                // rotation for corner zone, pointer for clickable object,
+                // default otherwise.
+                if self.select_state.is_rotating() || self.select_state.is_scaling() {
+                    gpu.window.set_cursor(winit::window::CursorIcon::Grabbing);
+                } else if self
                     .select_state
                     .hovered
                     .is_some_and(|vr| self.select_state.selected.contains(&vr))
                 {
                     gpu.window.set_cursor(winit::window::CursorIcon::Grab);
+                } else if let Some(handle) = self.select_state.hit_scale_handle(
+                    &self.scene,
+                    canvas_f64,
+                    self.camera.zoom as f64,
+                ) {
+                    use vector_tools::ScaleHandle;
+                    let cursor = match handle {
+                        ScaleHandle::TopLeft | ScaleHandle::BottomRight => {
+                            winit::window::CursorIcon::NwseResize
+                        }
+                        ScaleHandle::TopRight | ScaleHandle::BottomLeft => {
+                            winit::window::CursorIcon::NeswResize
+                        }
+                        ScaleHandle::Top | ScaleHandle::Bottom => {
+                            winit::window::CursorIcon::NsResize
+                        }
+                        ScaleHandle::Left | ScaleHandle::Right => {
+                            winit::window::CursorIcon::EwResize
+                        }
+                    };
+                    gpu.window.set_cursor(cursor);
+                } else if self.select_state.hit_rotation_zone(
+                    &self.scene,
+                    canvas_f64,
+                    self.camera.zoom as f64,
+                ) {
+                    // Crosshair when hovering the rotation zone outside bbox corners.
+                    gpu.window.set_cursor(winit::window::CursorIcon::Crosshair);
                 } else if self.select_state.hovered.is_some()
                     || SelectState::object_hit_test(&self.scene, canvas_f64).is_some()
                 {
@@ -455,6 +553,8 @@ impl EditorState {
             || self.active_tool == ToolType::Ellipse
         {
             gpu.window.set_cursor(winit::window::CursorIcon::Crosshair);
+        } else if self.active_tool == ToolType::Text {
+            gpu.window.set_cursor(winit::window::CursorIcon::Text);
         } else {
             gpu.window.set_cursor(winit::window::CursorIcon::Default);
         }
@@ -665,6 +765,8 @@ impl ApplicationHandler for App {
                         MouseButton::Left => {
                             if state == ElementState::Pressed {
                                 self.state.is_left_down = true;
+                                // Close any open canvas context menu.
+                                self.state.canvas_context_menu = None;
                                 // Double-click detection.
                                 let now = Instant::now();
                                 let is_double_click = if let Some((prev_time, prev_pos)) =
@@ -715,9 +817,40 @@ impl ApplicationHandler for App {
                                                                     .select_state
                                                                     .is_node_selected(node_id)
                                                             {
-                                                                self.state
-                                                                    .select_state
-                                                                    .enter_node_mode();
+                                                                // Text nodes: switch to text tool
+                                                                // and start editing instead of
+                                                                // entering vertex mode.
+                                                                let is_text = self
+                                                                    .state
+                                                                    .scene
+                                                                    .get(node_id)
+                                                                    .is_some_and(|n| {
+                                                                        matches!(
+                                                                            n.data,
+                                                                            NodeData::Text(_)
+                                                                        )
+                                                                    });
+                                                                if is_text {
+                                                                    self.state.active_tool =
+                                                                        ToolType::Text;
+                                                                    let action = self
+                                                                        .state
+                                                                        .text_tool
+                                                                        .on_press(
+                                                                            &mut self.state.scene,
+                                                                            canvas_f64,
+                                                                            self.state.camera.zoom
+                                                                                as f64,
+                                                                        );
+                                                                    self.state.handle_text_action(
+                                                                        action,
+                                                                        &mut gpu.renderer,
+                                                                    );
+                                                                } else {
+                                                                    self.state
+                                                                        .select_state
+                                                                        .enter_node_mode();
+                                                                }
                                                                 handled = true;
                                                             }
                                                         }
@@ -817,6 +950,8 @@ impl ApplicationHandler for App {
                                                     .state
                                                     .select_state
                                                     .is_dragging_objects()
+                                                    || self.state.select_state.is_rotating()
+                                                    || self.state.select_state.is_scaling()
                                                 {
                                                     self.state.snapshot_selected_transforms();
                                                 }
@@ -838,7 +973,15 @@ impl ApplicationHandler for App {
                                             );
                                             gpu.renderer.mark_dirty();
                                         }
-                                        _ => {}
+                                        ToolType::Text => {
+                                            let action = self.state.text_tool.on_press(
+                                                &mut self.state.scene,
+                                                canvas_f64,
+                                                self.state.camera.zoom as f64,
+                                            );
+                                            self.state
+                                                .handle_text_action(action, &mut gpu.renderer);
+                                        }
                                     }
                                     gpu.window.request_redraw();
                                 }
@@ -850,7 +993,10 @@ impl ApplicationHandler for App {
                                         // command before ending the drag.
                                         if self.state.select_state.is_dragging_vertices() {
                                             self.state.record_vertex_drag_undo();
-                                        } else if self.state.select_state.is_dragging_objects() {
+                                        } else if self.state.select_state.is_dragging_objects()
+                                            || self.state.select_state.is_rotating()
+                                            || self.state.select_state.is_scaling()
+                                        {
                                             self.state.record_object_drag_undo();
                                         }
                                         self.state.select_state.on_release();
@@ -891,13 +1037,56 @@ impl ApplicationHandler for App {
                             }
                         }
                         MouseButton::Right => {
-                            // Right-click: undo last pen point
-                            if state == ElementState::Pressed
-                                && self.state.active_tool == ToolType::Pen
-                            {
-                                let action = self.state.pen_state.undo_last(&mut self.state.scene);
-                                self.state.handle_pen_action(action, &mut gpu.renderer);
-                                gpu.window.request_redraw();
+                            if state == ElementState::Pressed {
+                                if self.state.active_tool == ToolType::Pen {
+                                    // Pen tool: undo last pen point.
+                                    let action =
+                                        self.state.pen_state.undo_last(&mut self.state.scene);
+                                    self.state.handle_pen_action(action, &mut gpu.renderer);
+                                    gpu.window.request_redraw();
+                                } else if self.state.active_tool == ToolType::Select
+                                    && let Some(cursor) = self.state.cursor_pos
+                                {
+                                    // Select tool: open context menu on vertex or segment.
+                                    let canvas =
+                                        self.state.camera.screen_to_canvas(cursor[0], cursor[1]);
+                                    let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
+                                    let zoom = self.state.camera.zoom as f64;
+                                    let screen_pos = egui::Pos2::new(cursor[0], cursor[1]);
+                                    let nodes = &self.state.select_state.selected_nodes;
+
+                                    if self.state.select_state.mode
+                                        == vector_tools::SelectionMode::Node
+                                        && !nodes.is_empty()
+                                    {
+                                        // Node mode: check vertex first, then edge.
+                                        if let Some(vr) = SelectState::hit_test_in_nodes(
+                                            &self.state.scene,
+                                            canvas_f64,
+                                            zoom,
+                                            nodes,
+                                        ) {
+                                            self.state.canvas_context_menu =
+                                                Some(CanvasContextMenu {
+                                                    target: CanvasContextTarget::Vertex(vr),
+                                                    screen_pos,
+                                                    first_frame: true,
+                                                });
+                                        } else if let Some(hit) = SelectState::edge_hit_test(
+                                            &self.state.scene,
+                                            canvas_f64,
+                                            zoom,
+                                            nodes,
+                                        ) {
+                                            self.state.canvas_context_menu =
+                                                Some(CanvasContextMenu {
+                                                    target: CanvasContextTarget::Segment(hit),
+                                                    screen_pos,
+                                                    first_frame: true,
+                                                });
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -986,64 +1175,109 @@ impl ApplicationHandler for App {
                     let modifiers = gpu.egui_ctx.input(|i| i.modifiers);
                     let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
-                    match &key_event.logical_key {
-                        // Undo: Ctrl+Z (no shift)
-                        Key::Character(c)
-                            if (c.as_str() == "z" || c.as_str() == "Z")
-                                && ctrl
-                                && !modifiers.shift =>
-                        {
-                            // Don't undo while a tool is actively building.
-                            if !self.state.pen_state.is_building()
-                                && !self.state.shape_draw.is_drawing()
-                                && self.state.history.can_undo()
-                            {
-                                self.state.undo();
-                                gpu.renderer.mark_dirty();
-                                gpu.window.request_redraw();
+                    // ── Text tool editing intercept ─────────────────────
+                    // When the text tool is actively editing, route all
+                    // non-Ctrl keys to it before any other handler.
+                    let mut text_handled = false;
+                    if self.state.text_tool.is_editing() {
+                        let action = match &key_event.logical_key {
+                            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                                self.state.text_tool.commit(&mut self.state.scene)
                             }
-                        }
-                        // Redo: Ctrl+Shift+Z or Ctrl+Y
-                        Key::Character(c)
-                            if ((c.as_str() == "z" || c.as_str() == "Z") && modifiers.shift
-                                || (c.as_str() == "y" || c.as_str() == "Y")
-                                    && !modifiers.shift)
-                                && ctrl =>
-                        {
-                            if !self.state.pen_state.is_building()
-                                && !self.state.shape_draw.is_drawing()
-                                && self.state.history.can_redo()
-                            {
-                                self.state.redo();
-                                gpu.renderer.mark_dirty();
-                                gpu.window.request_redraw();
+                            Key::Named(NamedKey::Backspace) if !ctrl => {
+                                self.state.text_tool.on_backspace(&mut self.state.scene)
                             }
-                        }
-                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
-                            if self.state.active_tool == ToolType::Pen
-                                && self.state.pen_state.is_building()
-                            {
-                                let action =
-                                    self.state.pen_state.finish(&mut self.state.scene, false);
-                                self.state.handle_pen_action(action, &mut gpu.renderer);
-                                gpu.window.request_redraw();
-                            } else if self.state.active_tool == ToolType::Select
-                                && self.state.select_state.mode == vector_tools::SelectionMode::Node
-                            {
-                                self.state.select_state.exit_node_mode();
-                                gpu.window.request_redraw();
+                            Key::Named(NamedKey::Delete) if !ctrl => {
+                                self.state.text_tool.on_delete(&mut self.state.scene)
                             }
+                            Key::Named(NamedKey::ArrowLeft) => self.state.text_tool.move_left(),
+                            Key::Named(NamedKey::ArrowRight) => {
+                                self.state.text_tool.move_right(&self.state.scene)
+                            }
+                            Key::Named(NamedKey::Home) => self.state.text_tool.move_home(),
+                            Key::Named(NamedKey::End) => {
+                                self.state.text_tool.move_end(&self.state.scene)
+                            }
+                            Key::Named(NamedKey::Space) if !ctrl => {
+                                self.state.text_tool.on_char(&mut self.state.scene, " ")
+                            }
+                            Key::Character(c) if !ctrl => self
+                                .state
+                                .text_tool
+                                .on_char(&mut self.state.scene, c.as_str()),
+                            _ => TextAction::None,
+                        };
+                        text_handled = !matches!(action, TextAction::None);
+                        self.state.handle_text_action(action, &mut gpu.renderer);
+                        if text_handled {
+                            gpu.window.request_redraw();
                         }
-                        Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
-                            if self.state.active_tool == ToolType::Select {
-                                let deleted = self.state.delete_with_undo();
-                                if deleted {
+                    }
+
+                    if !text_handled {
+                        match &key_event.logical_key {
+                            // Undo: Ctrl+Z (no shift)
+                            Key::Character(c)
+                                if (c.as_str() == "z" || c.as_str() == "Z")
+                                    && ctrl
+                                    && !modifiers.shift =>
+                            {
+                                // Don't undo while a tool is actively building.
+                                if !self.state.pen_state.is_building()
+                                    && !self.state.shape_draw.is_drawing()
+                                    && !self.state.text_tool.is_editing()
+                                    && self.state.history.can_undo()
+                                {
+                                    self.state.undo();
                                     gpu.renderer.mark_dirty();
                                     gpu.window.request_redraw();
                                 }
                             }
+                            // Redo: Ctrl+Shift+Z or Ctrl+Y
+                            Key::Character(c)
+                                if ((c.as_str() == "z" || c.as_str() == "Z")
+                                    && modifiers.shift
+                                    || (c.as_str() == "y" || c.as_str() == "Y")
+                                        && !modifiers.shift)
+                                    && ctrl =>
+                            {
+                                if !self.state.pen_state.is_building()
+                                    && !self.state.shape_draw.is_drawing()
+                                    && !self.state.text_tool.is_editing()
+                                    && self.state.history.can_redo()
+                                {
+                                    self.state.redo();
+                                    gpu.renderer.mark_dirty();
+                                    gpu.window.request_redraw();
+                                }
+                            }
+                            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                                if self.state.active_tool == ToolType::Pen
+                                    && self.state.pen_state.is_building()
+                                {
+                                    let action =
+                                        self.state.pen_state.finish(&mut self.state.scene, false);
+                                    self.state.handle_pen_action(action, &mut gpu.renderer);
+                                    gpu.window.request_redraw();
+                                } else if self.state.active_tool == ToolType::Select
+                                    && self.state.select_state.mode
+                                        == vector_tools::SelectionMode::Node
+                                {
+                                    self.state.select_state.exit_node_mode();
+                                    gpu.window.request_redraw();
+                                }
+                            }
+                            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
+                                if self.state.active_tool == ToolType::Select {
+                                    let deleted = self.state.delete_with_undo();
+                                    if deleted {
+                                        gpu.renderer.mark_dirty();
+                                        gpu.window.request_redraw();
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -1078,7 +1312,10 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     // any egui Ui, which lets is_pointer_over_egui() return false for it.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     gpu.egui_ctx.begin_pass(raw_input);
-    let (reorder, ui_scene_dirty) = run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
+    let (structure_cmds, ui_scene_dirty) = run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
+
+    // Canvas context menu (right-click on vertex/segment in node mode).
+    show_canvas_context_menu(&gpu.egui_ctx, state, &mut gpu.renderer);
 
     // Capture the canvas rect (area not covered by egui panels) before ending the pass.
     #[expect(deprecated)] // content_rect may not exist in this egui version yet
@@ -1092,10 +1329,9 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
         gpu.renderer.mark_dirty();
     }
 
-    // Apply any reorder from the structure panel (before renderer.prepare).
-    if let Some((node_id, new_parent, index)) = reorder
-        && state.scene.reparent(node_id, new_parent, index)
-    {
+    // Apply structure commands from the UI (after egui pass, before renderer.prepare).
+    for action in structure_cmds {
+        apply_structure_action(action, state);
         gpu.renderer.mark_dirty();
     }
 
@@ -1147,6 +1383,36 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     // Sync grid spacing from snap settings to the renderer.
     gpu.renderer.grid_minor_spacing = state.snap.grid_size as f32;
     gpu.renderer.grid_major_spacing = state.snap.grid_size as f32 * 10.0;
+    gpu.renderer.checker_fixed_size = state.checker_fixed_size;
+
+    // Update text cursor info for rendering.
+    gpu.renderer.text_cursor = if state.text_tool.is_editing() {
+        state
+            .text_tool
+            .cursor_local_position(&state.scene)
+            .and_then(|(x, top, bottom)| {
+                state
+                    .text_tool
+                    .editing_world_transform(&state.scene)
+                    .map(|world| vector_render::TextCursorInfo {
+                        local_x: x as f32,
+                        local_top: top as f32,
+                        local_bottom: bottom as f32,
+                        world_transform: [
+                            world.a as f32,
+                            world.c as f32,
+                            world.b as f32,
+                            world.d as f32,
+                            world.tx as f32,
+                            world.ty as f32,
+                        ],
+                    })
+            })
+    } else {
+        None
+    };
+    gpu.renderer.text_editing_node = state.text_tool.editing_node();
+
     gpu.renderer
         .prepare(&gpu.device, &gpu.queue, &state.scene, &state.select_state);
 
@@ -1201,26 +1467,283 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
 /// A pending reorder: (node to move, new parent, index within new parent).
 type ReorderCommand = Option<(vector_scene::NodeId, vector_scene::NodeId, usize)>;
 
+/// Deferred structural commands from the structure panel context menu.
+/// Applied after the egui pass to avoid mutating the tree while iterating it.
+type StructureCommands = Vec<StructureAction>;
+
+/// An action from the structure panel that modifies the scene tree.
+enum StructureAction {
+    /// Reorder/reparent a node (from drag-and-drop).
+    Reparent {
+        id: NodeId,
+        new_parent: NodeId,
+        index: usize,
+    },
+    /// Create a new empty group as a child of the given parent.
+    NewGroup { parent: NodeId },
+    /// Wrap the selected nodes in a new group.
+    GroupSelection { nodes: Vec<NodeId> },
+    /// Dissolve a group, moving its children to the group's parent.
+    Ungroup { group: NodeId },
+    /// Delete a node.
+    Delete { id: NodeId },
+}
+
+/// Render the canvas context menu (right-click on vertex/segment).
+fn show_canvas_context_menu(ctx: &egui::Context, state: &mut EditorState, renderer: &mut Renderer) {
+    let Some(menu) = &mut state.canvas_context_menu else {
+        return;
+    };
+
+    // We need an Area so the menu floats over the canvas. On the first
+    // frame we position it; on subsequent frames egui remembers.
+    let area_id = egui::Id::new("canvas_context_menu");
+    let pos = menu.screen_pos;
+    if menu.first_frame {
+        menu.first_frame = false;
+    }
+
+    let mut close = false;
+    let mut action: Option<CanvasContextAction> = None;
+
+    let area_resp = egui::Area::new(area_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            let frame = egui::Frame::popup(ui.style());
+            frame.show(ui, |ui| {
+                match &state.canvas_context_menu {
+                    Some(CanvasContextMenu {
+                        target: CanvasContextTarget::Vertex(vr),
+                        ..
+                    }) => {
+                        let vr = *vr;
+                        let is_anchor =
+                            matches!(vr.kind, PointKind::SubpathStart | PointKind::Endpoint);
+
+                        ui.label(
+                            egui::RichText::new(if is_anchor { "Vertex" } else { "Control Point" })
+                                .strong(),
+                        );
+                        ui.separator();
+
+                        if is_anchor {
+                            // Vertex mode buttons
+                            use vector_geom::VertexMode;
+                            let current_mode = state.scene.get(vr.node).and_then(|n| {
+                                if let NodeData::Path { ref path, .. } = n.data {
+                                    let sp = path.subpaths.get(vr.subpath)?;
+                                    let idx = match vr.kind {
+                                        PointKind::SubpathStart => 0,
+                                        PointKind::Endpoint => vr.segment + 1,
+                                        _ => return None,
+                                    };
+                                    sp.vertex_modes.get(idx).copied()
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if let Some(current) = current_mode {
+                                for (mode, label) in [
+                                    (VertexMode::Corner, "Corner"),
+                                    (VertexMode::Smooth, "Smooth"),
+                                    (VertexMode::Symmetric, "Symmetric"),
+                                ] {
+                                    let is_active = current == mode;
+                                    if ui.selectable_label(is_active, label).clicked() && !is_active
+                                    {
+                                        action = Some(CanvasContextAction::SetVertexMode(vr, mode));
+                                        close = true;
+                                    }
+                                }
+                                ui.separator();
+                            }
+
+                            if ui.button("Delete Vertex").clicked() {
+                                action = Some(CanvasContextAction::DeleteVertex(vr));
+                                close = true;
+                            }
+                        }
+                    }
+                    Some(CanvasContextMenu {
+                        target: CanvasContextTarget::Segment(hit),
+                        ..
+                    }) => {
+                        let hit = hit.clone();
+                        let seg_kind = SelectState::segment_type(&state.scene, &hit);
+
+                        ui.label(egui::RichText::new("Segment").strong());
+                        ui.separator();
+
+                        if let Some(kind) = seg_kind {
+                            use vector_tools::SegmentKind;
+                            for (target, label) in [
+                                (SegmentKind::Line, "Line"),
+                                (SegmentKind::Quad, "Quadratic"),
+                                (SegmentKind::Cubic, "Cubic"),
+                            ] {
+                                let is_active = kind == target;
+                                if ui.selectable_label(is_active, label).clicked() && !is_active {
+                                    action = Some(CanvasContextAction::ConvertSegment(
+                                        hit.clone(),
+                                        target,
+                                    ));
+                                    close = true;
+                                }
+                            }
+                            ui.separator();
+                        }
+
+                        if ui.button("Insert Vertex").clicked() {
+                            action = Some(CanvasContextAction::InsertVertex(hit));
+                            close = true;
+                        }
+                    }
+                    None => {}
+                }
+            });
+        });
+
+    // Close the menu if the user clicks anywhere outside it.
+    let menu_rect = area_resp.response.rect;
+    if ctx.input(|i| i.pointer.any_pressed()) {
+        let pointer_over_menu = ctx
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| menu_rect.contains(p));
+        if !pointer_over_menu {
+            close = true;
+        }
+    }
+
+    // Dismiss on Escape.
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        close = true;
+    }
+
+    // Apply the action after borrowing is released.
+    if let Some(action) = action {
+        apply_canvas_context_action(state, renderer, action);
+    }
+
+    if close {
+        state.canvas_context_menu = None;
+    }
+}
+
+/// Deferred action from a canvas context menu click.
+enum CanvasContextAction {
+    SetVertexMode(VertexRef, vector_geom::VertexMode),
+    DeleteVertex(VertexRef),
+    ConvertSegment(EdgeHit, vector_tools::SegmentKind),
+    InsertVertex(EdgeHit),
+}
+
+fn apply_canvas_context_action(
+    state: &mut EditorState,
+    renderer: &mut Renderer,
+    action: CanvasContextAction,
+) {
+    match action {
+        CanvasContextAction::SetVertexMode(vr, mode) => {
+            // Snapshot for undo.
+            if let Some(node) = state.scene.get(vr.node)
+                && let NodeData::Path { ref path, .. } = node.data
+            {
+                state.history.record_undo(Command::SetPathData {
+                    id: vr.node,
+                    path: path.clone(),
+                });
+            }
+            SelectState::set_vertex_mode(&mut state.scene, &vr, mode);
+            renderer.mark_dirty();
+        }
+        CanvasContextAction::DeleteVertex(vr) => {
+            // Select the vertex and delete via the existing method.
+            state.select_state.selected.clear();
+            state.select_state.selected.push(vr);
+            // Snapshot for undo.
+            if let Some(node) = state.scene.get(vr.node)
+                && let NodeData::Path { ref path, .. } = node.data
+            {
+                state.history.record_undo(Command::SetPathData {
+                    id: vr.node,
+                    path: path.clone(),
+                });
+            }
+            state
+                .select_state
+                .delete_selected_vertices(&mut state.scene);
+            renderer.mark_dirty();
+        }
+        CanvasContextAction::ConvertSegment(hit, kind) => {
+            // Snapshot for undo.
+            if let Some(node) = state.scene.get(hit.node)
+                && let NodeData::Path { ref path, .. } = node.data
+            {
+                state.history.record_undo(Command::SetPathData {
+                    id: hit.node,
+                    path: path.clone(),
+                });
+            }
+            let changed = match kind {
+                vector_tools::SegmentKind::Line => {
+                    SelectState::convert_segment_to_line(&mut state.scene, &hit)
+                }
+                vector_tools::SegmentKind::Quad => {
+                    SelectState::convert_segment_to_quad(&mut state.scene, &hit)
+                }
+                vector_tools::SegmentKind::Cubic => {
+                    SelectState::convert_segment_to_cubic(&mut state.scene, &hit)
+                }
+                vector_tools::SegmentKind::Arc => false, // no conversion to arc yet
+            };
+            if changed {
+                renderer.mark_dirty();
+            }
+        }
+        CanvasContextAction::InsertVertex(hit) => {
+            // Snapshot for undo.
+            if let Some(node) = state.scene.get(hit.node)
+                && let NodeData::Path { ref path, .. } = node.data
+            {
+                state.history.record_undo(Command::SetPathData {
+                    id: hit.node,
+                    path: path.clone(),
+                });
+            }
+            if let Some(vr) = SelectState::insert_point_on_edge(&mut state.scene, &hit) {
+                state.select_state.selected.clear();
+                state.select_state.selected.push(vr);
+                renderer.mark_dirty();
+            }
+        }
+    }
+}
+
 /// UI layout — uses begin_pass/end_pass with Panel::show on the Context directly,
 /// so the canvas area is NOT part of any egui Ui. This lets
 /// `is_pointer_over_egui()` return false for the canvas.
 ///
-/// Returns (reorder_command, scene_dirty) from the structure panel.
+/// Returns (structure_commands, scene_dirty) from the structure panel.
 #[expect(deprecated)] // Panel::show is deprecated in 0.34 but needed for top-level panels
 fn run_ui(
     ctx: &egui::Context,
     state: &mut EditorState,
     renderer: &mut Renderer,
-) -> (ReorderCommand, bool) {
+) -> (StructureCommands, bool) {
     let scene = &mut state.scene;
     let history = &mut state.history;
     let active_tool = &mut state.active_tool;
     let selection = &mut state.select_state;
     let pen_state = &mut state.pen_state;
+    let text_tool = &mut state.text_tool;
     let pending_zoom_to_fit = &mut state.pending_zoom_to_fit;
     let snap = &mut state.snap;
+    let checker_fixed_size = &mut state.checker_fixed_size;
     let mut dump_requested = false;
     let mut reorder_cmd: ReorderCommand = None;
+    let mut structure_cmds: StructureCommands = Vec::new();
     let mut scene_dirty = false;
     let mut open_requested = false;
     let mut save_requested = false;
@@ -1266,6 +1789,8 @@ fn run_ui(
                             .suffix(" px"),
                     );
                 });
+                ui.separator();
+                ui.checkbox(checker_fixed_size, "Fixed-size checkerboard");
             });
             ui.menu_button("Debug", |ui| {
                 if ui.button("Dump layout").clicked() {
@@ -1304,6 +1829,29 @@ fn run_ui(
                                 _ => {}
                             }
                         }
+                        // Commit text edit if switching away from text tool.
+                        if *active_tool == ToolType::Text
+                            && tool != ToolType::Text
+                            && text_tool.is_editing()
+                        {
+                            let action = text_tool.commit(scene);
+                            match action {
+                                TextAction::Committed(node_id, original) => {
+                                    history.record_undo(Command::SetTextData {
+                                        id: node_id,
+                                        text: original,
+                                    });
+                                    selection.selected_nodes.clear();
+                                    selection.selected_nodes.push(node_id);
+                                    renderer.mark_dirty();
+                                }
+                                TextAction::Cancelled => {
+                                    selection.selected_nodes.clear();
+                                    renderer.mark_dirty();
+                                }
+                                _ => {}
+                            }
+                        }
                         *active_tool = tool;
                     }
                 }
@@ -1335,7 +1883,34 @@ fn run_ui(
 
             // Structure — bottom half (scene graph tree)
             let structure_resp = egui::CentralPanel::default().show_inside(ui, |ui| {
-                ui.heading("Structure");
+                ui.horizontal(|ui| {
+                    ui.heading("Structure");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(egui_phosphor::regular::FOLDER_PLUS)
+                            .on_hover_text("New Group")
+                            .clicked()
+                        {
+                            structure_cmds.push(StructureAction::NewGroup {
+                                parent: scene.root(),
+                            });
+                        }
+                        // "Group Selection" button — enabled when ≥1 node selected
+                        let has_selection = !selection.selected_nodes.is_empty();
+                        if ui
+                            .add_enabled(
+                                has_selection,
+                                egui::Button::new(egui_phosphor::regular::SELECTION_ALL).small(),
+                            )
+                            .on_hover_text("Group Selection")
+                            .clicked()
+                        {
+                            structure_cmds.push(StructureAction::GroupSelection {
+                                nodes: selection.selected_nodes.clone(),
+                            });
+                        }
+                    });
+                });
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("structure_scroll")
@@ -1351,6 +1926,7 @@ fn run_ui(
                                 &children,
                                 selection,
                                 &mut reorder_cmd,
+                                &mut structure_cmds,
                                 &mut scene_dirty,
                             );
                         }
@@ -1456,7 +2032,164 @@ fn run_ui(
         }
     }
 
-    (reorder_cmd, scene_dirty)
+    // Convert drag-and-drop reorder to a structure action.
+    if let Some((node_id, new_parent, index)) = reorder_cmd {
+        structure_cmds.push(StructureAction::Reparent {
+            id: node_id,
+            new_parent,
+            index,
+        });
+    }
+
+    (structure_cmds, scene_dirty)
+}
+
+/// Apply a structural action from the structure panel to the scene,
+/// recording undo history as appropriate.
+fn apply_structure_action(action: StructureAction, state: &mut EditorState) {
+    use vector_scene::Node;
+
+    match action {
+        StructureAction::Reparent {
+            id,
+            new_parent,
+            index,
+        } => {
+            let cmd = Command::Reparent {
+                id,
+                new_parent,
+                index,
+            };
+            state.history.execute(cmd, &mut state.scene);
+        }
+        StructureAction::NewGroup { parent } => {
+            let cmd = Command::Insert {
+                parent,
+                index: None,
+                node: Box::new(Node::group("Group")),
+            };
+            state.history.execute(cmd, &mut state.scene);
+        }
+        StructureAction::GroupSelection { nodes } => {
+            if nodes.is_empty() {
+                return;
+            }
+            // Find the common parent of all selected nodes.
+            // Use the first node's parent as the group target.
+            let Some(parent) = state.scene.parent(nodes[0]) else {
+                return;
+            };
+
+            // Find the lowest index among selected nodes so the group
+            // appears at the position of the first selected node.
+            let mut min_index = usize::MAX;
+            for &nid in &nodes {
+                if state.scene.parent(nid) != Some(parent) {
+                    // For simplicity, only group siblings. If they have
+                    // different parents, just use the first node's parent.
+                    continue;
+                }
+                if let Some(idx) = state.scene.child_index(nid) {
+                    min_index = min_index.min(idx);
+                }
+            }
+            if min_index == usize::MAX {
+                min_index = 0;
+            }
+
+            // Insert the group first, then reparent each node into it.
+            // We need stepwise execution because Batch doesn't expose
+            // the inserted NodeId.
+            let group_cmd = Command::Insert {
+                parent,
+                index: Some(min_index),
+                node: Box::new(Node::group("Group")),
+            };
+            state.history.execute(group_cmd, &mut state.scene);
+
+            // The new group is at `min_index` in `parent`'s children.
+            let Some(parent_node) = state.scene.get(parent) else {
+                return;
+            };
+            let Some(&group_id) = parent_node.children.get(min_index) else {
+                return;
+            };
+
+            // Now reparent each selected node into the group.
+            // Collect reparent commands into a batch so undo is atomic.
+            let mut reparent_cmds = Vec::new();
+            for (i, &nid) in nodes.iter().enumerate() {
+                // Skip the defs node or root.
+                if nid == state.scene.root() || nid == state.scene.defs() {
+                    continue;
+                }
+                reparent_cmds.push(Command::Reparent {
+                    id: nid,
+                    new_parent: group_id,
+                    index: i,
+                });
+            }
+            if !reparent_cmds.is_empty() {
+                state
+                    .history
+                    .execute(Command::Batch(reparent_cmds), &mut state.scene);
+            }
+
+            // Select the new group.
+            state.select_state.selected_nodes.clear();
+            state.select_state.selected_nodes.push(group_id);
+        }
+        StructureAction::Ungroup { group } => {
+            let Some(group_node) = state.scene.get(group) else {
+                return;
+            };
+            // Only ungroup actual groups (not defs).
+            if !matches!(group_node.data, NodeData::Group { is_defs: false }) {
+                return;
+            }
+            let children: Vec<NodeId> = group_node.children.clone();
+            if children.is_empty() {
+                // Just delete the empty group.
+                state
+                    .history
+                    .execute(Command::Delete { id: group }, &mut state.scene);
+                return;
+            }
+
+            let Some(parent) = state.scene.parent(group) else {
+                return;
+            };
+            let group_index = state.scene.child_index(group).unwrap_or(0);
+
+            // Reparent each child to the group's parent, at sequential indices
+            // starting from the group's current position.
+            let mut reparent_cmds = Vec::new();
+            for (i, &child) in children.iter().enumerate() {
+                reparent_cmds.push(Command::Reparent {
+                    id: child,
+                    new_parent: parent,
+                    index: group_index + i,
+                });
+            }
+            reparent_cmds.push(Command::Delete { id: group });
+
+            state
+                .history
+                .execute(Command::Batch(reparent_cmds), &mut state.scene);
+
+            // Select the ungrouped children.
+            state.select_state.selected_nodes = children;
+        }
+        StructureAction::Delete { id } => {
+            if id == state.scene.root() || id == state.scene.defs() {
+                return;
+            }
+            state
+                .history
+                .execute(Command::Delete { id }, &mut state.scene);
+            state.select_state.selected_nodes.retain(|&n| n != id);
+        }
+    }
 }
 
 // ── Color conversion helpers ─────────────────────────────────────────
@@ -1480,14 +2213,7 @@ fn combined_bounds(scene: &Scene, node_ids: &[NodeId]) -> vector_geom::Bounds {
     for &id in node_ids {
         if let Some(node) = scene.get(id) {
             let world = scene.world_transform(id);
-            let b = match &node.data {
-                NodeData::Path { path, .. } => path.bounding_box().transform(world),
-                NodeData::Text(text) => {
-                    vector_text::text_bounds(&text.content, &text.font_family, text.font_size)
-                        .transform(world)
-                }
-                _ => vector_geom::Bounds::EMPTY,
-            };
+            let b = node.data.visual_bounds(world);
             if !b.is_empty() {
                 combined = combined.union(b);
             }
@@ -1517,6 +2243,30 @@ fn show_properties(
         ui.add_space(2.0);
     }
 
+    // ── Name field (single selection) ──
+    if node_ids.len() == 1
+        && let Some(node) = scene.get(node_ids[0])
+    {
+        let mut label = node.label.clone();
+        let (icon, default_name) = node_display(node);
+        let hint = default_name.clone();
+        ui.horizontal(|ui| {
+            ui.label(format!("{icon} Name"));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut label)
+                    .hint_text(hint)
+                    .desired_width(ui.available_width()),
+            );
+            if resp.changed() {
+                if let Some(n) = scene.get_mut(node_ids[0]) {
+                    n.label = label;
+                }
+                renderer.mark_dirty();
+            }
+        });
+        ui.add_space(2.0);
+    }
+
     // ── Transform / Geometry section ──
     {
         use vector_tools::SelectionMode;
@@ -1533,10 +2283,16 @@ fn show_properties(
                     SelectionMode::Object => {
                         let bounds = combined_bounds(scene, &node_ids);
                         // Position from the first selected node's transform.
-                        let (tx, ty) = scene
+                        let (orig_tx, orig_ty) = scene
                             .get(node_ids[0])
                             .map(|n| (n.transform.tx, n.transform.ty))
                             .unwrap_or((0.0, 0.0));
+                        let mut new_tx = orig_tx as f32;
+                        let mut new_ty = orig_ty as f32;
+                        let orig_w = bounds.width() as f32;
+                        let orig_h = bounds.height() as f32;
+                        let mut new_w = orig_w;
+                        let mut new_h = orig_h;
 
                         egui::Grid::new("transform_grid")
                             .num_columns(4)
@@ -1544,13 +2300,13 @@ fn show_properties(
                             .show(ui, |ui| {
                                 ui.label("X");
                                 ui.add(
-                                    egui::DragValue::new(&mut (tx as f32))
+                                    egui::DragValue::new(&mut new_tx)
                                         .speed(0.5)
                                         .fixed_decimals(1),
                                 );
                                 ui.label("Y");
                                 ui.add(
-                                    egui::DragValue::new(&mut (ty as f32))
+                                    egui::DragValue::new(&mut new_ty)
                                         .speed(0.5)
                                         .fixed_decimals(1),
                                 );
@@ -1559,30 +2315,154 @@ fn show_properties(
                                 if !bounds.is_empty() {
                                     ui.label("W");
                                     ui.add(
-                                        egui::DragValue::new(&mut (bounds.width() as f32))
+                                        egui::DragValue::new(&mut new_w)
                                             .speed(0.5)
-                                            .fixed_decimals(1),
+                                            .fixed_decimals(1)
+                                            .range(0.001..=f32::INFINITY),
                                     );
                                     ui.label("H");
                                     ui.add(
-                                        egui::DragValue::new(&mut (bounds.height() as f32))
+                                        egui::DragValue::new(&mut new_h)
                                             .speed(0.5)
-                                            .fixed_decimals(1),
+                                            .fixed_decimals(1)
+                                            .range(0.001..=f32::INFINITY),
                                     );
                                     ui.end_row();
                                 }
                             });
+
+                        // Rotation field (single selection only — multi-select
+                        // rotation from properties is ambiguous).
+                        if node_ids.len() == 1 {
+                            let orig_deg = scene
+                                .get(node_ids[0])
+                                .map(|n| n.transform.rotation_deg())
+                                .unwrap_or(0.0);
+                            let mut new_deg = orig_deg as f32;
+
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{} Rotation",
+                                    egui_phosphor::regular::ARROW_CLOCKWISE
+                                ));
+                                ui.add(
+                                    egui::DragValue::new(&mut new_deg)
+                                        .speed(0.5)
+                                        .fixed_decimals(1)
+                                        .suffix("°"),
+                                );
+                            });
+
+                            if (new_deg - orig_deg as f32).abs() > 1e-4 {
+                                let node_id = node_ids[0];
+                                if let Some(node) = scene.get(node_id) {
+                                    let old_transform = node.transform;
+                                    // Decompose → recompose with new angle.
+                                    // We rotate around the node's bounding box center.
+                                    let world = scene.world_transform(node_id);
+                                    let node_bounds = node.data.visual_bounds(world);
+                                    let center = if !node_bounds.is_empty() {
+                                        vector_geom::Point::new(
+                                            (node_bounds.min.x + node_bounds.max.x) * 0.5,
+                                            (node_bounds.min.y + node_bounds.max.y) * 0.5,
+                                        )
+                                    } else {
+                                        vector_geom::Point::new(old_transform.tx, old_transform.ty)
+                                    };
+
+                                    let delta_rad = (new_deg as f64 - orig_deg).to_radians();
+                                    let rot = Affine::rotate_around(delta_rad, center);
+                                    let parent_world = scene.parent_world_transform(node_id);
+                                    let new_world = rot.then(parent_world.then(old_transform));
+                                    if let Some(inv_parent) = parent_world.inverse() {
+                                        let new_local = inv_parent.then(new_world);
+                                        history.record_undo(Command::SetTransform {
+                                            id: node_id,
+                                            transform: old_transform,
+                                        });
+                                        if let Some(n) = scene.get_mut(node_id) {
+                                            n.transform = new_local;
+                                        }
+                                        renderer.mark_dirty();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Apply position changes.
+                        let pos_changed = (new_tx - orig_tx as f32).abs() > 1e-6
+                            || (new_ty - orig_ty as f32).abs() > 1e-6;
+                        if pos_changed {
+                            let dx = new_tx as f64 - orig_tx;
+                            let dy = new_ty as f64 - orig_ty;
+                            let mut undo_cmds = Vec::new();
+                            for &node_id in &node_ids {
+                                if let Some(node) = scene.get(node_id) {
+                                    undo_cmds.push(Command::SetTransform {
+                                        id: node_id,
+                                        transform: node.transform,
+                                    });
+                                }
+                            }
+                            for &node_id in &node_ids {
+                                if let Some(node) = scene.get_mut(node_id) {
+                                    node.transform.tx += dx;
+                                    node.transform.ty += dy;
+                                }
+                            }
+                            if undo_cmds.len() == 1 {
+                                history.record_undo(undo_cmds.into_iter().next().unwrap());
+                            } else if !undo_cmds.is_empty() {
+                                history.record_undo(Command::Batch(undo_cmds));
+                            }
+                            renderer.mark_dirty();
+                        }
+
+                        // Apply size changes (scale around object's bounds center).
+                        let size_changed = !bounds.is_empty()
+                            && ((new_w - orig_w).abs() > 1e-6 || (new_h - orig_h).abs() > 1e-6);
+                        if size_changed && node_ids.len() == 1 {
+                            let sx = if orig_w.abs() > 1e-6 {
+                                new_w as f64 / orig_w as f64
+                            } else {
+                                1.0
+                            };
+                            let sy = if orig_h.abs() > 1e-6 {
+                                new_h as f64 / orig_h as f64
+                            } else {
+                                1.0
+                            };
+                            let node_id = node_ids[0];
+                            if let Some(node) = scene.get(node_id) {
+                                let old_transform = node.transform;
+                                // Scale the transform: multiply a/b by sx, c/d by sy.
+                                // This scales the node's local coordinate system.
+                                let mut new_transform = old_transform;
+                                new_transform.a *= sx;
+                                new_transform.b *= sx;
+                                new_transform.c *= sy;
+                                new_transform.d *= sy;
+                                history.record_undo(Command::SetTransform {
+                                    id: node_id,
+                                    transform: old_transform,
+                                });
+                                if let Some(node) = scene.get_mut(node_id) {
+                                    node.transform = new_transform;
+                                }
+                                renderer.mark_dirty();
+                            }
+                        }
                     }
                     SelectionMode::Node => {
                         if selection.selected.len() == 1 {
                             // Single vertex — show its world-space position.
-                            let vref = &selection.selected[0];
+                            let vref = selection.selected[0];
                             if let Some(local_pos) = vref.get_position(scene) {
                                 let world = scene.world_transform(vref.node);
                                 let wp = world.apply(local_pos);
 
-                                // Show vertex mode for the anchor this point
-                                // belongs to.
+                                // Show vertex mode toggle buttons for the
+                                // anchor this point belongs to.
                                 if let Some(node) = scene.get(vref.node)
                                     && let NodeData::Path { ref path, .. } = node.data
                                     && let Some(subpath) = path.subpaths.get(vref.subpath)
@@ -1595,15 +2475,46 @@ fn show_properties(
                                         PointKind::CubicCtrl1 | PointKind::QuadCtrl => vref.segment,
                                         PointKind::CubicCtrl2 => vref.segment + 1,
                                     };
-                                    if let Some(mode) = subpath.vertex_modes.get(mode_idx) {
-                                        let mode_name = match mode {
-                                            VertexMode::Corner => "Corner",
-                                            VertexMode::Smooth => "Smooth",
-                                            VertexMode::Symmetric => "Symmetric",
-                                        };
-                                        ui.small(format!("Mode: {mode_name}"));
+                                    if let Some(current_mode) =
+                                        subpath.vertex_modes.get(mode_idx).copied()
+                                    {
+                                        let mut mode_changed = None;
+                                        ui.horizontal(|ui| {
+                                            for (mode, label) in [
+                                                (VertexMode::Corner, "Corner"),
+                                                (VertexMode::Smooth, "Smooth"),
+                                                (VertexMode::Symmetric, "Symmetric"),
+                                            ] {
+                                                let is_active = current_mode == mode;
+                                                if ui.selectable_label(is_active, label).clicked()
+                                                    && !is_active
+                                                {
+                                                    mode_changed = Some(mode);
+                                                }
+                                            }
+                                        });
+                                        if let Some(new_mode) = mode_changed {
+                                            // Snapshot path for undo before
+                                            // changing the mode.
+                                            if let Some(node) = scene.get(vref.node)
+                                                && let NodeData::Path { ref path, .. } = node.data
+                                            {
+                                                history.record_undo(Command::SetPathData {
+                                                    id: vref.node,
+                                                    path: path.clone(),
+                                                });
+                                            }
+                                            if SelectState::set_vertex_mode(scene, &vref, new_mode)
+                                                .is_some()
+                                            {
+                                                renderer.mark_dirty();
+                                            }
+                                        }
                                     }
                                 }
+
+                                let mut vx = wp.x as f32;
+                                let mut vy = wp.y as f32;
 
                                 egui::Grid::new("vertex_grid")
                                     .num_columns(4)
@@ -1611,21 +2522,47 @@ fn show_properties(
                                     .show(ui, |ui| {
                                         ui.label("X");
                                         ui.add(
-                                            egui::DragValue::new(&mut (wp.x as f32))
+                                            egui::DragValue::new(&mut vx)
                                                 .speed(0.5)
                                                 .fixed_decimals(1),
                                         );
                                         ui.label("Y");
                                         ui.add(
-                                            egui::DragValue::new(&mut (wp.y as f32))
+                                            egui::DragValue::new(&mut vy)
                                                 .speed(0.5)
                                                 .fixed_decimals(1),
                                         );
                                         ui.end_row();
                                     });
+
+                                // Apply vertex position change.
+                                let vtx_changed = (vx - wp.x as f32).abs() > 1e-6
+                                    || (vy - wp.y as f32).abs() > 1e-6;
+                                if vtx_changed {
+                                    // Convert new world position to local delta.
+                                    let new_world = vector_geom::Point::new(vx as f64, vy as f64);
+                                    if let Some(inv_world) = world.inverse() {
+                                        let new_local = inv_world.apply(new_world);
+                                        let dx = new_local.x - local_pos.x;
+                                        let dy = new_local.y - local_pos.y;
+
+                                        // Snapshot path for undo.
+                                        if let Some(node) = scene.get(vref.node)
+                                            && let NodeData::Path { ref path, .. } = node.data
+                                        {
+                                            history.record_undo(Command::SetPathData {
+                                                id: vref.node,
+                                                path: path.clone(),
+                                            });
+                                        }
+
+                                        vref.translate(scene, dx, dy);
+                                        renderer.mark_dirty();
+                                    }
+                                }
                             }
                         } else if selection.selected.len() > 1 {
-                            // Multiple vertices — show the bounding box of the selection.
+                            // Multiple vertices — show the bounding box of the selection (read-only).
                             let mut sel_bounds = vector_geom::Bounds::EMPTY;
                             for vref in &selection.selected {
                                 if let Some(local_pos) = vref.get_position(scene) {
@@ -1887,6 +2824,7 @@ fn node_display(node: &vector_scene::Node) -> (&'static str, String) {
 ///
 /// `parent_id` is the parent whose children we're rendering. Each child gets a
 /// drop slot before it, plus one final slot after the last child.
+#[expect(clippy::too_many_arguments)]
 fn show_children(
     ui: &mut egui::Ui,
     scene: &mut Scene,
@@ -1894,13 +2832,22 @@ fn show_children(
     children: &[vector_scene::NodeId],
     selection: &mut SelectState,
     reorder_cmd: &mut ReorderCommand,
+    structure_cmds: &mut StructureCommands,
     scene_dirty: &mut bool,
 ) {
     for (i, &child_id) in children.iter().enumerate() {
         // Drop slot before this child (insert at index i)
         drop_slot(ui, parent_id, i, reorder_cmd);
         // The node itself
-        show_scene_node(ui, scene, child_id, selection, reorder_cmd, scene_dirty);
+        show_scene_node(
+            ui,
+            scene,
+            child_id,
+            selection,
+            reorder_cmd,
+            structure_cmds,
+            scene_dirty,
+        );
     }
     // Final drop slot after last child
     drop_slot(ui, parent_id, children.len(), reorder_cmd);
@@ -1968,6 +2915,93 @@ fn visibility_button(ui: &mut egui::Ui, visible: bool) -> bool {
         .clicked()
 }
 
+/// Context menu for a scene node in the structure panel.
+fn node_context_menu(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    is_group: bool,
+    is_defs: bool,
+    selection: &SelectState,
+    structure_cmds: &mut StructureCommands,
+) {
+    if !is_defs {
+        // "Add Group Inside" — only for groups
+        if is_group
+            && ui
+                .button(format!(
+                    "{} Add Group Inside",
+                    egui_phosphor::regular::FOLDER_PLUS
+                ))
+                .clicked()
+        {
+            structure_cmds.push(StructureAction::NewGroup { parent: node_id });
+            ui.close();
+        }
+
+        // "Group Selection" — when multiple nodes are selected
+        if selection.selected_nodes.len() > 1
+            && ui
+                .button(format!(
+                    "{} Group Selection",
+                    egui_phosphor::regular::SELECTION_ALL
+                ))
+                .clicked()
+        {
+            structure_cmds.push(StructureAction::GroupSelection {
+                nodes: selection.selected_nodes.clone(),
+            });
+            ui.close();
+        }
+
+        // "Ungroup" — only for non-defs groups
+        if is_group
+            && ui
+                .button(format!("{} Ungroup", egui_phosphor::regular::FOLDER_MINUS))
+                .clicked()
+        {
+            structure_cmds.push(StructureAction::Ungroup { group: node_id });
+            ui.close();
+        }
+
+        ui.separator();
+
+        // "Delete"
+        if ui
+            .button(format!("{} Delete", egui_phosphor::regular::TRASH))
+            .clicked()
+        {
+            structure_cmds.push(StructureAction::Delete { id: node_id });
+            ui.close();
+        }
+    }
+}
+
+/// Handle a click on a node in the structure panel.
+///
+/// With `additive` (Shift or Ctrl/Cmd held), the node is toggled in the
+/// selection — added if not present, removed if already selected.
+/// Without a modifier the selection is replaced with just this node.
+fn structure_panel_click(
+    selection: &mut SelectState,
+    node_id: vector_scene::NodeId,
+    additive: bool,
+) {
+    selection.selected.clear();
+    selection.mode = vector_tools::SelectionMode::Object;
+
+    if additive {
+        // Toggle: remove if already selected, otherwise add
+        if let Some(idx) = selection.selected_nodes.iter().position(|n| *n == node_id) {
+            selection.selected_nodes.remove(idx);
+        } else {
+            selection.selected_nodes.push(node_id);
+        }
+    } else {
+        selection.selected_nodes.clear();
+        selection.selected_nodes.push(node_id);
+    }
+}
+
 /// Recursively render a scene node and its children in the structure panel.
 /// Each node is a drag source for reordering; clicking selects the node.
 fn show_scene_node(
@@ -1976,6 +3010,7 @@ fn show_scene_node(
     node_id: vector_scene::NodeId,
     selection: &mut SelectState,
     reorder_cmd: &mut ReorderCommand,
+    structure_cmds: &mut StructureCommands,
     scene_dirty: &mut bool,
 ) {
     use vector_scene::NodeData;
@@ -2060,6 +3095,7 @@ fn show_scene_node(
                             &children,
                             selection,
                             reorder_cmd,
+                            structure_cmds,
                             scene_dirty,
                         );
                     });
@@ -2067,14 +3103,25 @@ fn show_scene_node(
                     // Make the header row a drag source; click to select
                     let header_resp = resp.header_response;
                     if header_resp.clicked() {
-                        selection.selected_nodes.clear();
-                        selection.selected_nodes.push(node_id);
-                        selection.selected.clear();
-                        selection.mode = vector_tools::SelectionMode::Object;
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                        structure_panel_click(selection, node_id, shift || ctrl);
                     } else if header_resp.drag_started() {
                         egui::DragAndDrop::set_payload(ui.ctx(), node_id);
                         ui.ctx().set_dragged_id(drag_id);
                     }
+
+                    // Context menu on group header
+                    header_resp.context_menu(|ui| {
+                        node_context_menu(
+                            ui,
+                            node_id,
+                            is_group,
+                            is_defs,
+                            selection,
+                            structure_cmds,
+                        );
+                    });
                 });
             }
         } else {
@@ -2093,6 +3140,7 @@ fn show_scene_node(
                     &children,
                     selection,
                     reorder_cmd,
+                    structure_cmds,
                     scene_dirty,
                 );
             });
@@ -2156,15 +3204,25 @@ fn show_scene_node(
                     );
 
                     if response.clicked() {
-                        // Click to select this node (replace selection)
-                        selection.selected_nodes.clear();
-                        selection.selected_nodes.push(node_id);
-                        selection.selected.clear();
-                        selection.mode = vector_tools::SelectionMode::Object;
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                        structure_panel_click(selection, node_id, shift || ctrl);
                     } else if response.drag_started() {
                         egui::DragAndDrop::set_payload(ui.ctx(), node_id);
                         ui.ctx().set_dragged_id(drag_id);
                     }
+
+                    // Context menu on leaf node
+                    response.context_menu(|ui| {
+                        node_context_menu(
+                            ui,
+                            node_id,
+                            is_group,
+                            is_defs,
+                            selection,
+                            structure_cmds,
+                        );
+                    });
                 });
             }
         } else {

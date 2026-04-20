@@ -1,5 +1,5 @@
 use vector_geom::{Affine, Path};
-use vector_scene::{NodeId, NodeSnapshot, Scene, Style};
+use vector_scene::{NodeId, NodeSnapshot, Scene, Style, TextData};
 
 /// A reversible editing command. Each variant knows how to apply
 /// itself and produce an undo command.
@@ -23,8 +23,16 @@ pub enum Command {
     SetPathData { id: NodeId, path: Path },
     /// Replace the style of a path node.
     SetStyle { id: NodeId, style: Style },
+    /// Replace the text data of a text node.
+    SetTextData { id: NodeId, text: TextData },
     /// Replace the transform of a node.
     SetTransform { id: NodeId, transform: Affine },
+    /// Move a node to a new parent at a given index.
+    Reparent {
+        id: NodeId,
+        new_parent: NodeId,
+        index: usize,
+    },
     /// Batch of commands applied atomically.
     Batch(Vec<Command>),
 }
@@ -87,10 +95,36 @@ impl Command {
                 let old = std::mem::replace(current, style);
                 Some(Command::SetStyle { id, style: old })
             }
+            Command::SetTextData { id, text } => {
+                let node = scene.get_mut(id)?;
+                let vector_scene::NodeData::Text(ref mut current) = node.data else {
+                    return None;
+                };
+                let old = std::mem::replace(current, text);
+                Some(Command::SetTextData { id, text: old })
+            }
             Command::SetTransform { id, transform } => {
                 let node = scene.get_mut(id)?;
                 let old = std::mem::replace(&mut node.transform, transform);
                 Some(Command::SetTransform { id, transform: old })
+            }
+            Command::Reparent {
+                id,
+                new_parent,
+                index,
+            } => {
+                // Capture old parent and index for undo.
+                let old_parent = scene.parent(id)?;
+                let old_index = scene.child_index(id).unwrap_or(0);
+                if scene.reparent(id, new_parent, index) {
+                    Some(Command::Reparent {
+                        id,
+                        new_parent: old_parent,
+                        index: old_index,
+                    })
+                } else {
+                    None
+                }
             }
             Command::Batch(cmds) => {
                 let mut undos: Vec<Command> = Vec::new();

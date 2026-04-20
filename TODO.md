@@ -23,12 +23,27 @@
 - [x] Fix egui text selection — disabled selectable_labels, use is_pointer_over_egui() for canvas hover suppression
 - [x] Cubic handle creation on mode switch — Lines upgraded to Cubics with handles at 1/3 segment length, closed-path wrap-around
 - [x] Pattern rendering — Pattern paint type in scene graph, render-to-texture pipeline (per-tile rasterization into texture array, fragment shader sampling), SVG import/export with deduplication, nested pattern support with topological ordering and cycle detection (per SVG spec)
+- [x] SVG import smooth junction detection — post-pass on imported subpaths detects collinear ctrl2/ctrl1 pairs at junctions, classifies as Smooth (collinear, different lengths) or Symmetric (collinear + equidistant), handles closed-path wrap-around
+- [x] Vertex constraint enforcement on closed-path wrap-around during drag — enforce_vertex_constraint now wraps segment indices on closed paths (first↔last segment pair)
+
+- [x] Properties panel editable fields — DragValue widgets wired to scene: Object mode X/Y (translate), W/H (scale), Node mode vertex X/Y (local-space delta via inverse world transform), all with undo support
+- [x] Object transforms from properties panel — dragging X/Y moves objects, dragging W/H scales (single selection), undo via SetTransform commands
+
+- [x] Text tool — click to create/edit text, typing with cursor, backspace/delete, arrow keys, Home/End, Enter/Escape to commit, undo/redo support, caret rendering, I-beam cursor icon
+
+- [x] Structure panel — context menu (right-click): New Group, Group Selection, Ungroup, Delete; "Add Group" and "Group Selection" buttons in header; drag-and-drop reparent through undo system
+- [x] Node renaming — editable Name field in Properties panel for any selected node
+- [x] Rotation — interactive rotation via corner zone outside bbox, properties panel rotation field (degrees), `Affine::rotate_around` for rotation about center
+- [x] Scale handles — 8-handle bbox pattern (4 corners + 4 edge midpoints), absolute scale from original transforms, resize cursors per handle direction
 
 ## Pending
-- [ ] Properties panel editable fields — DragValue widgets for X/Y/W/H currently read-only; need to wire mutations to scene + undo
-- [ ] SVG import smooth junction detection — detect collinear ctrl2/ctrl1 pairs at junctions and set VertexMode::Smooth
-- [ ] Vertex constraint enforcement on closed-path wrap-around during drag — enforce_vertex_constraint doesn't handle the last↔first segment pair
-- [ ] Text tool — text editing, cursor, font selection UI
-- [ ] Object transforms from properties panel — dragging X/Y/W/H should move/resize objects
-- [ ] Multi-select in structure panel — Shift/Ctrl+click for additive selection
+- [ ] Flatten/bake transforms — manual action to push non-translate transform into vertices (paths) or font size (text), leaving transform as translate-only
+- [ ] Text tool — font selection UI in properties panel (ComboBox with system fonts)
+- [ ] Text tool — text selection (Shift+arrow, click-drag)
+- [ ] Text tool — multi-line text support
+- [x] Multi-select in structure panel — Shift/Ctrl+click for additive selection (toggle behavior matching canvas)
+- [x] Vertex mode toggle buttons in properties panel — Corner/Smooth/Symmetric selectable_labels replacing text display
+- [x] Quad→Cubic upgrade in ensure_cubic_handles — degree elevation when switching vertex mode from Corner
+- [x] Canvas context menus — right-click on vertex (mode toggle + delete) or segment (Line/Quad/Cubic conversion + insert vertex)
+- [x] Segment type conversion — convert_segment_to_line/quad/cubic with undo support
 - [ ] Snap to points/vertices — snap to existing geometry, not just grid
