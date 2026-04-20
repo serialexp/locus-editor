@@ -717,34 +717,30 @@ impl ApplicationHandler for App {
 
         match event {
             // Resize is never consumed by egui, but always relevant
-            WindowEvent::Resized(size) => {
-                if size.width > 0 && size.height > 0 {
-                    gpu.surface_config.width = size.width;
-                    gpu.surface_config.height = size.height;
-                    gpu.surface.configure(&gpu.device, &gpu.surface_config);
-                    gpu.renderer.resize(size.width as f32, size.height as f32);
-                    gpu.window.request_redraw();
-                }
+            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+                gpu.surface_config.width = size.width;
+                gpu.surface_config.height = size.height;
+                gpu.surface.configure(&gpu.device, &gpu.surface_config);
+                gpu.renderer.resize(size.width as f32, size.height as f32);
+                gpu.window.request_redraw();
             }
-            WindowEvent::DroppedFile(path) => {
-                if path.extension().is_some_and(|e| e == "svg") {
-                    match std::fs::read(&path) {
-                        Ok(data) => match vector_svg::import_svg(&data) {
-                            Ok(scene) => {
-                                self.state.scene = scene;
-                                self.state.history = History::new();
-                                self.state.select_state = SelectState::default();
-                                self.state.pending_zoom_to_fit = true;
-                                if let Some(gpu) = &mut self.gpu {
-                                    gpu.renderer.mark_dirty();
-                                    gpu.window.request_redraw();
-                                }
-                                log::info!("Loaded SVG: {}", path.display());
+            WindowEvent::DroppedFile(path) if path.extension().is_some_and(|e| e == "svg") => {
+                match std::fs::read(&path) {
+                    Ok(data) => match vector_svg::import_svg(&data) {
+                        Ok(scene) => {
+                            self.state.scene = scene;
+                            self.state.history = History::new();
+                            self.state.select_state = SelectState::default();
+                            self.state.pending_zoom_to_fit = true;
+                            if let Some(gpu) = &mut self.gpu {
+                                gpu.renderer.mark_dirty();
+                                gpu.window.request_redraw();
                             }
-                            Err(e) => log::error!("Failed to import SVG: {e}"),
-                        },
-                        Err(e) => log::error!("Failed to read file: {e}"),
-                    }
+                            log::info!("Loaded SVG: {}", path.display());
+                        }
+                        Err(e) => log::error!("Failed to import SVG: {e}"),
+                    },
+                    Err(e) => log::error!("Failed to read file: {e}"),
                 }
             }
             // --- Canvas input events: guard with wants_pointer/wants_keyboard ---
@@ -1036,55 +1032,49 @@ impl ApplicationHandler for App {
                                 }
                             }
                         }
-                        MouseButton::Right => {
-                            if state == ElementState::Pressed {
-                                if self.state.active_tool == ToolType::Pen {
-                                    // Pen tool: undo last pen point.
-                                    let action =
-                                        self.state.pen_state.undo_last(&mut self.state.scene);
-                                    self.state.handle_pen_action(action, &mut gpu.renderer);
-                                    gpu.window.request_redraw();
-                                } else if self.state.active_tool == ToolType::Select
-                                    && let Some(cursor) = self.state.cursor_pos
-                                {
-                                    // Select tool: open context menu on vertex or segment.
-                                    let canvas =
-                                        self.state.camera.screen_to_canvas(cursor[0], cursor[1]);
-                                    let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
-                                    let zoom = self.state.camera.zoom as f64;
-                                    let screen_pos = egui::Pos2::new(cursor[0], cursor[1]);
-                                    let nodes = &self.state.select_state.selected_nodes;
+                        MouseButton::Right if state == ElementState::Pressed => {
+                            if self.state.active_tool == ToolType::Pen {
+                                // Pen tool: undo last pen point.
+                                let action = self.state.pen_state.undo_last(&mut self.state.scene);
+                                self.state.handle_pen_action(action, &mut gpu.renderer);
+                                gpu.window.request_redraw();
+                            } else if self.state.active_tool == ToolType::Select
+                                && let Some(cursor) = self.state.cursor_pos
+                            {
+                                // Select tool: open context menu on vertex or segment.
+                                let canvas =
+                                    self.state.camera.screen_to_canvas(cursor[0], cursor[1]);
+                                let canvas_f64 = [canvas[0] as f64, canvas[1] as f64];
+                                let zoom = self.state.camera.zoom as f64;
+                                let screen_pos = egui::Pos2::new(cursor[0], cursor[1]);
+                                let nodes = &self.state.select_state.selected_nodes;
 
-                                    if self.state.select_state.mode
-                                        == vector_tools::SelectionMode::Node
-                                        && !nodes.is_empty()
-                                    {
-                                        // Node mode: check vertex first, then edge.
-                                        if let Some(vr) = SelectState::hit_test_in_nodes(
-                                            &self.state.scene,
-                                            canvas_f64,
-                                            zoom,
-                                            nodes,
-                                        ) {
-                                            self.state.canvas_context_menu =
-                                                Some(CanvasContextMenu {
-                                                    target: CanvasContextTarget::Vertex(vr),
-                                                    screen_pos,
-                                                    first_frame: true,
-                                                });
-                                        } else if let Some(hit) = SelectState::edge_hit_test(
-                                            &self.state.scene,
-                                            canvas_f64,
-                                            zoom,
-                                            nodes,
-                                        ) {
-                                            self.state.canvas_context_menu =
-                                                Some(CanvasContextMenu {
-                                                    target: CanvasContextTarget::Segment(hit),
-                                                    screen_pos,
-                                                    first_frame: true,
-                                                });
-                                        }
+                                if self.state.select_state.mode == vector_tools::SelectionMode::Node
+                                    && !nodes.is_empty()
+                                {
+                                    // Node mode: check vertex first, then edge.
+                                    if let Some(vr) = SelectState::hit_test_in_nodes(
+                                        &self.state.scene,
+                                        canvas_f64,
+                                        zoom,
+                                        nodes,
+                                    ) {
+                                        self.state.canvas_context_menu = Some(CanvasContextMenu {
+                                            target: CanvasContextTarget::Vertex(vr),
+                                            screen_pos,
+                                            first_frame: true,
+                                        });
+                                    } else if let Some(hit) = SelectState::edge_hit_test(
+                                        &self.state.scene,
+                                        canvas_f64,
+                                        zoom,
+                                        nodes,
+                                    ) {
+                                        self.state.canvas_context_menu = Some(CanvasContextMenu {
+                                            target: CanvasContextTarget::Segment(hit),
+                                            screen_pos,
+                                            first_frame: true,
+                                        });
                                     }
                                 }
                             }
@@ -1150,134 +1140,124 @@ impl ApplicationHandler for App {
             WindowEvent::CursorLeft { .. } => {
                 self.state.cursor_pos = None;
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if !gpu.egui_ctx.egui_wants_pointer_input() {
-                    let scroll_y = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
-                    };
+            WindowEvent::MouseWheel { delta, .. } if !gpu.egui_ctx.egui_wants_pointer_input() => {
+                let scroll_y = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
+                };
 
-                    if let Some(cursor) = self.state.cursor_pos {
-                        let factor = 1.0 + scroll_y * 0.1;
-                        self.state.camera.zoom_at(factor, cursor[0], cursor[1]);
-                        gpu.window.request_redraw();
-                    }
+                if let Some(cursor) = self.state.cursor_pos {
+                    let factor = 1.0 + scroll_y * 0.1;
+                    self.state.camera.zoom_at(factor, cursor[0], cursor[1]);
+                    gpu.window.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput {
                 event: ref key_event,
                 ..
-            } => {
-                if !gpu.egui_ctx.egui_wants_keyboard_input()
-                    && key_event.state == ElementState::Pressed
-                {
-                    use winit::keyboard::{Key, NamedKey};
-                    let modifiers = gpu.egui_ctx.input(|i| i.modifiers);
-                    let ctrl = modifiers.ctrl || modifiers.mac_cmd;
+            } if !gpu.egui_ctx.egui_wants_keyboard_input()
+                && key_event.state == ElementState::Pressed =>
+            {
+                use winit::keyboard::{Key, NamedKey};
+                let modifiers = gpu.egui_ctx.input(|i| i.modifiers);
+                let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
-                    // ── Text tool editing intercept ─────────────────────
-                    // When the text tool is actively editing, route all
-                    // non-Ctrl keys to it before any other handler.
-                    let mut text_handled = false;
-                    if self.state.text_tool.is_editing() {
-                        let action = match &key_event.logical_key {
-                            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
-                                self.state.text_tool.commit(&mut self.state.scene)
-                            }
-                            Key::Named(NamedKey::Backspace) if !ctrl => {
-                                self.state.text_tool.on_backspace(&mut self.state.scene)
-                            }
-                            Key::Named(NamedKey::Delete) if !ctrl => {
-                                self.state.text_tool.on_delete(&mut self.state.scene)
-                            }
-                            Key::Named(NamedKey::ArrowLeft) => self.state.text_tool.move_left(),
-                            Key::Named(NamedKey::ArrowRight) => {
-                                self.state.text_tool.move_right(&self.state.scene)
-                            }
-                            Key::Named(NamedKey::Home) => self.state.text_tool.move_home(),
-                            Key::Named(NamedKey::End) => {
-                                self.state.text_tool.move_end(&self.state.scene)
-                            }
-                            Key::Named(NamedKey::Space) if !ctrl => {
-                                self.state.text_tool.on_char(&mut self.state.scene, " ")
-                            }
-                            Key::Character(c) if !ctrl => self
-                                .state
-                                .text_tool
-                                .on_char(&mut self.state.scene, c.as_str()),
-                            _ => TextAction::None,
-                        };
-                        text_handled = !matches!(action, TextAction::None);
-                        self.state.handle_text_action(action, &mut gpu.renderer);
-                        if text_handled {
+                // ── Text tool editing intercept ─────────────────────
+                // When the text tool is actively editing, route all
+                // non-Ctrl keys to it before any other handler.
+                let mut text_handled = false;
+                if self.state.text_tool.is_editing() {
+                    let action = match &key_event.logical_key {
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                            self.state.text_tool.commit(&mut self.state.scene)
+                        }
+                        Key::Named(NamedKey::Backspace) if !ctrl => {
+                            self.state.text_tool.on_backspace(&mut self.state.scene)
+                        }
+                        Key::Named(NamedKey::Delete) if !ctrl => {
+                            self.state.text_tool.on_delete(&mut self.state.scene)
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => self.state.text_tool.move_left(),
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.state.text_tool.move_right(&self.state.scene)
+                        }
+                        Key::Named(NamedKey::Home) => self.state.text_tool.move_home(),
+                        Key::Named(NamedKey::End) => {
+                            self.state.text_tool.move_end(&self.state.scene)
+                        }
+                        Key::Named(NamedKey::Space) if !ctrl => {
+                            self.state.text_tool.on_char(&mut self.state.scene, " ")
+                        }
+                        Key::Character(c) if !ctrl => self
+                            .state
+                            .text_tool
+                            .on_char(&mut self.state.scene, c.as_str()),
+                        _ => TextAction::None,
+                    };
+                    text_handled = !matches!(action, TextAction::None);
+                    self.state.handle_text_action(action, &mut gpu.renderer);
+                    if text_handled {
+                        gpu.window.request_redraw();
+                    }
+                }
+
+                if !text_handled {
+                    match &key_event.logical_key {
+                        // Undo: Ctrl+Z (no shift)
+                        Key::Character(c)
+                            if (c.as_str() == "z" || c.as_str() == "Z")
+                                    && ctrl
+                                    && !modifiers.shift
+                                    // Don't undo while a tool is actively building.
+                                    && !self.state.pen_state.is_building()
+                                    && !self.state.shape_draw.is_drawing()
+                                    && !self.state.text_tool.is_editing()
+                                    && self.state.history.can_undo() =>
+                        {
+                            self.state.undo();
+                            gpu.renderer.mark_dirty();
                             gpu.window.request_redraw();
                         }
-                    }
-
-                    if !text_handled {
-                        match &key_event.logical_key {
-                            // Undo: Ctrl+Z (no shift)
-                            Key::Character(c)
-                                if (c.as_str() == "z" || c.as_str() == "Z")
-                                    && ctrl
-                                    && !modifiers.shift =>
-                            {
-                                // Don't undo while a tool is actively building.
-                                if !self.state.pen_state.is_building()
-                                    && !self.state.shape_draw.is_drawing()
-                                    && !self.state.text_tool.is_editing()
-                                    && self.state.history.can_undo()
-                                {
-                                    self.state.undo();
-                                    gpu.renderer.mark_dirty();
-                                    gpu.window.request_redraw();
-                                }
-                            }
-                            // Redo: Ctrl+Shift+Z or Ctrl+Y
-                            Key::Character(c)
-                                if ((c.as_str() == "z" || c.as_str() == "Z")
-                                    && modifiers.shift
-                                    || (c.as_str() == "y" || c.as_str() == "Y")
-                                        && !modifiers.shift)
-                                    && ctrl =>
-                            {
-                                if !self.state.pen_state.is_building()
-                                    && !self.state.shape_draw.is_drawing()
-                                    && !self.state.text_tool.is_editing()
-                                    && self.state.history.can_redo()
-                                {
-                                    self.state.redo();
-                                    gpu.renderer.mark_dirty();
-                                    gpu.window.request_redraw();
-                                }
-                            }
-                            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
-                                if self.state.active_tool == ToolType::Pen
-                                    && self.state.pen_state.is_building()
-                                {
-                                    let action =
-                                        self.state.pen_state.finish(&mut self.state.scene, false);
-                                    self.state.handle_pen_action(action, &mut gpu.renderer);
-                                    gpu.window.request_redraw();
-                                } else if self.state.active_tool == ToolType::Select
-                                    && self.state.select_state.mode
-                                        == vector_tools::SelectionMode::Node
-                                {
-                                    self.state.select_state.exit_node_mode();
-                                    gpu.window.request_redraw();
-                                }
-                            }
-                            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
-                                if self.state.active_tool == ToolType::Select {
-                                    let deleted = self.state.delete_with_undo();
-                                    if deleted {
-                                        gpu.renderer.mark_dirty();
-                                        gpu.window.request_redraw();
-                                    }
-                                }
-                            }
-                            _ => {}
+                        // Redo: Ctrl+Shift+Z or Ctrl+Y
+                        Key::Character(c)
+                            if ((c.as_str() == "z" || c.as_str() == "Z") && modifiers.shift
+                                || (c.as_str() == "y" || c.as_str() == "Y")
+                                    && !modifiers.shift)
+                                && ctrl
+                                && !self.state.pen_state.is_building()
+                                && !self.state.shape_draw.is_drawing()
+                                && !self.state.text_tool.is_editing()
+                                && self.state.history.can_redo() =>
+                        {
+                            self.state.redo();
+                            gpu.renderer.mark_dirty();
+                            gpu.window.request_redraw();
                         }
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                            if self.state.active_tool == ToolType::Pen
+                                && self.state.pen_state.is_building()
+                            {
+                                let action =
+                                    self.state.pen_state.finish(&mut self.state.scene, false);
+                                self.state.handle_pen_action(action, &mut gpu.renderer);
+                                gpu.window.request_redraw();
+                            } else if self.state.active_tool == ToolType::Select
+                                && self.state.select_state.mode == vector_tools::SelectionMode::Node
+                            {
+                                self.state.select_state.exit_node_mode();
+                                gpu.window.request_redraw();
+                            }
+                        }
+                        Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace)
+                            if self.state.active_tool == ToolType::Select =>
+                        {
+                            let deleted = self.state.delete_with_undo();
+                            if deleted {
+                                gpu.renderer.mark_dirty();
+                                gpu.window.request_redraw();
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
