@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "vector-editor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "egui-phosphor",
@@ -3456,7 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "vector-geom"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "kurbo 0.11.3",
@@ -3465,7 +3465,7 @@ dependencies = [
 
 [[package]]
 name = "vector-ops"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "vector-geom",
  "vector-scene",
@@ -3473,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "vector-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "log",
@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "vector-scene"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "slotmap",
@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "vector-svg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "usvg",
@@ -3509,7 +3509,7 @@ dependencies = [
 
 [[package]]
 name = "vector-tess"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "lyon_geom",
@@ -3520,7 +3520,7 @@ dependencies = [
 
 [[package]]
 name = "vector-text"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fontdb",
  "log",
@@ -3531,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "vector-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui-phosphor",
  "vector-geom",
