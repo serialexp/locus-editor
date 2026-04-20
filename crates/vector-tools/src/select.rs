@@ -1437,27 +1437,23 @@ impl SelectState {
             };
 
             match vr.kind {
-                PointKind::SubpathStart => {
+                PointKind::SubpathStart if !subpath.segments.is_empty() => {
                     // Move start to the first segment's endpoint and remove
                     // that segment.
-                    if !subpath.segments.is_empty() {
-                        subpath.start = subpath.segments[0].endpoint();
-                        subpath.segments.remove(0);
-                        // Remove the start point's mode, shift the next one
-                        // into position 0 (it becomes the new start).
-                        if subpath.vertex_modes.len() > 1 {
-                            subpath.vertex_modes.remove(0);
-                        }
+                    subpath.start = subpath.segments[0].endpoint();
+                    subpath.segments.remove(0);
+                    // Remove the start point's mode, shift the next one
+                    // into position 0 (it becomes the new start).
+                    if subpath.vertex_modes.len() > 1 {
+                        subpath.vertex_modes.remove(0);
                     }
                 }
-                PointKind::Endpoint => {
-                    if vr.segment < subpath.segments.len() {
-                        subpath.segments.remove(vr.segment);
-                        // vertex_modes index for this endpoint is vr.segment + 1.
-                        let mode_idx = vr.segment + 1;
-                        if mode_idx < subpath.vertex_modes.len() {
-                            subpath.vertex_modes.remove(mode_idx);
-                        }
+                PointKind::Endpoint if vr.segment < subpath.segments.len() => {
+                    subpath.segments.remove(vr.segment);
+                    // vertex_modes index for this endpoint is vr.segment + 1.
+                    let mode_idx = vr.segment + 1;
+                    if mode_idx < subpath.vertex_modes.len() {
+                        subpath.vertex_modes.remove(mode_idx);
                     }
                 }
                 _ => {}
