@@ -20,7 +20,7 @@
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::single::SingleFloatOverlay;
-use vector_geom::{Affine, Path, Point, Segment, SubPath, VertexMode};
+use vector_geom::{Affine, Bounds, Path, Point, Segment, SubPath, VertexMode};
 use vector_scene::{BoolOp, GroupKind, NodeData, NodeId, Scene};
 
 /// Tolerance for curve flattening, in world-space units. Small enough that
@@ -294,6 +294,74 @@ pub fn compute_boolean_group_path(scene: &Scene, group_id: NodeId) -> Path {
     apply(op, &operands)
 }
 
+/// Visual bounds for a Boolean group in world space, including the group's
+/// own stroke expansion. The baked path lives in the group's local space,
+/// so we compute its tight local AABB (with stroke) and transform by the
+/// group's world transform.
+///
+/// Returns `Bounds::EMPTY` if `group_id` is not a Boolean group or has no
+/// path descendants.
+pub fn boolean_group_visual_bounds(scene: &Scene, group_id: NodeId, world: Affine) -> Bounds {
+    let Some(group_node) = scene.get(group_id) else {
+        return Bounds::EMPTY;
+    };
+    let NodeData::Group {
+        kind: GroupKind::Boolean { style, .. },
+        ..
+    } = &group_node.data
+    else {
+        return Bounds::EMPTY;
+    };
+    let computed = compute_boolean_group_path(scene, group_id);
+    if computed.subpaths.is_empty() {
+        return Bounds::EMPTY;
+    }
+    let has_fill = style.fill.is_some();
+    let stroke_params = style.stroke.as_ref().map(|s| s.style.bounds_params());
+    let local = vector_tess::path_visual_bounds(&computed, has_fill, stroke_params.as_ref());
+    local.transform(world)
+}
+
+/// Bounding box over all visible rendered content in a scene, short-circuiting
+/// at Boolean groups (so they contribute the tight bounds of their baked
+/// computed path, not the naive union of their operands).
+///
+/// This is the boolean-group-aware analogue of `Scene::content_bounds` —
+/// prefer it wherever accurate fit-to-content matters (SVG viewBox export,
+/// zoom-to-fit), since the naive descendant union can be significantly
+/// looser than the real result for Intersect / Difference groups.
+pub fn scene_content_bounds(scene: &Scene) -> Bounds {
+    let mut bounds = Bounds::EMPTY;
+    scene.walk_depth_first(scene.root(), Affine::IDENTITY, &mut |id, node, world| {
+        if !node.visible {
+            return false;
+        }
+        // Skip defs subtree entirely — not rendered.
+        if let NodeData::Group { is_defs: true, .. } = node.data {
+            return false;
+        }
+        // Boolean group: use the baked path's visual bounds and do not
+        // recurse into the (individually-invisible) operand children.
+        if let NodeData::Group {
+            kind: GroupKind::Boolean { .. },
+            ..
+        } = &node.data
+        {
+            let nb = boolean_group_visual_bounds(scene, id, world);
+            if !nb.is_empty() {
+                bounds = bounds.union(nb);
+            }
+            return false;
+        }
+        let nb = node.data.visual_bounds(world);
+        if !nb.is_empty() {
+            bounds = bounds.union(nb);
+        }
+        true
+    });
+    bounds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +466,67 @@ mod tests {
         );
         // XOR of two overlapping squares: two disjoint regions.
         assert_eq!(result.subpaths.len(), 2);
+    }
+
+    #[test]
+    fn scene_content_bounds_uses_tight_intersect_bounds() {
+        // Two 10x10 squares overlapping by 5 on x, wrapped in a Boolean
+        // Intersect group. The naive descendant-union would span 0..15;
+        // the baked intersect result is only 5..10 on x. The
+        // boolean-aware `scene_content_bounds` must return the tight
+        // result — otherwise SVG export and zoom-to-fit waste space.
+        use vector_scene::Node;
+
+        let mut scene = Scene::new();
+        let root = scene.root();
+
+        let group_id = scene
+            .insert(root, Node::group("bool"))
+            .expect("insert group");
+        // Convert to a Boolean::Intersect group.
+        if let Some(node) = scene.get_mut(group_id) {
+            node.data = NodeData::Group {
+                is_defs: false,
+                kind: GroupKind::Boolean {
+                    op: BoolOp::Intersect,
+                    style: vector_scene::Style::default(),
+                },
+            };
+        }
+
+        scene
+            .insert(group_id, Node::path("a", square(0.0, 0.0, 10.0)))
+            .expect("insert a");
+        scene
+            .insert(group_id, Node::path("b", square(5.0, 0.0, 10.0)))
+            .expect("insert b");
+
+        let bounds = scene_content_bounds(&scene);
+        assert!(!bounds.is_empty());
+        // Tight intersect: x ∈ [5, 10], y ∈ [0, 10]. Allow tiny slack for
+        // flattening + stroke-expansion (the default path style has no
+        // stroke but a solid fill, so the tessellator's AABB matches the
+        // geometry to within float noise).
+        assert!(
+            (bounds.min.x - 5.0).abs() < 1e-3,
+            "min.x = {}",
+            bounds.min.x
+        );
+        assert!(
+            (bounds.max.x - 10.0).abs() < 1e-3,
+            "max.x = {}",
+            bounds.max.x
+        );
+        assert!(
+            (bounds.min.y - 0.0).abs() < 1e-3,
+            "min.y = {}",
+            bounds.min.y
+        );
+        assert!(
+            (bounds.max.y - 10.0).abs() < 1e-3,
+            "max.y = {}",
+            bounds.max.y
+        );
     }
 
     #[test]

@@ -9,7 +9,9 @@ use vector_scene::{
 
 /// Export a scene graph to an SVG string.
 pub fn export_svg(scene: &Scene) -> String {
-    let bounds = scene.content_bounds();
+    // Use the boolean-group-aware content bounds so Intersect/Difference
+    // groups contribute their tight baked bounds, not their operand union.
+    let bounds = vector_bool::scene_content_bounds(scene);
     let (vx, vy, vw, vh) = if bounds.is_empty() {
         (0.0, 0.0, 800.0, 600.0)
     } else {

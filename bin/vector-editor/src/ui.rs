@@ -88,7 +88,7 @@ pub(crate) fn run_ui(
                 let sel_count = selection.selected_nodes.len();
                 let enabled = sel_count >= 2;
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Union"))
+                    .add_enabled(enabled, egui::Button::new("Union  Ctrl++"))
                     .on_hover_text("Combine selected paths into one Boolean(Union) group")
                     .clicked()
                 {
@@ -99,7 +99,7 @@ pub(crate) fn run_ui(
                     ui.close();
                 }
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Difference"))
+                    .add_enabled(enabled, egui::Button::new("Difference  Ctrl+-"))
                     .on_hover_text(
                         "Subtract upper paths from the lowest selected path (Boolean group)",
                     )
@@ -112,7 +112,7 @@ pub(crate) fn run_ui(
                     ui.close();
                 }
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Intersect"))
+                    .add_enabled(enabled, egui::Button::new("Intersect  Ctrl+*"))
                     .on_hover_text("Keep the overlapping region of the selected paths")
                     .clicked()
                 {
@@ -123,7 +123,7 @@ pub(crate) fn run_ui(
                     ui.close();
                 }
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Exclude (XOR)"))
+                    .add_enabled(enabled, egui::Button::new("Exclude (XOR)  Ctrl+^"))
                     .on_hover_text("Keep the symmetric difference of the selected paths")
                     .clicked()
                 {

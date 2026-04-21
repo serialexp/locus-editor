@@ -3949,6 +3949,7 @@ dependencies = [
  "lyon_geom",
  "vector-geom",
  "vector-scene",
+ "vector-tess",
 ]
 
 [[package]]

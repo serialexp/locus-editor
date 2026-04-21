@@ -14,7 +14,7 @@ use vector_tools::{SelectState, TextAction, ToolType};
 use crate::context_menu::show_canvas_context_menu;
 use crate::demo::create_demo_content;
 use crate::editor_state::{CanvasContextMenu, CanvasContextTarget, EditorState};
-use crate::structure_panel::apply_structure_action;
+use crate::structure_panel::{StructureAction, apply_structure_action};
 use crate::ui::run_ui;
 
 /// Classification of a file dropped onto the window.
@@ -765,6 +765,37 @@ impl ApplicationHandler for App {
                                 gpu.window.request_redraw();
                             }
                         }
+                        // ── Boolean group keybindings (Inkscape-style) ──
+                        //  Ctrl+ +  or  Ctrl+ =   → Union
+                        //  Ctrl+ -               → Difference
+                        //  Ctrl+ *               → Intersect
+                        //  Ctrl+ ^               → Exclude (XOR)
+                        // "=" is accepted as an unshifted alias for "+" so
+                        // the binding works on US layouts without Shift.
+                        // Requires ≥2 selected nodes; no-op otherwise.
+                        Key::Character(c)
+                            if ctrl
+                                && !self.state.pen_state.is_building()
+                                && !self.state.shape_draw.is_drawing()
+                                && !self.state.text_tool.is_editing()
+                                && self.state.select_state.selected_nodes.len() >= 2
+                                && matches!(c.as_str(), "+" | "=" | "-" | "*" | "^") =>
+                        {
+                            let op = match c.as_str() {
+                                "+" | "=" => vector_scene::BoolOp::Union,
+                                "-" => vector_scene::BoolOp::Difference,
+                                "*" => vector_scene::BoolOp::Intersect,
+                                "^" => vector_scene::BoolOp::Exclude,
+                                _ => unreachable!(),
+                            };
+                            let nodes = self.state.select_state.selected_nodes.clone();
+                            apply_structure_action(
+                                StructureAction::MakeBooleanGroup { nodes, op },
+                                &mut self.state,
+                            );
+                            gpu.renderer.mark_dirty();
+                            gpu.window.request_redraw();
+                        }
                         _ => {}
                     }
                 }
@@ -839,7 +870,7 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     // Handle pending zoom-to-fit (e.g. after loading an SVG).
     if state.pending_zoom_to_fit {
         state.pending_zoom_to_fit = false;
-        let bounds = state.scene.content_bounds();
+        let bounds = vector_bool::scene_content_bounds(&state.scene);
         state.camera.zoom_to_fit(bounds, state.canvas_rect);
     }
 

@@ -8,5 +8,6 @@ authors.workspace = true
 [dependencies]
 vector-geom = { path = "../vector-geom" }
 vector-scene = { path = "../vector-scene" }
+vector-tess = { path = "../vector-tess" }
 i_overlay = "4"
 lyon_geom = { workspace = true }

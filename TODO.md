@@ -52,9 +52,9 @@
 - [ ] Align & distribute panel — align selection left/center/right/top/middle/bottom, distribute with equal spacing. Uses existing `combined_bounds`.
 - [x] Boolean path operations — non-destructive boolean groups (`GroupKind::Boolean { op, style }`) via new `vector-bool` crate wrapping `i_overlay`. Union / Difference / Intersect / Exclude; operands preserved as children, result recomputes on edit. Path menu actions + properties-panel op combo + Flatten-to-path. SVG export bakes to a single `<path>` with `data-vector-boolean-op` attribute.
 - [ ] Boolean groups: cache per-group computed path, invalidate on descendant path/transform edits (currently recomputed every frame; part of the broader per-path tess caching work below).
-- [ ] Boolean groups: `content_bounds` returns the naive descendant-union for boolean groups instead of the computed-path bounds — harmless overestimate for "fit-to-content" but worth fixing when we add the per-group cache.
+- [x] Boolean groups: boolean-group-aware `vector_bool::scene_content_bounds` — short-circuits at Boolean groups and returns the tight baked-path bounds (with the group's stroke expansion). Used by SVG viewBox export and zoom-to-fit. `Scene::content_bounds` remains the naive fallback for contexts without the vector-bool dep.
 - [ ] Boolean groups: curve fidelity — result is all `Line` segments (polyline approximation at 0.1 tolerance). Add an optional post-pass refit to cubics for round-trippable curves.
-- [ ] Boolean groups: Inkscape-style keybindings (Ctrl+ + / − / * / ^).
+- [x] Boolean groups: Inkscape-style keybindings — Ctrl++ / Ctrl+= (Union), Ctrl+- (Difference), Ctrl+* (Intersect), Ctrl+^ (Exclude). Requires ≥2 selected nodes. Wired directly into the winit key handler; menu labels show the shortcut.
 - [ ] Boolean groups: allow `Text` nodes as operands (auto-convert to path on evaluation).
 - [ ] Convert stroke to path — outline the stroked region as a fillable path. Reuses the stroke-tessellation machinery in `vector-tess`.
 - [ ] Zoom-to-fit and zoom-to-selection — bind to `1` and `3` (Inkscape convention). Uses `Scene::content_bounds` and `combined_bounds`.
