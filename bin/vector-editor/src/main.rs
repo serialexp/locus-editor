@@ -1,4 +1,14 @@
 mod app;
+mod camera;
+mod context_menu;
+mod demo;
+mod editor_state;
+mod hud;
+mod properties_panel;
+mod snap;
+mod structure_panel;
+mod ui;
+mod util;
 
 use app::App;
 

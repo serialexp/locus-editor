@@ -48,6 +48,21 @@
 - [x] Segment type conversion — convert_segment_to_line/quad/cubic with undo support
 - [ ] Snap to points/vertices — snap to existing geometry, not just grid
 
+### Editor features users expect
+- [ ] Align & distribute panel — align selection left/center/right/top/middle/bottom, distribute with equal spacing. Uses existing `combined_bounds`.
+- [ ] Boolean path operations — union, intersection, difference, exclusion. Via `lyon_path` or `i_overlay`.
+- [ ] Convert stroke to path — outline the stroked region as a fillable path. Reuses the stroke-tessellation machinery in `vector-tess`.
+- [ ] Zoom-to-fit and zoom-to-selection — bind to `1` and `3` (Inkscape convention). Uses `Scene::content_bounds` and `combined_bounds`.
+- [ ] Layers as first-class concept — a layer is a group with a UI role (name, lock, solo). Structure-panel affordance + `is_layer` flag on groups.
+
+### Performance
+- [ ] Gate `build_handles` on selection/scene change — currently rebuilt every frame even when nothing changed, wasteful under continuous redraw.
+- [ ] Cache `flatten_tree` output — currently re-flattened every frame; invalidate only when scene or `structure_collapse` changes.
+- [ ] Per-path tessellation cache — avoid re-tessellating the whole scene on any single-path edit. Key on `(NodeId, Path, Style)`, invalidate in command application.
+
+### Architecture
+- [x] Split `bin/vector-editor/src/app.rs` (3491 → 986 lines) into focused modules: camera, demo, snap, util, hud, editor_state, context_menu, structure_panel, properties_panel, ui.
+
 ### Raster tracing (`vector-trace`)
 - [ ] Preset/parameter tuning UI — egui dialog exposing TracePreset (Bw/Poster/Photo) and the key vtracer knobs (filter_speckle, color_precision, corner_threshold, splice_threshold, layer_difference, path simplify mode). Currently hard-coded to Poster default.
 - [ ] Async tracing — run `vector_trace::trace_image_bytes` off the UI thread (std::thread + channel, or a simple worker). Large images block the UI for seconds.
