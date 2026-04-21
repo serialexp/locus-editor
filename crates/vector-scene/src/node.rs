@@ -27,16 +27,56 @@ pub struct Node {
     pub locked: bool,
 }
 
+/// The kind of a group — either a plain container, or a non-destructive
+/// boolean compound whose rendered geometry is the computed op over its
+/// descendant paths.
+///
+/// For boolean groups the group itself owns a `Style` (applied to the
+/// computed result); the individual child paths' styles are ignored while
+/// the group is in Boolean mode, but preserved so switching back to
+/// `Regular` restores them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum GroupKind {
+    /// Ordinary group — children render independently in order.
+    #[default]
+    Regular,
+    /// Non-destructive boolean compound. The group renders as a single
+    /// shape computed from descendant path geometry under `op`, styled
+    /// with `style`. Children remain individually editable.
+    Boolean { op: BoolOp, style: Style },
+}
+
+/// The boolean operation applied to a `GroupKind::Boolean`'s descendants.
+///
+/// `Union`, `Intersect`, and `Exclude` are symmetric and n-ary (order
+/// doesn't matter). `Difference` is asymmetric: the bottom-most descendant
+/// in z-order is the base, and every other descendant is subtracted from
+/// it — so things stacked on top visually cut holes in what's below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BoolOp {
+    Union,
+    Difference,
+    Intersect,
+    Exclude,
+}
+
 /// The payload that distinguishes node types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeData {
-    /// A group — just a container with a transform.
-    /// Also used for SVG `<defs>` (a non-rendered group)
-    /// and patterns (a group referenced as a paint tile).
+    /// A group — a container with a transform, and optionally a boolean-op
+    /// kind that makes the group render as a computed shape over its
+    /// descendants rather than as a plain container.
+    ///
+    /// Also used for SVG `<defs>` (a non-rendered group) and patterns (a
+    /// group referenced as a paint tile).
     Group {
         /// If true, this group's contents are not rendered directly.
         /// They exist only to be referenced (gradients, patterns, symbols).
         is_defs: bool,
+        /// Whether this group behaves as a plain container or as a
+        /// non-destructive boolean compound (union/difference/intersect/
+        /// exclude over descendant path geometry).
+        kind: GroupKind,
     },
 
     /// A vector path with fill/stroke styling.
@@ -107,7 +147,10 @@ impl Node {
         Self {
             label: label.into(),
             transform: Affine::IDENTITY,
-            data: NodeData::Group { is_defs: false },
+            data: NodeData::Group {
+                is_defs: false,
+                kind: GroupKind::Regular,
+            },
             children: Vec::new(),
             visible: true,
             locked: false,
@@ -245,7 +288,10 @@ mod tests {
 
     #[test]
     fn visual_bounds_group_returns_empty() {
-        let node = NodeData::Group { is_defs: false };
+        let node = NodeData::Group {
+            is_defs: false,
+            kind: GroupKind::Regular,
+        };
         let b = node.visual_bounds(Affine::IDENTITY);
         assert!(b.is_empty());
     }

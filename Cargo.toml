@@ -7,6 +7,7 @@ members = [
     "crates/vector-tess",
     "crates/vector-render",
     "crates/vector-ops",
+    "crates/vector-bool",
     "crates/vector-tools",
     "crates/vector-trace",
     "bin/vector-editor",

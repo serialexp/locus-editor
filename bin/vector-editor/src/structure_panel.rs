@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use vector_ops::Command;
-use vector_scene::{NodeData, NodeId, Scene};
+use vector_scene::{BoolOp, GroupKind, NodeData, NodeId, Scene, Style};
 use vector_tools::SelectState;
 
 use crate::editor_state::EditorState;
@@ -35,6 +35,15 @@ pub(crate) enum StructureAction {
     Ungroup { group: NodeId },
     /// Delete a node.
     Delete { id: NodeId },
+    /// Wrap the selected nodes in a new Boolean group with the given op.
+    /// The resulting group renders as a single computed shape over its
+    /// descendants.
+    MakeBooleanGroup { nodes: Vec<NodeId>, op: BoolOp },
+    /// Change the `BoolOp` on an existing Boolean group.
+    SetBooleanOp { group: NodeId, op: BoolOp },
+    /// Replace a Boolean group with a single Path node containing the
+    /// baked computed geometry. Destroys the original operand children.
+    FlattenBooleanGroup { group: NodeId },
 }
 
 /// A single flattened row in the structure panel tree view.
@@ -87,7 +96,7 @@ fn flatten_recurse(
         return;
     };
 
-    let is_defs = matches!(&node.data, NodeData::Group { is_defs: true });
+    let is_defs = matches!(&node.data, NodeData::Group { is_defs: true, .. });
     let is_group = matches!(&node.data, NodeData::Group { .. });
     // Preserve current behavior: defs is rendered as a leaf — its children
     // (gradients, patterns) aren't shown in the structure panel.
@@ -496,7 +505,7 @@ pub(crate) fn apply_structure_action(action: StructureAction, state: &mut Editor
                 return;
             };
             // Only ungroup actual groups (not defs).
-            if !matches!(group_node.data, NodeData::Group { is_defs: false }) {
+            if !matches!(group_node.data, NodeData::Group { is_defs: false, .. }) {
                 return;
             }
             let children: Vec<NodeId> = group_node.children.clone();
@@ -541,5 +550,191 @@ pub(crate) fn apply_structure_action(action: StructureAction, state: &mut Editor
                 .execute(Command::Delete { id }, &mut state.scene);
             state.select_state.selected_nodes.retain(|&n| n != id);
         }
+        StructureAction::MakeBooleanGroup { nodes, op } => {
+            if nodes.is_empty() {
+                return;
+            }
+            let Some(parent) = state.scene.parent(nodes[0]) else {
+                return;
+            };
+
+            // Pick an insertion index — the minimum index among the
+            // selected siblings of `parent`.
+            let mut min_index = usize::MAX;
+            for &nid in &nodes {
+                if state.scene.parent(nid) != Some(parent) {
+                    continue;
+                }
+                if let Some(idx) = state.scene.child_index(nid) {
+                    min_index = min_index.min(idx);
+                }
+            }
+            if min_index == usize::MAX {
+                min_index = 0;
+            }
+
+            // Inherit the style of the bottom-most Path descendant among
+            // the selected nodes — that's the visual "base" the user
+            // sees shine through after the op. Falls back to default.
+            let inherited_style = inherit_style_for_boolean(&state.scene, &nodes);
+
+            // 1) Insert a new group.
+            let group_cmd = Command::Insert {
+                parent,
+                index: Some(min_index),
+                node: Box::new(Node::group("Boolean")),
+            };
+            state.history.execute(group_cmd, &mut state.scene);
+            let Some(parent_node) = state.scene.get(parent) else {
+                return;
+            };
+            let Some(&group_id) = parent_node.children.get(min_index) else {
+                return;
+            };
+
+            // 2) Reparent selected nodes into the group, preserving their
+            //    z-order (earlier children = bottom, as in the scene).
+            let mut batch: Vec<Command> = Vec::new();
+            for (i, &nid) in nodes.iter().enumerate() {
+                if nid == state.scene.root() || nid == state.scene.defs() {
+                    continue;
+                }
+                batch.push(Command::Reparent {
+                    id: nid,
+                    new_parent: group_id,
+                    index: i,
+                });
+            }
+            // 3) Flip the group's kind to Boolean with the chosen op.
+            batch.push(Command::SetGroupKind {
+                id: group_id,
+                kind: GroupKind::Boolean {
+                    op,
+                    style: inherited_style,
+                },
+            });
+            if !batch.is_empty() {
+                state
+                    .history
+                    .execute(Command::Batch(batch), &mut state.scene);
+            }
+
+            // Select the new group.
+            state.select_state.selected_nodes.clear();
+            state.select_state.selected_nodes.push(group_id);
+        }
+        StructureAction::SetBooleanOp { group, op } => {
+            let Some(node) = state.scene.get(group) else {
+                return;
+            };
+            // Keep the existing style; only swap the op.
+            let NodeData::Group {
+                kind: GroupKind::Boolean { style, .. },
+                ..
+            } = &node.data
+            else {
+                return;
+            };
+            let new_kind = GroupKind::Boolean {
+                op,
+                style: style.clone(),
+            };
+            state.history.execute(
+                Command::SetGroupKind {
+                    id: group,
+                    kind: new_kind,
+                },
+                &mut state.scene,
+            );
+        }
+        StructureAction::FlattenBooleanGroup { group } => {
+            let Some(node) = state.scene.get(group) else {
+                return;
+            };
+            let NodeData::Group {
+                kind: GroupKind::Boolean { style, .. },
+                ..
+            } = &node.data
+            else {
+                return;
+            };
+            let style = style.clone();
+            let label = if node.label.is_empty() {
+                "Path".to_string()
+            } else {
+                node.label.clone()
+            };
+            let transform = node.transform;
+            let computed = vector_bool::compute_boolean_group_path(&state.scene, group);
+            if computed.subpaths.is_empty() {
+                // Empty result — just delete the group.
+                state
+                    .history
+                    .execute(Command::Delete { id: group }, &mut state.scene);
+                state.select_state.selected_nodes.retain(|&n| n != group);
+                return;
+            }
+
+            let Some(parent) = state.scene.parent(group) else {
+                return;
+            };
+            let index = state.scene.child_index(group).unwrap_or(0);
+
+            let mut path_node = Node::path(label, computed);
+            path_node.transform = transform;
+            if let NodeData::Path { style: s, .. } = &mut path_node.data {
+                *s = style;
+            }
+
+            // Batch: delete the group, insert the baked path in its
+            // place. Undo restores the full boolean structure.
+            let batch = Command::Batch(vec![
+                Command::Delete { id: group },
+                Command::Insert {
+                    parent,
+                    index: Some(index),
+                    node: Box::new(path_node),
+                },
+            ]);
+            state.history.execute(batch, &mut state.scene);
+
+            // Select the new path if we can find it.
+            if let Some(parent_node) = state.scene.get(parent)
+                && let Some(&new_id) = parent_node.children.get(index)
+            {
+                state.select_state.selected_nodes.clear();
+                state.select_state.selected_nodes.push(new_id);
+            }
+        }
     }
+}
+
+/// Pick a style for a new Boolean group — the style of the bottom-most
+/// Path descendant among `nodes`, or `Style::default()` if none.
+fn inherit_style_for_boolean(scene: &Scene, nodes: &[NodeId]) -> Style {
+    // `nodes` is assumed to be in the same order they appear as siblings.
+    // The first (lowest-index) path descendant is the visual base.
+    for &nid in nodes {
+        if let Some(node) = scene.get(nid) {
+            if let NodeData::Path { style, .. } = &node.data {
+                return style.clone();
+            }
+            // Recurse into groups to find the first Path descendant.
+            let mut found: Option<Style> = None;
+            scene.walk_depth_first(nid, vector_geom::Affine::IDENTITY, &mut |_id, n, _w| {
+                if found.is_some() {
+                    return false;
+                }
+                if let NodeData::Path { style, .. } = &n.data {
+                    found = Some(style.clone());
+                    return false;
+                }
+                true
+            });
+            if let Some(s) = found {
+                return s;
+            }
+        }
+    }
+    Style::default()
 }

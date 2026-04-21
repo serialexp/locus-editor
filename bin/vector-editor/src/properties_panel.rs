@@ -4,18 +4,24 @@
 use vector_geom::Affine;
 use vector_ops::{Command, History};
 use vector_render::Renderer;
-use vector_scene::{NodeData, Scene};
+use vector_scene::{BoolOp, GroupKind, NodeData, Scene};
 use vector_tools::SelectState;
 
+use crate::structure_panel::{StructureAction, StructureCommands};
 use crate::util::{color_to_egui, combined_bounds, egui_to_color, node_display};
 
 /// Show fill/stroke properties for the current selection.
+///
+/// `structure_cmds` is the deferred action queue from the structure
+/// panel — used to enqueue boolean-group op changes that must run
+/// outside the egui pass.
 pub(crate) fn show_properties(
     ui: &mut egui::Ui,
     scene: &mut Scene,
     history: &mut History,
     selection: &SelectState,
     renderer: &mut Renderer,
+    structure_cmds: &mut StructureCommands,
 ) {
     if selection.selected_nodes.is_empty() {
         ui.label("No selection");
@@ -401,11 +407,82 @@ pub(crate) fn show_properties(
             });
     }
 
-    // Read current style from the first selected path node.
+    // ── Boolean group section (shown when exactly one Boolean group is selected) ──
+    if node_ids.len() == 1 {
+        let id = node_ids[0];
+        let is_boolean = scene
+            .get(id)
+            .map(|n| {
+                matches!(
+                    &n.data,
+                    NodeData::Group {
+                        kind: GroupKind::Boolean { .. },
+                        ..
+                    }
+                )
+            })
+            .unwrap_or(false);
+        if is_boolean {
+            egui::CollapsingHeader::new(egui::RichText::new("Boolean").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    let current_op = match &scene.get(id).unwrap().data {
+                        NodeData::Group {
+                            kind: GroupKind::Boolean { op, .. },
+                            ..
+                        } => *op,
+                        _ => BoolOp::Union,
+                    };
+                    let mut op = current_op;
+                    ui.horizontal(|ui| {
+                        ui.label("Op");
+                        egui::ComboBox::from_id_salt("boolean_op_combo")
+                            .selected_text(op_label(op))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut op,
+                                    BoolOp::Union,
+                                    op_label(BoolOp::Union),
+                                );
+                                ui.selectable_value(
+                                    &mut op,
+                                    BoolOp::Difference,
+                                    op_label(BoolOp::Difference),
+                                );
+                                ui.selectable_value(
+                                    &mut op,
+                                    BoolOp::Intersect,
+                                    op_label(BoolOp::Intersect),
+                                );
+                                ui.selectable_value(
+                                    &mut op,
+                                    BoolOp::Exclude,
+                                    op_label(BoolOp::Exclude),
+                                );
+                            });
+                    });
+                    if op != current_op {
+                        structure_cmds.push(StructureAction::SetBooleanOp { group: id, op });
+                    }
+                    if ui.button("Flatten → Path").clicked() {
+                        structure_cmds.push(StructureAction::FlattenBooleanGroup { group: id });
+                    }
+                });
+        }
+    }
+
+    // Read current style from the first selected node that has one.
+    // Both Path nodes and Boolean groups carry a Style; Boolean groups
+    // take priority when mixed (single-selection Boolean group exposes
+    // its own style editors).
     let reference_style = node_ids.iter().find_map(|&id| {
         let node = scene.get(id)?;
         match &node.data {
-            vector_scene::NodeData::Path { style, .. } => Some(style.clone()),
+            NodeData::Path { style, .. } => Some(style.clone()),
+            NodeData::Group {
+                kind: GroupKind::Boolean { style, .. },
+                ..
+            } => Some(style.clone()),
             _ => None,
         }
     });
@@ -537,28 +614,57 @@ pub(crate) fn show_properties(
         // Snapshot old styles for undo.
         let mut undo_cmds = Vec::new();
         for &node_id in &node_ids {
-            if let Some(node) = scene.get(node_id)
-                && let vector_scene::NodeData::Path {
-                    style: ref old_style,
-                    ..
-                } = node.data
-            {
-                undo_cmds.push(Command::SetStyle {
-                    id: node_id,
-                    style: old_style.clone(),
-                });
+            if let Some(node) = scene.get(node_id) {
+                match &node.data {
+                    NodeData::Path {
+                        style: old_style, ..
+                    } => {
+                        undo_cmds.push(Command::SetStyle {
+                            id: node_id,
+                            style: old_style.clone(),
+                        });
+                    }
+                    NodeData::Group {
+                        kind:
+                            GroupKind::Boolean {
+                                op,
+                                style: old_style,
+                            },
+                        ..
+                    } => {
+                        undo_cmds.push(Command::SetGroupKind {
+                            id: node_id,
+                            kind: GroupKind::Boolean {
+                                op: *op,
+                                style: old_style.clone(),
+                            },
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
 
         // Apply new style.
         for &node_id in &node_ids {
-            if let Some(node) = scene.get_mut(node_id)
-                && let vector_scene::NodeData::Path {
-                    style: ref mut node_style,
-                    ..
-                } = node.data
-            {
-                *node_style = style.clone();
+            if let Some(node) = scene.get_mut(node_id) {
+                match &mut node.data {
+                    NodeData::Path {
+                        style: node_style, ..
+                    } => {
+                        *node_style = style.clone();
+                    }
+                    NodeData::Group {
+                        kind:
+                            GroupKind::Boolean {
+                                style: node_style, ..
+                            },
+                        ..
+                    } => {
+                        *node_style = style.clone();
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -570,5 +676,14 @@ pub(crate) fn show_properties(
         }
 
         renderer.mark_dirty();
+    }
+}
+
+fn op_label(op: BoolOp) -> &'static str {
+    match op {
+        BoolOp::Union => "Union",
+        BoolOp::Difference => "Difference",
+        BoolOp::Intersect => "Intersect",
+        BoolOp::Exclude => "Exclude (XOR)",
     }
 }

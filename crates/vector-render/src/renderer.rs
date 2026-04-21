@@ -892,11 +892,33 @@ impl Renderer {
 
         let root = scene.root();
         let mut path_count: u32 = 0;
-        scene.walk_depth_first(root, Affine::IDENTITY, &mut |_id, node, world_transform| {
+        scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
             if !node.visible {
                 return false;
             }
             match node.data {
+                NodeData::Group {
+                    kind: vector_scene::GroupKind::Boolean { ref style, .. },
+                    is_defs: false,
+                } => {
+                    // Non-destructive boolean group: render the computed
+                    // path with the group's own style, and skip recursion
+                    // into children (they're operands, not drawables).
+                    // TODO(perf): cache this per group, invalidate on
+                    // descendant edits.
+                    let computed = vector_bool::compute_boolean_group_path(scene, id);
+                    if !computed.subpaths.is_empty() {
+                        path_count += 1;
+                        let fill = style.fill.as_ref().map(|f| FillParams {
+                            paint: resolve_paint(&f.paint),
+                            opacity: f.opacity,
+                        });
+                        let stroke = style.stroke.as_ref().map(&resolve_stroke);
+                        let mesh = tessellate_path(&computed, fill, stroke);
+                        push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
+                    }
+                    return false;
+                }
                 NodeData::Path {
                     ref path,
                     ref style,
@@ -1312,6 +1334,16 @@ impl Renderer {
                 // Compute the world-space bounding box for this node,
                 // including the visible stroke area.
                 let bounds = match &node.data {
+                    NodeData::Group {
+                        kind: vector_scene::GroupKind::Boolean { .. },
+                        ..
+                    } => {
+                        // Boolean group: use the bounds of the computed
+                        // result path, transformed into world space.
+                        let computed = vector_bool::compute_boolean_group_path(scene, id);
+                        let local = vector_tess::path_visual_bounds(&computed, true, None);
+                        local.transform(world_transform)
+                    }
                     NodeData::Group { .. } => {
                         // For groups, walk the subtree to get the aggregate bounds.
                         let mut b = vector_geom::Bounds::EMPTY;
@@ -1402,6 +1434,14 @@ impl Renderer {
                     }
                     let world = scene.world_transform(id);
                     let b = match &node.data {
+                        NodeData::Group {
+                            kind: vector_scene::GroupKind::Boolean { .. },
+                            ..
+                        } => {
+                            let computed = vector_bool::compute_boolean_group_path(scene, id);
+                            let local = vector_tess::path_visual_bounds(&computed, true, None);
+                            local.transform(world)
+                        }
                         NodeData::Group { .. } => {
                             let mut gb = vector_geom::Bounds::EMPTY;
                             scene.walk_depth_first(id, world, &mut |_cid, cnode, cworld| {

@@ -1,9 +1,22 @@
 use vector_geom::{Affine, Bounds, Point, Segment, VertexMode};
-use vector_scene::{NodeData, NodeId, Scene};
+use vector_scene::{GroupKind, NodeData, NodeId, Scene};
 
 /// Compute the world-space bounding box for a node's visual content,
 /// including the visible stroke area around the geometry.
-fn node_bounds(data: &NodeData, world: Affine) -> Bounds {
+///
+/// For Boolean groups this returns the bounds of the computed result
+/// path rather than `EMPTY` — so a click on the boolean's visible shape
+/// can hit the group node itself rather than falling through to nothing.
+fn node_bounds(scene: &Scene, id: NodeId, data: &NodeData, world: Affine) -> Bounds {
+    if let NodeData::Group {
+        kind: GroupKind::Boolean { .. },
+        ..
+    } = data
+    {
+        let computed = vector_bool::compute_boolean_group_path(scene, id);
+        let local = vector_tess::path_visual_bounds(&computed, true, None);
+        return local.transform(world);
+    }
     data.visual_bounds(world)
 }
 
@@ -763,11 +776,19 @@ impl SelectState {
                 if !node.visible {
                     return false;
                 }
-                let bounds = node_bounds(&node.data, world);
+                let bounds = node_bounds(scene, id, &node.data, world);
                 if !bounds.is_empty() && bounds.contains_point(target) {
                     best = Some(id);
                 }
-                true
+                // Boolean groups behave as a single hittable shape — do
+                // not descend into their operand children for hit testing.
+                !matches!(
+                    node.data,
+                    NodeData::Group {
+                        kind: GroupKind::Boolean { .. },
+                        ..
+                    }
+                )
             },
         );
 
@@ -788,11 +809,17 @@ impl SelectState {
                 if !node.visible {
                     return false;
                 }
-                let bounds = node_bounds(&node.data, world);
+                let bounds = node_bounds(scene, id, &node.data, world);
                 if !bounds.is_empty() && bounds.intersects(query) {
                     result.push(id);
                 }
-                true
+                !matches!(
+                    node.data,
+                    NodeData::Group {
+                        kind: GroupKind::Boolean { .. },
+                        ..
+                    }
+                )
             },
         );
 
@@ -807,7 +834,7 @@ impl SelectState {
         for &id in &self.selected_nodes {
             if let Some(node) = scene.get(id) {
                 let world = scene.world_transform(id);
-                let b = node.data.visual_bounds(world);
+                let b = node_bounds(scene, id, &node.data, world);
                 if !b.is_empty() {
                     combined = combined.union(b);
                 }
@@ -945,7 +972,7 @@ impl SelectState {
                 return false;
             };
             let world = scene.world_transform(id);
-            let bounds = node_bounds(&node.data, world);
+            let bounds = node_bounds(scene, id, &node.data, world);
             !bounds.is_empty() && bounds.contains_point(target)
         })
     }

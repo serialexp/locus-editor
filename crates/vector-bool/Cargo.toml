@@ -1,0 +1,12 @@
+[package]
+name = "vector-bool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+vector-geom = { path = "../vector-geom" }
+vector-scene = { path = "../vector-scene" }
+i_overlay = "4"
+lyon_geom = { workspace = true }

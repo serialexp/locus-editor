@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 vector-geom = { path = "../vector-geom" }
 vector-scene = { path = "../vector-scene" }
+vector-bool = { path = "../vector-bool" }
 vector-text = { path = "../vector-text" }
 usvg = { workspace = true }
 log = { workspace = true }

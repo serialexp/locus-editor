@@ -35,7 +35,10 @@ impl Scene {
         let root = nodes.insert(Node::group("root"));
         let defs = nodes.insert(Node {
             label: "defs".into(),
-            data: crate::node::NodeData::Group { is_defs: true },
+            data: crate::node::NodeData::Group {
+                is_defs: true,
+                kind: crate::node::GroupKind::Regular,
+            },
             ..Node::group("")
         });
 

@@ -36,8 +36,12 @@ pub(crate) fn node_display(node: &vector_scene::Node) -> (&'static str, String) 
     use vector_scene::NodeData;
 
     let icon = match &node.data {
-        NodeData::Group { is_defs: true } => egui_phosphor::regular::LOCK_KEY,
-        NodeData::Group { is_defs: false } => egui_phosphor::regular::FOLDER,
+        NodeData::Group { is_defs: true, .. } => egui_phosphor::regular::LOCK_KEY,
+        NodeData::Group {
+            is_defs: false,
+            kind: vector_scene::GroupKind::Boolean { .. },
+        } => egui_phosphor::regular::INTERSECT_SQUARE,
+        NodeData::Group { is_defs: false, .. } => egui_phosphor::regular::FOLDER,
         NodeData::Path { .. } => egui_phosphor::regular::PATH,
         NodeData::Paint(_) => egui_phosphor::regular::PALETTE,
         NodeData::Text(_) => egui_phosphor::regular::TEXT_AA,
@@ -45,7 +49,7 @@ pub(crate) fn node_display(node: &vector_scene::Node) -> (&'static str, String) 
 
     let label = if node.label.is_empty() {
         match &node.data {
-            NodeData::Group { is_defs: true } => "defs".to_string(),
+            NodeData::Group { is_defs: true, .. } => "defs".to_string(),
             NodeData::Group { .. } => "Group".to_string(),
             NodeData::Path { .. } => "Path".to_string(),
             NodeData::Paint(_) => "Paint".to_string(),

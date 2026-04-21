@@ -80,6 +80,89 @@ pub(crate) fn run_ui(
                     ui.close();
                 }
             });
+            ui.menu_button("Path", |ui| {
+                // Boolean group operations — wrap ≥2 selected nodes in a
+                // new non-destructive boolean group. Originals are
+                // preserved as the group's children; editing them
+                // recomputes the result.
+                let sel_count = selection.selected_nodes.len();
+                let enabled = sel_count >= 2;
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Union"))
+                    .on_hover_text("Combine selected paths into one Boolean(Union) group")
+                    .clicked()
+                {
+                    structure_cmds.push(StructureAction::MakeBooleanGroup {
+                        nodes: selection.selected_nodes.clone(),
+                        op: vector_scene::BoolOp::Union,
+                    });
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Difference"))
+                    .on_hover_text(
+                        "Subtract upper paths from the lowest selected path (Boolean group)",
+                    )
+                    .clicked()
+                {
+                    structure_cmds.push(StructureAction::MakeBooleanGroup {
+                        nodes: selection.selected_nodes.clone(),
+                        op: vector_scene::BoolOp::Difference,
+                    });
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Intersect"))
+                    .on_hover_text("Keep the overlapping region of the selected paths")
+                    .clicked()
+                {
+                    structure_cmds.push(StructureAction::MakeBooleanGroup {
+                        nodes: selection.selected_nodes.clone(),
+                        op: vector_scene::BoolOp::Intersect,
+                    });
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Exclude (XOR)"))
+                    .on_hover_text("Keep the symmetric difference of the selected paths")
+                    .clicked()
+                {
+                    structure_cmds.push(StructureAction::MakeBooleanGroup {
+                        nodes: selection.selected_nodes.clone(),
+                        op: vector_scene::BoolOp::Exclude,
+                    });
+                    ui.close();
+                }
+
+                ui.separator();
+
+                // "Flatten" — bake a selected Boolean group into a single
+                // Path node. Destroys the non-destructive structure.
+                let flatten_target = selection.selected_nodes.iter().copied().find(|&id| {
+                    matches!(
+                        scene.get(id).map(|n| &n.data),
+                        Some(vector_scene::NodeData::Group {
+                            kind: vector_scene::GroupKind::Boolean { .. },
+                            ..
+                        })
+                    )
+                });
+                if ui
+                    .add_enabled(
+                        flatten_target.is_some(),
+                        egui::Button::new("Flatten Boolean → Path"),
+                    )
+                    .on_hover_text(
+                        "Replace the selected Boolean group with its baked result as a single path",
+                    )
+                    .clicked()
+                {
+                    if let Some(group) = flatten_target {
+                        structure_cmds.push(StructureAction::FlattenBooleanGroup { group });
+                    }
+                    ui.close();
+                }
+            });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut snap.grid_enabled, "Snap to grid");
                 ui.horizontal(|ui| {
@@ -220,7 +303,14 @@ pub(crate) fn run_ui(
                     egui::ScrollArea::vertical()
                         .id_salt("properties_scroll")
                         .show(ui, |ui| {
-                            show_properties(ui, scene, history, selection, renderer);
+                            show_properties(
+                                ui,
+                                scene,
+                                history,
+                                selection,
+                                renderer,
+                                &mut structure_cmds,
+                            );
                         });
                 });
             properties_rect = props_resp.response.rect;

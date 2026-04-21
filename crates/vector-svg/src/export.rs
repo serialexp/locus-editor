@@ -94,7 +94,7 @@ fn write_node(
     let transform_attr = fmt_transform(node.transform);
 
     match &node.data {
-        NodeData::Group { is_defs: true } => {
+        NodeData::Group { is_defs: true, .. } => {
             // Emit a <defs> block if there are any paint definitions.
             if gradient_ids.is_empty() {
                 return;
@@ -117,7 +117,42 @@ fn write_node(
             }
             let _ = writeln!(buf, "{pad}</defs>");
         }
-        NodeData::Group { is_defs: false } => {
+        NodeData::Group {
+            is_defs: false,
+            kind: vector_scene::GroupKind::Boolean { op, style },
+        } => {
+            // Non-destructive boolean group: bake to a single <path> on
+            // export. SVG has no native compound-shape concept, so this
+            // is a destructive-on-export conversion. We stash the op name
+            // in a data-* attribute so a round-trip within this tool can
+            // recover the structure in the future.
+            let computed = vector_bool::compute_boolean_group_path(scene, id);
+            if computed.subpaths.is_empty() {
+                return;
+            }
+            let d = fmt_path_data(&computed);
+            let _ = write!(buf, r#"{pad}<path d="{d}""#);
+            if !node.label.is_empty() {
+                let _ = write!(buf, r#" id="{}""#, xml_escape(&node.label));
+            }
+            if let Some(ref t) = transform_attr {
+                let _ = write!(buf, r#" transform="{t}""#);
+            }
+            let op_name = match op {
+                vector_scene::BoolOp::Union => "union",
+                vector_scene::BoolOp::Difference => "difference",
+                vector_scene::BoolOp::Intersect => "intersect",
+                vector_scene::BoolOp::Exclude => "exclude",
+            };
+            let _ = write!(buf, r#" data-vector-boolean-op="{op_name}""#);
+            write_fill_attrs(style, gradient_ids, buf);
+            write_stroke_attrs(style, gradient_ids, buf);
+            let _ = writeln!(buf, "/>");
+        }
+        NodeData::Group {
+            is_defs: false,
+            kind: vector_scene::GroupKind::Regular,
+        } => {
             let _ = write!(buf, "{pad}<g");
             if !node.label.is_empty() {
                 let _ = write!(buf, r#" id="{}""#, xml_escape(&node.label));

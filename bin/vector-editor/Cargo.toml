@@ -14,6 +14,7 @@ vector-text = { path = "../../crates/vector-text" }
 vector-tess = { path = "../../crates/vector-tess" }
 vector-render = { path = "../../crates/vector-render" }
 vector-ops = { path = "../../crates/vector-ops" }
+vector-bool = { path = "../../crates/vector-bool" }
 vector-tools = { path = "../../crates/vector-tools" }
 vector-trace = { path = "../../crates/vector-trace" }
 

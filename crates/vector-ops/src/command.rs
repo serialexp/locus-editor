@@ -1,5 +1,5 @@
 use vector_geom::{Affine, Path};
-use vector_scene::{NodeId, NodeSnapshot, Scene, Style, TextData};
+use vector_scene::{GroupKind, NodeId, NodeSnapshot, Scene, Style, TextData};
 
 /// A reversible editing command. Each variant knows how to apply
 /// itself and produce an undo command.
@@ -27,6 +27,10 @@ pub enum Command {
     SetTextData { id: NodeId, text: TextData },
     /// Replace the transform of a node.
     SetTransform { id: NodeId, transform: Affine },
+    /// Replace the `GroupKind` of a group node — used to convert between
+    /// regular and boolean groups, or to switch the boolean op / style.
+    /// Fails silently (returns None) if the target is not a Group.
+    SetGroupKind { id: NodeId, kind: GroupKind },
     /// Move a node to a new parent at a given index.
     Reparent {
         id: NodeId,
@@ -107,6 +111,18 @@ impl Command {
                 let node = scene.get_mut(id)?;
                 let old = std::mem::replace(&mut node.transform, transform);
                 Some(Command::SetTransform { id, transform: old })
+            }
+            Command::SetGroupKind { id, kind } => {
+                let node = scene.get_mut(id)?;
+                let vector_scene::NodeData::Group {
+                    kind: ref mut current,
+                    ..
+                } = node.data
+                else {
+                    return None;
+                };
+                let old = std::mem::replace(current, kind);
+                Some(Command::SetGroupKind { id, kind: old })
             }
             Command::Reparent {
                 id,
@@ -297,5 +313,55 @@ mod tests {
             panic!("expected path node");
         };
         assert!(style.fill.is_some());
+    }
+
+    #[test]
+    fn set_group_kind_roundtrip() {
+        use vector_scene::{BoolOp, GroupKind};
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let group_id = scene.insert(root, Node::group("g")).unwrap();
+
+        // Convert to a Boolean(Union) group.
+        let new_kind = GroupKind::Boolean {
+            op: BoolOp::Union,
+            style: Style::default(),
+        };
+        let cmd = Command::SetGroupKind {
+            id: group_id,
+            kind: new_kind,
+        };
+        let undo = cmd
+            .apply(&mut scene)
+            .expect("set_group_kind should succeed");
+
+        let node = scene.get(group_id).unwrap();
+        let NodeData::Group { kind, .. } = &node.data else {
+            panic!("expected group");
+        };
+        assert!(matches!(kind, GroupKind::Boolean { .. }));
+
+        // Undo restores Regular.
+        undo.apply(&mut scene).expect("undo should work");
+        let node = scene.get(group_id).unwrap();
+        let NodeData::Group { kind, .. } = &node.data else {
+            panic!("expected group");
+        };
+        assert!(matches!(kind, GroupKind::Regular));
+    }
+
+    #[test]
+    fn set_group_kind_on_non_group_is_none() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let path_id = scene
+            .insert(root, Node::path("p", make_test_path()))
+            .unwrap();
+
+        let cmd = Command::SetGroupKind {
+            id: path_id,
+            kind: vector_scene::GroupKind::Regular,
+        };
+        assert!(cmd.apply(&mut scene).is_none());
     }
 }

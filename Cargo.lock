@@ -1508,6 +1508,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "i_float"
+version = "1.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "813145bb0ad5b60f55cbbf3c74cdceda1c0a9d253b35c4cc36ae0df7887cb78f"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "i_key_sort"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c4d36ff9fb73dc62e163e25a07523ca5c2126660fb2485cdecf063e59b58f29"
+
+[[package]]
+name = "i_overlay"
+version = "4.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "934cba666ad1bf60436a190af6eaa3f58f57b5bad28268ce3fb45d9185862232"
+dependencies = [
+ "i_float",
+ "i_key_sort",
+ "i_shape",
+ "i_tree",
+]
+
+[[package]]
+name = "i_shape"
+version = "1.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfa9eac533d7509a8ab87672b60ac610c17240f9ea4851d26227689fdfe349c8"
+dependencies = [
+ "i_float",
+]
+
+[[package]]
+name = "i_tree"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4804bdc1dc124eb7e1aa9e144ecc04096bcf787a10a15fa44af682b51f0f6cce"
+
+[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2141,7 +2183,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3900,6 +3942,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 
 [[package]]
+name = "vector-bool"
+version = "0.2.0"
+dependencies = [
+ "i_overlay",
+ "lyon_geom",
+ "vector-geom",
+ "vector-scene",
+]
+
+[[package]]
 name = "vector-editor"
 version = "0.2.0"
 dependencies = [
@@ -3913,6 +3965,7 @@ dependencies = [
  "pollster",
  "profiling",
  "rfd",
+ "vector-bool",
  "vector-geom",
  "vector-ops",
  "vector-render",
@@ -3950,6 +4003,7 @@ dependencies = [
  "bytemuck",
  "log",
  "profiling",
+ "vector-bool",
  "vector-geom",
  "vector-scene",
  "vector-tess",
@@ -3975,6 +4029,7 @@ version = "0.2.0"
 dependencies = [
  "log",
  "usvg",
+ "vector-bool",
  "vector-geom",
  "vector-scene",
  "vector-text",
@@ -4008,9 +4063,11 @@ name = "vector-tools"
 version = "0.2.0"
 dependencies = [
  "egui-phosphor",
+ "vector-bool",
  "vector-geom",
  "vector-ops",
  "vector-scene",
+ "vector-tess",
  "vector-text",
 ]
 
