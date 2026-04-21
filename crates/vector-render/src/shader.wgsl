@@ -1,8 +1,17 @@
 // Vector rendering shader with gradient and pattern support.
-// Takes 2D positions + RGBA color per vertex, applies an orthographic projection.
+//
+// Vertex positions are in LOCAL space; each vertex carries a `path_id` that
+// indexes into a `transforms` storage buffer of 2D affine matrices. The
+// vertex shader computes `world = transforms[path_id] * position`, then
+// applies the view-projection to produce clip-space output.
+//
+// `transforms[0]` is reserved for the identity transform — overlay geometry
+// (grid, selection handles, scale handles) is pre-computed in world space
+// and uses `path_id = 0`.
+//
 // Gradient vertices carry a gradient_index >= 0 that indexes into a storage
 // buffer of gradient descriptors; the fragment shader evaluates the gradient
-// color per-pixel using the interpolated world_pos.
+// color per-pixel using the interpolated world_pos computed here.
 // Pattern vertices carry a pattern_index >= 0 that indexes into a storage
 // buffer of pattern descriptors; the fragment shader samples a tiled texture.
 
@@ -11,7 +20,7 @@
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) world_pos: vec2<f32>,
+    @location(2) path_id: u32,
     @location(3) gradient_index: i32,
     @location(4) pattern_index: i32,
 };
@@ -81,6 +90,16 @@ struct GpuPattern {
     _pad2: u32,
 };
 
+// 2D affine transform, packed as two vec4s:
+//   row0 = [a, b, tx, _]
+//   row1 = [c, d, ty, _]
+// world_x = a*x + b*y + tx
+// world_y = c*x + d*y + ty
+struct GpuTransform {
+    row0: vec4<f32>,
+    row1: vec4<f32>,
+};
+
 @group(0) @binding(0)
 var<uniform> globals: Globals;
 
@@ -96,14 +115,22 @@ var pattern_texture: texture_2d_array<f32>;
 @group(0) @binding(4)
 var pattern_sampler: sampler;
 
+@group(0) @binding(5)
+var<storage, read> transforms: array<GpuTransform>;
+
 // ── Vertex shader ───────────────────────────────────────────────────────
 
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = globals.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    let t = transforms[in.path_id];
+    let world = vec2<f32>(
+        t.row0.x * in.position.x + t.row0.y * in.position.y + t.row0.z,
+        t.row1.x * in.position.x + t.row1.y * in.position.y + t.row1.z,
+    );
+    out.clip_position = globals.view_proj * vec4<f32>(world, 0.0, 1.0);
     out.color = in.color;
-    out.world_pos = in.world_pos;
+    out.world_pos = world;
     out.gradient_index = in.gradient_index;
     out.pattern_index = in.pattern_index;
     return out;

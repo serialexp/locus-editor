@@ -149,8 +149,8 @@ pub fn tessellate_path(
                         TessPaint::Solid(color) => {
                             Vertex::solid(pos, [color.r, color.g, color.b, color.a * opacity])
                         }
-                        TessPaint::Gradient { index } => Vertex::gradient(pos, pos, index, opacity),
-                        TessPaint::Pattern { index } => Vertex::pattern(pos, pos, index, opacity),
+                        TessPaint::Gradient { index } => Vertex::gradient(pos, index, opacity),
+                        TessPaint::Pattern { index } => Vertex::pattern(pos, index, opacity),
                     }
                 }),
             )
@@ -198,12 +198,8 @@ pub fn tessellate_path(
                             TessPaint::Solid(color) => {
                                 Vertex::solid(pos, [color.r, color.g, color.b, color.a * opacity])
                             }
-                            TessPaint::Gradient { index } => {
-                                Vertex::gradient(pos, pos, index, opacity)
-                            }
-                            TessPaint::Pattern { index } => {
-                                Vertex::pattern(pos, pos, index, opacity)
-                            }
+                            TessPaint::Gradient { index } => Vertex::gradient(pos, index, opacity),
+                            TessPaint::Pattern { index } => Vertex::pattern(pos, index, opacity),
                         }
                     },
                 ),

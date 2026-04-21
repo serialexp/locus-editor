@@ -253,6 +253,15 @@ tess cache with local-space vertices + per-draw transforms`.
   `vector_bool::compute_boolean_group_path` still goes through the
   uncached function, but in the common steady state the outer cache
   short-circuits before recursion happens at all, so nested groups
-  effectively benefit. Revisit if profiling shows otherwise.)
-- **Phase C pending** — per-path tess cache + local-space vertex
-  pipeline rework.
+  effectively benefit. Filed as nice-to-have in TODO.md.)
+- **Phase C done** — `TessCache` in `vector-render`, keyed on each
+  node's `Scene::geometry_revision`. Tessellation moved into local
+  space; each vertex carries a `path_id` that indexes into a new
+  `transforms` storage buffer populated per frame. Transform-only
+  edits (drag, rotate, scale, properties-panel X/Y) no longer re-tess
+  any path — the tess cache is reused verbatim and only the transforms
+  buffer is re-uploaded. Boolean groups intentionally skip this cache
+  (their `geometry_rev`/`subtree_rev` combo over-invalidates on
+  group-own transforms, and re-tessellating the Phase-B-cached
+  computed path is cheap anyway). 4 new tess_cache tests pass,
+  including the N-paths-1-transform-edit → N hits check from the plan.

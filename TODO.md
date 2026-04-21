@@ -63,7 +63,9 @@
 ### Performance
 - [ ] Gate `build_handles` on selection/scene change — currently rebuilt every frame even when nothing changed, wasteful under continuous redraw.
 - [ ] Cache `flatten_tree` output — currently re-flattened every frame; invalidate only when scene or `structure_collapse` changes.
-- [ ] Per-path tessellation cache — avoid re-tessellating the whole scene on any single-path edit. Key on `(NodeId, Path, Style)`, invalidate in command application.
+- [x] Per-path tessellation cache — `TessCache` in `vector-render`, keyed on each node's `Scene::geometry_revision`. Vertices live in local space; per-path `path_id` indexes a `transforms` storage buffer rebuilt per frame. Transform-only edits reuse cached vertex/index buffers verbatim.
+- [x] Per-boolean-group computed-path cache — `BoolPathCache` in `vector-render`, keyed on `Scene::subtree_revision`. Eliminates per-frame `i_overlay` calls for idle boolean groups.
+- [ ] Nice-to-have: thread `BoolPathCache` through `vector_bool::compute_boolean_group_path`'s recursion so nested boolean groups hit their own cache while the outer group is being recomputed. Only matters when a wide/deeply-nested boolean tree has active edits in one branch while siblings stay idle — uncommon enough that the outer-only cache is fine for now.
 
 ### Architecture
 - [x] Split `bin/vector-editor/src/app.rs` (3491 → 986 lines) into focused modules: camera, demo, snap, util, hud, editor_state, context_menu, structure_panel, properties_panel, ui.

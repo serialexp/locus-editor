@@ -14,6 +14,7 @@ use vector_tools::{PointKind, SelectState, SelectionMode, VertexRef};
 
 use crate::bool_cache::BoolPathCache;
 use crate::pipeline;
+use crate::tess_cache::{TessCache, TessCacheStats};
 
 /// Size of an anchor point handle in pixels (half-width).
 const HANDLE_SIZE: f32 = 4.0;
@@ -173,6 +174,33 @@ impl GpuPattern {
     }
 }
 
+// ── GPU-side per-path transform ──────────────────────────────────────
+//
+// Must match the WGSL shader's `GpuTransform` layout exactly.
+//   row0 = [a, b, tx, _]  — world_x = a*x + b*y + tx
+//   row1 = [c, d, ty, _]  — world_y = c*x + d*y + ty
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct GpuTransform {
+    row0: [f32; 4],
+    row1: [f32; 4],
+}
+
+impl GpuTransform {
+    const IDENTITY: Self = Self {
+        row0: [1.0, 0.0, 0.0, 0.0],
+        row1: [0.0, 1.0, 0.0, 0.0],
+    };
+
+    fn from_affine(a: &Affine) -> Self {
+        Self {
+            row0: [a.a as f32, a.b as f32, a.tx as f32, 0.0],
+            row1: [a.c as f32, a.d as f32, a.ty as f32, 0.0],
+        }
+    }
+}
+
 /// Maximum pixel dimension for a single pattern tile texture.
 const PATTERN_MAX_TEX_SIZE: u32 = 512;
 /// Minimum pixel dimension for a single pattern tile texture.
@@ -244,6 +272,17 @@ pub struct Renderer {
     /// `Scene::subtree_revision`. Avoids re-running `i_overlay` polygon
     /// booleans every frame while a boolean group is visible but idle.
     bool_path_cache: BoolPathCache,
+    /// Per-path tessellation cache, keyed on each node's
+    /// `Scene::geometry_revision`. Transform-only edits do not bump
+    /// `geometry_rev`, so dragging a selection just re-uploads the
+    /// transforms buffer while every vertex buffer entry is reused.
+    tess_cache: TessCache,
+    /// GPU storage buffer of per-path world transforms (`GpuTransform`),
+    /// indexed by each vertex's `path_id` attribute. Slot `0` is
+    /// reserved for identity and used by overlay geometry.
+    transforms_buffer: wgpu::Buffer,
+    /// Current capacity (number of `GpuTransform` slots) of `transforms_buffer`.
+    transforms_capacity: u32,
 }
 
 /// Post-tessellation geometry stats for the scene (excluding grid / handle
@@ -322,6 +361,16 @@ impl Renderer {
             ..Default::default()
         });
 
+        // Initial transforms storage buffer: one identity matrix at slot 0.
+        // Overlay geometry (grid, handles, selection bbox) uses slot 0 for
+        // its pre-computed world-space vertices.
+        use wgpu::util::DeviceExt;
+        let transforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vector transforms"),
+            contents: bytemuck::bytes_of(&GpuTransform::IDENTITY),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let bind_group = create_bind_group(
             device,
             &bind_group_layout,
@@ -330,6 +379,7 @@ impl Renderer {
             &pattern_buffer,
             &pattern_texture_view,
             &pattern_sampler,
+            &transforms_buffer,
         );
 
         Self {
@@ -366,7 +416,17 @@ impl Renderer {
             text_cursor: None,
             text_editing_node: None,
             bool_path_cache: BoolPathCache::new(),
+            tess_cache: TessCache::new(),
+            transforms_buffer,
+            transforms_capacity: 1,
         }
+    }
+
+    /// Statistics for the per-path tessellation cache from the most
+    /// recent `prepare()` call. Hits + misses sum to the number of
+    /// path/text nodes tessellated that frame.
+    pub fn tess_cache_stats(&self) -> TessCacheStats {
+        self.tess_cache.stats()
     }
 
     /// Call when the scene has changed and needs re-tessellation.
@@ -718,6 +778,9 @@ impl Renderer {
                     &tile_pat_buf,
                     &tile_pat_view,
                     &self.pattern_sampler,
+                    // Pattern tile content uses path_id=0 with identity; slot 0 of
+                    // the main transforms buffer is always identity by invariant.
+                    &self.transforms_buffer,
                 );
 
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -820,6 +883,7 @@ impl Renderer {
             &self.pattern_buffer,
             &self.pattern_texture_view,
             &self.pattern_sampler,
+            &self.transforms_buffer,
         );
 
         // ── Helper: resolve PaintRef → TessPaint ───────────────────────
@@ -839,8 +903,22 @@ impl Renderer {
         };
 
         // ── Walk scene and tessellate ──────────────────────────────────
+        //
+        // Path and text nodes go through `tess_cache` — a hit reuses the
+        // cached local-space vertex/index buffers verbatim. Each mesh's
+        // vertices are appended with their `path_id` rewritten to point
+        // at the slot we allocate in the `transforms` storage buffer.
+        //
+        // Boolean groups are re-tessellated every frame from the Phase B
+        // cached computed path — that tessellation is cheap compared to
+        // the `i_overlay` boolean, which is what Phase B actually saved.
+        // Caching the tess on boolean groups is avoided because their
+        // `subtree_rev` over-invalidates on group-own transform edits.
+        //
+        // Slot 0 of `transforms` is reserved for identity (overlays).
         let mut all_vertices: Vec<Vertex> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
+        let mut transforms: Vec<GpuTransform> = vec![GpuTransform::IDENTITY];
 
         // Helper: resolve scene Style into tessellation parameters.
         let resolve_stroke = |s: &Stroke| -> StrokeParams {
@@ -869,36 +947,36 @@ impl Renderer {
             }
         };
 
-        // Helper: push a tessellated mesh into the global vertex/index buffers,
-        // applying the world transform.
-        let push_mesh = |mesh: TessellatedMesh,
-                         world_transform: &Affine,
-                         all_vertices: &mut Vec<Vertex>,
-                         all_indices: &mut Vec<u32>| {
+        // Helper: append a cached mesh's vertices/indices, rewriting each
+        // vertex's `path_id` to the provided slot.
+        let push_cached = |vertices: &[Vertex],
+                           indices: &[u32],
+                           path_id: u32,
+                           all_vertices: &mut Vec<Vertex>,
+                           all_indices: &mut Vec<u32>| {
             let base = all_vertices.len() as u32;
-            if world_transform.is_identity() {
-                all_vertices.extend_from_slice(&mesh.vertices);
-            } else {
-                all_vertices.extend(mesh.vertices.iter().map(|v| {
-                    let p = world_transform
-                        .apply(Point::new(v.position[0] as f64, v.position[1] as f64));
-                    Vertex {
-                        position: [p.x as f32, p.y as f32],
-                        color: v.color,
-                        world_pos: [p.x as f32, p.y as f32],
-                        gradient_index: v.gradient_index,
-                        pattern_index: v.pattern_index,
-                    }
-                }));
+            all_vertices.reserve(vertices.len());
+            for v in vertices {
+                all_vertices.push(Vertex {
+                    position: v.position,
+                    color: v.color,
+                    path_id,
+                    gradient_index: v.gradient_index,
+                    pattern_index: v.pattern_index,
+                });
             }
-            all_indices.extend(mesh.indices.iter().map(|i| i + base));
+            all_indices.extend(indices.iter().map(|i| i + base));
         };
 
         let mut font_db = global_font_db();
 
         let root = scene.root();
         let mut path_count: u32 = 0;
+        // Split the borrow of `self` so the closure can hold `&mut` on both
+        // the tess cache and the bool-path cache independently of `scene`.
         let bool_cache = &mut self.bool_path_cache;
+        let tess_cache = &mut self.tess_cache;
+        tess_cache.reset_stats();
         scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
             if !node.visible {
                 return false;
@@ -920,7 +998,15 @@ impl Renderer {
                         });
                         let stroke = style.stroke.as_ref().map(&resolve_stroke);
                         let mesh = tessellate_path(computed, fill, stroke);
-                        push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
+                        let slot = transforms.len() as u32;
+                        transforms.push(GpuTransform::from_affine(&world_transform));
+                        push_cached(
+                            &mesh.vertices,
+                            &mesh.indices,
+                            slot,
+                            &mut all_vertices,
+                            &mut all_indices,
+                        );
                     }
                     return false;
                 }
@@ -929,27 +1015,48 @@ impl Renderer {
                     ref style,
                 } => {
                     path_count += 1;
+                    let rev = scene.geometry_revision(id);
                     let fill = style.fill.as_ref().map(|f| FillParams {
                         paint: resolve_paint(&f.paint),
                         opacity: f.opacity,
                     });
                     let stroke = style.stroke.as_ref().map(&resolve_stroke);
-
-                    let mesh = tessellate_path(path, fill, stroke);
-                    push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
+                    let cached = tess_cache
+                        .get_or_insert_with(id, rev, || tessellate_path(path, fill, stroke));
+                    let slot = transforms.len() as u32;
+                    transforms.push(GpuTransform::from_affine(&world_transform));
+                    push_cached(
+                        &cached.vertices,
+                        &cached.indices,
+                        slot,
+                        &mut all_vertices,
+                        &mut all_indices,
+                    );
                 }
                 NodeData::Text(ref text) => {
                     path_count += 1;
-                    let shaped =
-                        font_db.shape_text(&text.content, &text.font_family, text.font_size);
+                    let rev = scene.geometry_revision(id);
                     let fill = text.style.fill.as_ref().map(|f| FillParams {
                         paint: resolve_paint(&f.paint),
                         opacity: f.opacity,
                     });
                     let stroke = text.style.stroke.as_ref().map(&resolve_stroke);
-
-                    let mesh = tessellate_path(&shaped.path, fill, stroke);
-                    push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
+                    let font_family = text.font_family.clone();
+                    let font_size = text.font_size;
+                    let content = text.content.clone();
+                    let cached = tess_cache.get_or_insert_with(id, rev, || {
+                        let shaped = font_db.shape_text(&content, &font_family, font_size);
+                        tessellate_path(&shaped.path, fill, stroke)
+                    });
+                    let slot = transforms.len() as u32;
+                    transforms.push(GpuTransform::from_affine(&world_transform));
+                    push_cached(
+                        &cached.vertices,
+                        &cached.indices,
+                        slot,
+                        &mut all_vertices,
+                        &mut all_indices,
+                    );
                 }
                 _ => {}
             }
@@ -959,6 +1066,11 @@ impl Renderer {
         self.num_indices = all_indices.len() as u32;
         self.num_vertices = all_vertices.len() as u32;
         self.num_paths = path_count;
+
+        // Upload the transforms buffer first — reallocate if it grew past
+        // the current capacity, rebuild the bind group to point at the new
+        // buffer when that happens.
+        self.upload_transforms(device, queue, &transforms);
 
         if self.num_indices > 0 {
             use wgpu::util::DeviceExt;
@@ -977,6 +1089,41 @@ impl Renderer {
                 },
             ));
         }
+    }
+
+    /// Upload `transforms` into the `transforms_buffer`, reallocating and
+    /// rebuilding the bind group if the buffer needs to grow.
+    fn upload_transforms(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        transforms: &[GpuTransform],
+    ) {
+        let needed = transforms.len() as u32;
+        if needed > self.transforms_capacity {
+            // Grow with a bit of slack so we don't reallocate on every small
+            // scene change.
+            let new_cap = needed.next_power_of_two().max(4);
+            self.transforms_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vector transforms"),
+                size: (new_cap as usize * std::mem::size_of::<GpuTransform>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.transforms_capacity = new_cap;
+            // Bind group references the old buffer — rebuild it.
+            self.bind_group = create_bind_group(
+                device,
+                &self.bind_group_layout,
+                &self.globals_buffer,
+                &self.gradient_buffer,
+                &self.pattern_buffer,
+                &self.pattern_texture_view,
+                &self.pattern_sampler,
+                &self.transforms_buffer,
+            );
+        }
+        queue.write_buffer(&self.transforms_buffer, 0, bytemuck::cast_slice(transforms));
     }
 
     /// Build grid line geometry covering the visible canvas area.
@@ -2298,6 +2445,7 @@ fn pattern_array_view(texture: &wgpu::Texture) -> wgpu::TextureView {
 }
 
 /// Create the full bind group with all five bindings.
+#[allow(clippy::too_many_arguments)]
 fn create_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -2306,6 +2454,7 @@ fn create_bind_group(
     pattern_buffer: &wgpu::Buffer,
     pattern_texture_view: &wgpu::TextureView,
     pattern_sampler: &wgpu::Sampler,
+    transforms_buffer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("vector bind group"),
@@ -2330,6 +2479,10 @@ fn create_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(pattern_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: transforms_buffer.as_entire_binding(),
             },
         ],
     })
@@ -2504,7 +2657,10 @@ fn tessellate_pattern_content(
                 Vertex {
                     position: [p.x as f32, p.y as f32],
                     color: v.color,
-                    world_pos: [p.x as f32, p.y as f32],
+                    // Pattern tile content uses path_id=0 (identity). The tile
+                    // render pass binds the main transforms_buffer whose slot
+                    // 0 is always identity, so shader output = input position.
+                    path_id: 0,
                     gradient_index: v.gradient_index,
                     pattern_index: v.pattern_index,
                 }

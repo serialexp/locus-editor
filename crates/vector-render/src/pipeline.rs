@@ -59,6 +59,17 @@ pub fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
+            // Binding 5: per-path world transforms (vertex shader)
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
