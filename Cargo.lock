@@ -4004,6 +4004,7 @@ dependencies = [
  "bytemuck",
  "log",
  "profiling",
+ "slotmap",
  "vector-bool",
  "vector-geom",
  "vector-scene",

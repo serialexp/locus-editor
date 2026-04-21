@@ -1,3 +1,4 @@
+mod bool_cache;
 mod pipeline;
 mod renderer;
 

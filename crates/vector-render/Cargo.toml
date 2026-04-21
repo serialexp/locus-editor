@@ -17,3 +17,4 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true }
 log = { workspace = true }
 profiling = { workspace = true }
+slotmap = { workspace = true }

@@ -12,6 +12,7 @@ use vector_tess::{
 use vector_text::global_font_db;
 use vector_tools::{PointKind, SelectState, SelectionMode, VertexRef};
 
+use crate::bool_cache::BoolPathCache;
 use crate::pipeline;
 
 /// Size of an anchor point handle in pixels (half-width).
@@ -239,6 +240,10 @@ pub struct Renderer {
     pub text_cursor: Option<TextCursorInfo>,
     /// Node currently being text-edited (for drawing a distinct bounding box).
     pub text_editing_node: Option<NodeId>,
+    /// Per-boolean-group computed-path cache, keyed on each group's
+    /// `Scene::subtree_revision`. Avoids re-running `i_overlay` polygon
+    /// booleans every frame while a boolean group is visible but idle.
+    bool_path_cache: BoolPathCache,
 }
 
 /// Post-tessellation geometry stats for the scene (excluding grid / handle
@@ -360,6 +365,7 @@ impl Renderer {
             checker_screen_px: 24.0,
             text_cursor: None,
             text_editing_node: None,
+            bool_path_cache: BoolPathCache::new(),
         }
     }
 
@@ -892,6 +898,7 @@ impl Renderer {
 
         let root = scene.root();
         let mut path_count: u32 = 0;
+        let bool_cache = &mut self.bool_path_cache;
         scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
             if !node.visible {
                 return false;
@@ -904,9 +911,7 @@ impl Renderer {
                     // Non-destructive boolean group: render the computed
                     // path with the group's own style, and skip recursion
                     // into children (they're operands, not drawables).
-                    // TODO(perf): cache this per group, invalidate on
-                    // descendant edits.
-                    let computed = vector_bool::compute_boolean_group_path(scene, id);
+                    let computed = bool_cache.get_or_compute(scene, id);
                     if !computed.subpaths.is_empty() {
                         path_count += 1;
                         let fill = style.fill.as_ref().map(|f| FillParams {
@@ -914,7 +919,7 @@ impl Renderer {
                             opacity: f.opacity,
                         });
                         let stroke = style.stroke.as_ref().map(&resolve_stroke);
-                        let mesh = tessellate_path(&computed, fill, stroke);
+                        let mesh = tessellate_path(computed, fill, stroke);
                         push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
                     }
                     return false;
@@ -1323,6 +1328,7 @@ impl Renderer {
             let half_thickness = thickness * 0.5;
 
             let root = scene.root();
+            let bool_cache = &mut self.bool_path_cache;
             scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
                 if !node.visible {
                     return false;
@@ -1340,8 +1346,8 @@ impl Renderer {
                     } => {
                         // Boolean group: use the bounds of the computed
                         // result path, transformed into world space.
-                        let computed = vector_bool::compute_boolean_group_path(scene, id);
-                        let local = vector_tess::path_visual_bounds(&computed, true, None);
+                        let computed = bool_cache.get_or_compute(scene, id);
+                        let local = vector_tess::path_visual_bounds(computed, true, None);
                         local.transform(world_transform)
                     }
                     NodeData::Group { .. } => {
@@ -1438,8 +1444,8 @@ impl Renderer {
                             kind: vector_scene::GroupKind::Boolean { .. },
                             ..
                         } => {
-                            let computed = vector_bool::compute_boolean_group_path(scene, id);
-                            let local = vector_tess::path_visual_bounds(&computed, true, None);
+                            let computed = bool_cache.get_or_compute(scene, id);
+                            let local = vector_tess::path_visual_bounds(computed, true, None);
                             local.transform(world)
                         }
                         NodeData::Group { .. } => {

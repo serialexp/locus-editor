@@ -241,7 +241,18 @@ tess cache with local-space vertices + per-draw transforms`.
 
 ## Where we are now
 
-- Phases planned; awaiting sign-off to start Phase A.
-- Last commit: `ea483c5 feat(boolean): Inkscape-style keybindings +
-  tight content bounds` (also ahead 4 of origin/main).
-- Working tree clean.
+- **Phase A done** — per-node revision tracking in `Scene`, `get_mut`
+  removed, all mutation routed through typed setters / `edit()` guard /
+  closure helpers. 17 new scene tests pass.
+  Commit: `3510833 refactor(scene): per-node revision tracking for cache
+  invalidation`.
+- **Phase B done** — `BoolPathCache` in `vector-render`, keyed on
+  `Scene::subtree_revision`. Replaces all three in-renderer
+  `compute_boolean_group_path` call sites. 4 new cache tests pass.
+  (Note on risk #5: nested-boolean recursion in
+  `vector_bool::compute_boolean_group_path` still goes through the
+  uncached function, but in the common steady state the outer cache
+  short-circuits before recursion happens at all, so nested groups
+  effectively benefit. Revisit if profiling shows otherwise.)
+- **Phase C pending** — per-path tess cache + local-space vertex
+  pipeline rework.
