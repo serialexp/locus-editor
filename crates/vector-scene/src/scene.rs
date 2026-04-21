@@ -1,7 +1,11 @@
-use serde::{Deserialize, Serialize};
-use slotmap::SlotMap;
+use std::ops::{Deref, DerefMut};
 
-use crate::node::Node;
+use serde::{Deserialize, Serialize};
+use slotmap::{SecondaryMap, SlotMap};
+
+use crate::node::{GroupKind, Node, NodeData, TextData};
+use crate::style::Style;
+use vector_geom::{Affine, Path};
 
 // SlotMap's DefaultKey gives us stable, generational IDs for free:
 // - O(1) lookup
@@ -12,14 +16,45 @@ slotmap::new_key_type! {
     pub struct NodeId;
 }
 
+/// Per-node revision counters, used for cache invalidation.
+///
+/// Two counters are tracked:
+/// * `geometry_rev` — bumps when the node's own rendered geometry changes
+///   (Path data, Style, GroupKind's Boolean style, TextData). Drives the
+///   per-path tessellation cache: if `geometry_rev` is unchanged since
+///   last tess, the cached mesh is still valid in local space.
+/// * `subtree_rev` — bumps whenever *any* descendant (including self) in
+///   the node's subtree changes in any way (geometry, transform, structural
+///   insert/remove/reparent). Drives the per-boolean-group computed-path
+///   cache: a boolean group's baked `Path` depends on every descendant's
+///   geometry *and* transform (operands compose in the group's local
+///   space), so any subtree change invalidates it.
+///
+/// Transform edits bump `subtree_rev` (of self + ancestors) but NOT
+/// `geometry_rev` — local-space tessellation output is unchanged when
+/// a node's transform changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRevision {
+    pub geometry_rev: u64,
+    pub subtree_rev: u64,
+}
+
 /// The scene: a flat pool of nodes with a designated root.
 /// Parent-child relationships are stored inside each node (children vec),
 /// with an auxiliary parent lookup for walking up the tree.
+///
+/// Mutation invariant: the only way to obtain a mutable reference to a
+/// `Node` is via one of the typed `set_*` methods or the `edit()` guard.
+/// Both are wired to bump the right revision counters. There is no
+/// `pub fn get_mut` — this is deliberate, so that cache invalidation
+/// cannot be silently skipped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene {
     nodes: SlotMap<NodeId, Node>,
     /// Parent lookup: child -> parent. Root has no entry.
-    parents: slotmap::SecondaryMap<NodeId, NodeId>,
+    parents: SecondaryMap<NodeId, NodeId>,
+    /// Per-node revision counters for cache invalidation.
+    revisions: SecondaryMap<NodeId, NodeRevision>,
     /// The root group node. Always exists.
     root: NodeId,
     /// The defs group (non-rendered). Child of root, always exists.
@@ -30,17 +65,21 @@ impl Scene {
     /// Create a new empty scene with a root group and a defs group.
     pub fn new() -> Self {
         let mut nodes = SlotMap::with_key();
-        let mut parents = slotmap::SecondaryMap::new();
+        let mut parents = SecondaryMap::new();
+        let mut revisions = SecondaryMap::new();
 
         let root = nodes.insert(Node::group("root"));
+        revisions.insert(root, NodeRevision::default());
+
         let defs = nodes.insert(Node {
             label: "defs".into(),
-            data: crate::node::NodeData::Group {
+            data: NodeData::Group {
                 is_defs: true,
-                kind: crate::node::GroupKind::Regular,
+                kind: GroupKind::Regular,
             },
             ..Node::group("")
         });
+        revisions.insert(defs, NodeRevision::default());
 
         // defs is a child of root
         nodes[root].children.push(defs);
@@ -49,6 +88,7 @@ impl Scene {
         Self {
             nodes,
             parents,
+            revisions,
             root,
             defs,
         }
@@ -67,24 +107,237 @@ impl Scene {
         self.nodes.get(id)
     }
 
-    /// Get a mutable reference to a node.
-    pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.get_mut(id)
-    }
-
     /// Get the parent of a node.
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
         self.parents.get(id).copied()
     }
 
+    // ── Revision accessors ─────────────────────────────────────────
+
+    /// Current geometry revision for `id` (0 if missing).
+    ///
+    /// Bumps when Path / Style / GroupKind / TextData mutate on this
+    /// specific node. Does NOT bump on transform changes. Cache consumers
+    /// that operate on local-space geometry (e.g. tessellation output)
+    /// key on this value.
+    pub fn geometry_revision(&self, id: NodeId) -> u64 {
+        self.revisions.get(id).map_or(0, |r| r.geometry_rev)
+    }
+
+    /// Current subtree revision for `id` (0 if missing).
+    ///
+    /// Bumps whenever this node OR any descendant changes in any way,
+    /// including transforms and structural edits. Cache consumers whose
+    /// output depends on the whole subtree (e.g. a boolean group's baked
+    /// path, which composes descendant geometry in the group's local
+    /// space) key on this value.
+    pub fn subtree_revision(&self, id: NodeId) -> u64 {
+        self.revisions.get(id).map_or(0, |r| r.subtree_rev)
+    }
+
+    // ── Typed setters ──────────────────────────────────────────────
+    //
+    // Every mutation of a `Node`'s field goes through one of these
+    // methods (or the `edit()` guard). Each bumps exactly the revisions
+    // it needs to and no more.
+
+    /// Replace a node's local transform, returning the previous value.
+    /// Bumps `subtree_rev` of self + ancestors. Does NOT bump
+    /// `geometry_rev` (local tessellation is unaffected by transform).
+    /// Returns `None` if the node doesn't exist.
+    pub fn set_transform(&mut self, id: NodeId, transform: Affine) -> Option<Affine> {
+        let node = self.nodes.get_mut(id)?;
+        let old = std::mem::replace(&mut node.transform, transform);
+        self.bump_subtree_chain(id);
+        Some(old)
+    }
+
+    /// Replace a path node's `Path` data, returning the previous value.
+    /// Bumps `geometry_rev` of self and `subtree_rev` of self + ancestors.
+    /// Returns `None` if the node doesn't exist or isn't a `Path`.
+    pub fn set_path_data(&mut self, id: NodeId, path: Path) -> Option<Path> {
+        let node = self.nodes.get_mut(id)?;
+        let NodeData::Path { path: current, .. } = &mut node.data else {
+            return None;
+        };
+        let old = std::mem::replace(current, path);
+        self.bump_geometry(id);
+        Some(old)
+    }
+
+    /// Replace a path or boolean-group's `Style`, returning the previous value.
+    /// Bumps `geometry_rev` of self and `subtree_rev` of self + ancestors.
+    /// Returns `None` if the node doesn't exist or isn't a `Path`/boolean `Group`.
+    pub fn set_style(&mut self, id: NodeId, style: Style) -> Option<Style> {
+        let node = self.nodes.get_mut(id)?;
+        let current = match &mut node.data {
+            NodeData::Path { style: current, .. } => current,
+            NodeData::Group {
+                kind: GroupKind::Boolean { style: current, .. },
+                ..
+            } => current,
+            _ => return None,
+        };
+        let old = std::mem::replace(current, style);
+        self.bump_geometry(id);
+        Some(old)
+    }
+
+    /// Replace a group node's `GroupKind`, returning the previous value.
+    /// Bumps `geometry_rev` of self and `subtree_rev` of self + ancestors
+    /// (switching between Regular and Boolean changes what the group
+    /// renders as, even if descendants didn't change).
+    /// Returns `None` if the node doesn't exist or isn't a `Group`.
+    pub fn set_group_kind(&mut self, id: NodeId, kind: GroupKind) -> Option<GroupKind> {
+        let node = self.nodes.get_mut(id)?;
+        let NodeData::Group { kind: current, .. } = &mut node.data else {
+            return None;
+        };
+        let old = std::mem::replace(current, kind);
+        self.bump_geometry(id);
+        Some(old)
+    }
+
+    /// Replace a text node's `TextData`, returning the previous value.
+    /// Bumps `geometry_rev` of self and `subtree_rev` of self + ancestors.
+    /// Returns `None` if the node doesn't exist or isn't a `Text`.
+    pub fn set_text_data(&mut self, id: NodeId, text: TextData) -> Option<TextData> {
+        let node = self.nodes.get_mut(id)?;
+        let NodeData::Text(current) = &mut node.data else {
+            return None;
+        };
+        let old = std::mem::replace(current, text);
+        self.bump_geometry(id);
+        Some(old)
+    }
+
+    /// Set a node's `visible` flag. Does NOT bump any revision — visibility
+    /// doesn't affect any cached geometry. Returns `false` if the node
+    /// doesn't exist.
+    pub fn set_visible(&mut self, id: NodeId, visible: bool) -> bool {
+        match self.nodes.get_mut(id) {
+            Some(n) => {
+                n.visible = visible;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set a node's `locked` flag. Does NOT bump any revision.
+    /// Returns `false` if the node doesn't exist.
+    pub fn set_locked(&mut self, id: NodeId, locked: bool) -> bool {
+        match self.nodes.get_mut(id) {
+            Some(n) => {
+                n.locked = locked;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set a node's human-readable label. Does NOT bump any revision.
+    /// Returns `false` if the node doesn't exist.
+    pub fn set_label(&mut self, id: NodeId, label: String) -> bool {
+        match self.nodes.get_mut(id) {
+            Some(n) => {
+                n.label = label;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Run `f` with mutable access to a path node's `Path`, bumping
+    /// `geometry_rev` on success. The closure returns an arbitrary value
+    /// that's threaded through. Useful for partial / deep mutations into
+    /// the path structure (pushing segments, editing vertices) that
+    /// don't warrant a full `set_path_data` clone-and-swap.
+    ///
+    /// Returns `None` if the node is missing or isn't a `Path`. Does not
+    /// bump if `None` is returned (nothing was mutated).
+    pub fn with_path_data_mut<F, R>(&mut self, id: NodeId, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Path) -> R,
+    {
+        let node = self.nodes.get_mut(id)?;
+        let NodeData::Path { path, .. } = &mut node.data else {
+            return None;
+        };
+        let r = f(path);
+        self.bump_geometry(id);
+        Some(r)
+    }
+
+    /// Run `f` with mutable access to a text node's `TextData`, bumping
+    /// `geometry_rev` on success. Analogous to `with_path_data_mut`.
+    pub fn with_text_data_mut<F, R>(&mut self, id: NodeId, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut TextData) -> R,
+    {
+        let node = self.nodes.get_mut(id)?;
+        let NodeData::Text(text) = &mut node.data else {
+            return None;
+        };
+        let r = f(text);
+        self.bump_geometry(id);
+        Some(r)
+    }
+
+    /// Acquire a mutation guard for a node. The guard derefs to `&mut Node`
+    /// and, on drop, conservatively bumps both `geometry_rev` and
+    /// `subtree_rev` (cascading subtree_rev up the ancestor chain) since
+    /// it can't know what the caller changed.
+    ///
+    /// Prefer the typed setters when you're mutating a single field —
+    /// they bump more narrowly. Use this guard for compound mutations
+    /// (e.g. in-place vertex drag that walks into `Path.subpaths`) where
+    /// typed setters would require a clone-and-swap.
+    ///
+    /// Returns `None` if the node doesn't exist.
+    pub fn edit(&mut self, id: NodeId) -> Option<NodeEditGuard<'_>> {
+        if !self.nodes.contains_key(id) {
+            return None;
+        }
+        Some(NodeEditGuard { scene: self, id })
+    }
+
+    // ── Internal bump helpers (private) ────────────────────────────
+
+    /// Bump `geometry_rev` of `id`, then cascade `subtree_rev` up from
+    /// `id` to the root (inclusive).
+    fn bump_geometry(&mut self, id: NodeId) {
+        if let Some(rev) = self.revisions.get_mut(id) {
+            rev.geometry_rev = rev.geometry_rev.wrapping_add(1);
+        }
+        self.bump_subtree_chain(id);
+    }
+
+    /// Cascade `subtree_rev` upward starting at `id` (inclusive), walking
+    /// every ancestor via `parents`. Used by transform edits and by the
+    /// tail of `bump_geometry`.
+    fn bump_subtree_chain(&mut self, id: NodeId) {
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            if let Some(rev) = self.revisions.get_mut(c) {
+                rev.subtree_rev = rev.subtree_rev.wrapping_add(1);
+            }
+            cur = self.parents.get(c).copied();
+        }
+    }
+
+    // ── Structural operations ──────────────────────────────────────
+
     /// Insert a new node as a child of `parent` (appended at the end).
-    /// Returns the new node's ID.
+    /// Returns the new node's ID. Bumps `subtree_rev` of `parent` and all
+    /// its ancestors (the subtree gained a new descendant).
     pub fn insert(&mut self, parent: NodeId, node: Node) -> Option<NodeId> {
         self.insert_at(parent, node, None)
     }
 
     /// Insert a new node as a child of `parent` at a specific index.
     /// If `index` is `None`, the node is appended at the end.
+    /// Bumps `subtree_rev` of `parent` and all its ancestors.
     pub fn insert_at(
         &mut self,
         parent: NodeId,
@@ -95,12 +348,14 @@ impl Scene {
             return None;
         }
         let id = self.nodes.insert(node);
+        self.revisions.insert(id, NodeRevision::default());
         let children = &mut self.nodes[parent].children;
         match index {
             Some(idx) => children.insert(idx.min(children.len()), id),
             None => children.push(id),
         }
         self.parents.insert(id, parent);
+        self.bump_subtree_chain(parent);
         Some(id)
     }
 
@@ -112,10 +367,12 @@ impl Scene {
     }
 
     /// Remove a node and all its descendants. Returns the removed nodes.
+    /// Bumps `subtree_rev` of the old parent and all its ancestors.
     pub fn remove(&mut self, id: NodeId) -> Vec<(NodeId, Node)> {
         if id == self.root || id == self.defs {
             return Vec::new(); // can't remove structural nodes
         }
+        let old_parent = self.parents.get(id).copied();
         let mut removed = Vec::new();
         self.remove_recursive(id, &mut removed);
 
@@ -125,11 +382,17 @@ impl Scene {
         {
             parent.children.retain(|c| *c != id);
         }
+
+        // Cascade invalidation up from the old parent.
+        if let Some(parent_id) = old_parent {
+            self.bump_subtree_chain(parent_id);
+        }
         removed
     }
 
     fn remove_recursive(&mut self, id: NodeId, out: &mut Vec<(NodeId, Node)>) {
         if let Some(node) = self.nodes.remove(id) {
+            self.revisions.remove(id);
             let children: Vec<NodeId> = node.children.clone();
             out.push((id, node));
             for child in children {
@@ -140,14 +403,17 @@ impl Scene {
     }
 
     /// Move a node to be a child of a new parent at a given index.
+    /// Bumps `subtree_rev` of both old and new parent chains.
     pub fn reparent(&mut self, id: NodeId, new_parent: NodeId, index: usize) -> bool {
         if id == self.root || id == self.defs || !self.nodes.contains_key(new_parent) {
             return false;
         }
 
+        let old_parent = self.parents.get(id).copied();
+
         // Remove from old parent
-        if let Some(old_parent) = self.parents.get(id).copied()
-            && let Some(parent) = self.nodes.get_mut(old_parent)
+        if let Some(op) = old_parent
+            && let Some(parent) = self.nodes.get_mut(op)
         {
             parent.children.retain(|c| *c != id);
         }
@@ -157,6 +423,14 @@ impl Scene {
         let idx = index.min(children.len());
         children.insert(idx, id);
         self.parents.insert(id, new_parent);
+
+        // Cascade invalidation from both the old and new parent chains.
+        // The moved subtree's own geometry/subtree revisions are
+        // unchanged — its contents haven't changed, only its parent.
+        if let Some(op) = old_parent {
+            self.bump_subtree_chain(op);
+        }
+        self.bump_subtree_chain(new_parent);
         true
     }
 
@@ -177,8 +451,8 @@ impl Scene {
     pub fn walk_depth_first(
         &self,
         from: NodeId,
-        parent_transform: vector_geom::Affine,
-        f: &mut impl FnMut(NodeId, &Node, vector_geom::Affine) -> bool,
+        parent_transform: Affine,
+        f: &mut impl FnMut(NodeId, &Node, Affine) -> bool,
     ) {
         let Some(node) = self.get(from) else {
             return;
@@ -212,7 +486,7 @@ impl Scene {
 
     /// Compute the accumulated world transform for a node by walking up
     /// the parent chain. Returns `Affine::IDENTITY` for the root.
-    pub fn world_transform(&self, id: NodeId) -> vector_geom::Affine {
+    pub fn world_transform(&self, id: NodeId) -> Affine {
         let mut chain = Vec::new();
         let mut current = id;
         while let Some(parent) = self.parents.get(current).copied() {
@@ -224,7 +498,7 @@ impl Scene {
         let mut xform = self
             .nodes
             .get(current)
-            .map_or(vector_geom::Affine::IDENTITY, |n| n.transform);
+            .map_or(Affine::IDENTITY, |n| n.transform);
         for &node_id in chain.iter().rev() {
             if let Some(node) = self.nodes.get(node_id) {
                 xform = xform.then(node.transform);
@@ -236,10 +510,10 @@ impl Scene {
     /// Compute the accumulated world transform of a node's *parent chain*,
     /// excluding the node's own transform. Useful for converting a world-space
     /// delta into the local space where the node's transform operates.
-    pub fn parent_world_transform(&self, id: NodeId) -> vector_geom::Affine {
+    pub fn parent_world_transform(&self, id: NodeId) -> Affine {
         let parent_id = match self.parents.get(id) {
             Some(&p) => p,
-            None => return vector_geom::Affine::IDENTITY,
+            None => return Affine::IDENTITY,
         };
         self.world_transform(parent_id)
     }
@@ -247,23 +521,68 @@ impl Scene {
     /// Compute the bounding box of all visible content (paths and text),
     /// skipping defs, taking group transforms into account. Includes the
     /// visible stroke area around each shape.
+    ///
+    /// This is the naive variant — it treats every node's `visual_bounds`
+    /// independently. For scenes with Boolean groups, prefer
+    /// `vector_bool::scene_content_bounds`, which short-circuits at
+    /// Boolean groups and returns their tight baked-path bounds instead
+    /// of the looser union-of-operands bounds.
     pub fn content_bounds(&self) -> vector_geom::Bounds {
         let mut bounds = vector_geom::Bounds::EMPTY;
-        self.walk_depth_first(
-            self.root,
-            vector_geom::Affine::IDENTITY,
-            &mut |_id, node, world| {
-                if !node.visible {
-                    return false;
-                }
-                let node_bounds = node.data.visual_bounds(world);
-                if !node_bounds.is_empty() {
-                    bounds = bounds.union(node_bounds);
-                }
-                true
-            },
-        );
+        self.walk_depth_first(self.root, Affine::IDENTITY, &mut |_id, node, world| {
+            if !node.visible {
+                return false;
+            }
+            let node_bounds = node.data.visual_bounds(world);
+            if !node_bounds.is_empty() {
+                bounds = bounds.union(node_bounds);
+            }
+            true
+        });
         bounds
+    }
+}
+
+// ── Mutation guard ────────────────────────────────────────────────────
+
+/// RAII guard returned by `Scene::edit`. Derefs to `&mut Node` for
+/// compound mutations (e.g. in-place path vertex edits). On drop, bumps
+/// both `geometry_rev` of the target node and `subtree_rev` of self +
+/// ancestors — conservatively, since the guard can't observe what was
+/// actually changed.
+///
+/// Prefer typed setters (`set_transform`, `set_path_data`, etc.) when
+/// possible; they bump more narrowly.
+pub struct NodeEditGuard<'a> {
+    scene: &'a mut Scene,
+    id: NodeId,
+}
+
+impl<'a> NodeEditGuard<'a> {
+    /// The ID of the node being edited.
+    pub fn id(&self) -> NodeId {
+        self.id
+    }
+}
+
+impl<'a> Deref for NodeEditGuard<'a> {
+    type Target = Node;
+    fn deref(&self) -> &Node {
+        // The guard is only created when the node exists; SlotMap keys
+        // are generational, so indexing is safe here.
+        &self.scene.nodes[self.id]
+    }
+}
+
+impl<'a> DerefMut for NodeEditGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Node {
+        &mut self.scene.nodes[self.id]
+    }
+}
+
+impl<'a> Drop for NodeEditGuard<'a> {
+    fn drop(&mut self) {
+        self.scene.bump_geometry(self.id);
     }
 }
 
@@ -329,7 +648,7 @@ impl Default for Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vector_geom::{Path, Point, Segment, SubPath, VertexMode};
+    use vector_geom::{Point, Segment, SubPath, VertexMode};
 
     fn make_test_path() -> Path {
         let mut path = Path::new();
@@ -427,5 +746,199 @@ mod tests {
             .map(|&id| scene.get(id).unwrap().label.as_str())
             .collect();
         assert_eq!(child_labels, vec!["a", "b"]);
+    }
+
+    // ── Revision tracking tests ───────────────────────────────────
+
+    #[test]
+    fn new_node_starts_at_zero_revisions() {
+        let mut scene = Scene::new();
+        let id = scene
+            .insert(scene.root(), Node::path("p", make_test_path()))
+            .unwrap();
+        assert_eq!(scene.geometry_revision(id), 0);
+        assert_eq!(scene.subtree_revision(id), 0);
+    }
+
+    #[test]
+    fn set_path_data_bumps_geometry_and_subtree() {
+        let mut scene = Scene::new();
+        let id = scene
+            .insert(scene.root(), Node::path("p", make_test_path()))
+            .unwrap();
+        let geom0 = scene.geometry_revision(id);
+        let sub0 = scene.subtree_revision(id);
+
+        let new_path = make_test_path();
+        assert!(scene.set_path_data(id, new_path).is_some());
+
+        assert!(scene.geometry_revision(id) > geom0, "geometry should bump");
+        assert!(scene.subtree_revision(id) > sub0, "subtree should bump");
+    }
+
+    #[test]
+    fn set_transform_bumps_subtree_only_not_geometry() {
+        let mut scene = Scene::new();
+        let id = scene
+            .insert(scene.root(), Node::path("p", make_test_path()))
+            .unwrap();
+        let geom0 = scene.geometry_revision(id);
+        let sub0 = scene.subtree_revision(id);
+
+        let t = Affine {
+            a: 2.0,
+            b: 0.0,
+            c: 0.0,
+            d: 2.0,
+            tx: 5.0,
+            ty: 7.0,
+        };
+        assert!(scene.set_transform(id, t).is_some());
+
+        assert_eq!(
+            scene.geometry_revision(id),
+            geom0,
+            "geometry must NOT bump on transform change"
+        );
+        assert!(
+            scene.subtree_revision(id) > sub0,
+            "subtree should bump on transform change"
+        );
+    }
+
+    #[test]
+    fn geometry_edit_cascades_subtree_rev_to_ancestors() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let outer = scene.insert(root, Node::group("outer")).unwrap();
+        let inner = scene.insert(outer, Node::group("inner")).unwrap();
+        let leaf = scene
+            .insert(inner, Node::path("p", make_test_path()))
+            .unwrap();
+
+        // Record all ancestor subtree_revs after the chain was built.
+        let root_s0 = scene.subtree_revision(root);
+        let outer_s0 = scene.subtree_revision(outer);
+        let inner_s0 = scene.subtree_revision(inner);
+        let leaf_s0 = scene.subtree_revision(leaf);
+
+        // Edit the leaf.
+        scene.set_path_data(leaf, make_test_path()).unwrap();
+
+        // Every node on the chain should have bumped subtree_rev.
+        assert!(
+            scene.subtree_revision(leaf) > leaf_s0,
+            "leaf subtree should bump"
+        );
+        assert!(
+            scene.subtree_revision(inner) > inner_s0,
+            "inner subtree should bump"
+        );
+        assert!(
+            scene.subtree_revision(outer) > outer_s0,
+            "outer subtree should bump"
+        );
+        assert!(
+            scene.subtree_revision(root) > root_s0,
+            "root subtree should bump"
+        );
+    }
+
+    #[test]
+    fn insert_bumps_parent_chain_subtree() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let outer = scene.insert(root, Node::group("outer")).unwrap();
+        let outer_s0 = scene.subtree_revision(outer);
+        let root_s0 = scene.subtree_revision(root);
+
+        // Insert a leaf inside outer.
+        scene
+            .insert(outer, Node::path("p", make_test_path()))
+            .unwrap();
+
+        assert!(
+            scene.subtree_revision(outer) > outer_s0,
+            "outer subtree should bump on insert"
+        );
+        assert!(
+            scene.subtree_revision(root) > root_s0,
+            "root subtree should bump on insert"
+        );
+    }
+
+    #[test]
+    fn remove_bumps_old_parent_chain_subtree() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let outer = scene.insert(root, Node::group("outer")).unwrap();
+        let leaf = scene
+            .insert(outer, Node::path("p", make_test_path()))
+            .unwrap();
+        let outer_s0 = scene.subtree_revision(outer);
+        let root_s0 = scene.subtree_revision(root);
+
+        scene.remove(leaf);
+
+        assert!(scene.subtree_revision(outer) > outer_s0);
+        assert!(scene.subtree_revision(root) > root_s0);
+    }
+
+    #[test]
+    fn reparent_bumps_both_parent_chains() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let a = scene.insert(root, Node::group("a")).unwrap();
+        let b = scene.insert(root, Node::group("b")).unwrap();
+        let leaf = scene.insert(a, Node::path("p", make_test_path())).unwrap();
+
+        let a_s0 = scene.subtree_revision(a);
+        let b_s0 = scene.subtree_revision(b);
+
+        assert!(scene.reparent(leaf, b, 0));
+
+        assert!(
+            scene.subtree_revision(a) > a_s0,
+            "old parent subtree should bump"
+        );
+        assert!(
+            scene.subtree_revision(b) > b_s0,
+            "new parent subtree should bump"
+        );
+    }
+
+    #[test]
+    fn edit_guard_bumps_on_drop() {
+        let mut scene = Scene::new();
+        let id = scene
+            .insert(scene.root(), Node::path("p", make_test_path()))
+            .unwrap();
+        let geom0 = scene.geometry_revision(id);
+        let sub0 = scene.subtree_revision(id);
+
+        {
+            let mut guard = scene.edit(id).unwrap();
+            guard.label = "renamed".into();
+            // Even though we only changed a meta field, the guard bumps
+            // conservatively on drop — that's the documented trade-off.
+        }
+
+        assert!(scene.geometry_revision(id) > geom0);
+        assert!(scene.subtree_revision(id) > sub0);
+    }
+
+    #[test]
+    fn set_visible_does_not_bump() {
+        let mut scene = Scene::new();
+        let id = scene
+            .insert(scene.root(), Node::path("p", make_test_path()))
+            .unwrap();
+        let geom0 = scene.geometry_revision(id);
+        let sub0 = scene.subtree_revision(id);
+
+        assert!(scene.set_visible(id, false));
+
+        assert_eq!(scene.geometry_revision(id), geom0);
+        assert_eq!(scene.subtree_revision(id), sub0);
     }
 }

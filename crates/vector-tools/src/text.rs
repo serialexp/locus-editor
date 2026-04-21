@@ -161,9 +161,7 @@ impl TextToolState {
         let root = scene.root();
         if let Some(node_id) = scene.insert(root, node) {
             // Set the transform to position the text at the click location.
-            if let Some(n) = scene.get_mut(node_id) {
-                n.transform = Affine::translate(canvas_pos[0], canvas_pos[1]);
-            }
+            scene.set_transform(node_id, Affine::translate(canvas_pos[0], canvas_pos[1]));
             self.start_editing(scene, node_id, true);
             return TextAction::Created(node_id);
         }
@@ -183,7 +181,7 @@ impl TextToolState {
         };
 
         let node_id = *node_id;
-        let Some(node) = scene.get_mut(node_id) else {
+        let Some(mut node) = scene.edit(node_id) else {
             return TextAction::None;
         };
         let NodeData::Text(text) = &mut node.data else {
@@ -212,7 +210,7 @@ impl TextToolState {
         }
 
         let node_id = *node_id;
-        let Some(node) = scene.get_mut(node_id) else {
+        let Some(mut node) = scene.edit(node_id) else {
             return TextAction::None;
         };
         let NodeData::Text(text) = &mut node.data else {
@@ -251,7 +249,7 @@ impl TextToolState {
             return TextAction::None;
         }
 
-        let Some(node) = scene.get_mut(node_id) else {
+        let Some(mut node) = scene.edit(node_id) else {
             return TextAction::None;
         };
         let NodeData::Text(text) = &mut node.data else {
@@ -400,11 +398,9 @@ impl TextToolState {
         }
 
         // Restore the original text.
-        if let Some(node) = scene.get_mut(node_id)
-            && let NodeData::Text(text) = &mut node.data
-        {
+        scene.with_text_data_mut(node_id, |text| {
             *text = original;
-        }
+        });
 
         TextAction::Cancelled
     }

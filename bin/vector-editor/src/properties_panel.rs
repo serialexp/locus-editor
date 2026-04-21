@@ -51,9 +51,7 @@ pub(crate) fn show_properties(
                     .desired_width(ui.available_width()),
             );
             if resp.changed() {
-                if let Some(n) = scene.get_mut(node_ids[0]) {
-                    n.label = label;
-                }
+                scene.set_label(node_ids[0], label);
                 renderer.mark_dirty();
             }
         });
@@ -173,9 +171,7 @@ pub(crate) fn show_properties(
                                             id: node_id,
                                             transform: old_transform,
                                         });
-                                        if let Some(n) = scene.get_mut(node_id) {
-                                            n.transform = new_local;
-                                        }
+                                        scene.set_transform(node_id, new_local);
                                         renderer.mark_dirty();
                                     }
                                 }
@@ -198,9 +194,11 @@ pub(crate) fn show_properties(
                                 }
                             }
                             for &node_id in &node_ids {
-                                if let Some(node) = scene.get_mut(node_id) {
-                                    node.transform.tx += dx;
-                                    node.transform.ty += dy;
+                                if let Some(node) = scene.get(node_id) {
+                                    let mut t = node.transform;
+                                    t.tx += dx;
+                                    t.ty += dy;
+                                    scene.set_transform(node_id, t);
                                 }
                             }
                             if undo_cmds.len() == 1 {
@@ -239,9 +237,7 @@ pub(crate) fn show_properties(
                                     id: node_id,
                                     transform: old_transform,
                                 });
-                                if let Some(node) = scene.get_mut(node_id) {
-                                    node.transform = new_transform;
-                                }
+                                scene.set_transform(node_id, new_transform);
                                 renderer.mark_dirty();
                             }
                         }
@@ -647,25 +643,7 @@ pub(crate) fn show_properties(
 
         // Apply new style.
         for &node_id in &node_ids {
-            if let Some(node) = scene.get_mut(node_id) {
-                match &mut node.data {
-                    NodeData::Path {
-                        style: node_style, ..
-                    } => {
-                        *node_style = style.clone();
-                    }
-                    NodeData::Group {
-                        kind:
-                            GroupKind::Boolean {
-                                style: node_style, ..
-                            },
-                        ..
-                    } => {
-                        *node_style = style.clone();
-                    }
-                    _ => {}
-                }
-            }
+            scene.set_style(node_id, style.clone());
         }
 
         // Record undo.

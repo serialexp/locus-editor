@@ -76,52 +76,23 @@ impl Command {
                 })
             }
             Command::SetPathData { id, path } => {
-                let node = scene.get_mut(id)?;
-                let vector_scene::NodeData::Path {
-                    path: ref mut current,
-                    ..
-                } = node.data
-                else {
-                    return None;
-                };
-                let old = std::mem::replace(current, path);
+                let old = scene.set_path_data(id, path)?;
                 Some(Command::SetPathData { id, path: old })
             }
             Command::SetStyle { id, style } => {
-                let node = scene.get_mut(id)?;
-                let vector_scene::NodeData::Path {
-                    style: ref mut current,
-                    ..
-                } = node.data
-                else {
-                    return None;
-                };
-                let old = std::mem::replace(current, style);
+                let old = scene.set_style(id, style)?;
                 Some(Command::SetStyle { id, style: old })
             }
             Command::SetTextData { id, text } => {
-                let node = scene.get_mut(id)?;
-                let vector_scene::NodeData::Text(ref mut current) = node.data else {
-                    return None;
-                };
-                let old = std::mem::replace(current, text);
+                let old = scene.set_text_data(id, text)?;
                 Some(Command::SetTextData { id, text: old })
             }
             Command::SetTransform { id, transform } => {
-                let node = scene.get_mut(id)?;
-                let old = std::mem::replace(&mut node.transform, transform);
+                let old = scene.set_transform(id, transform)?;
                 Some(Command::SetTransform { id, transform: old })
             }
             Command::SetGroupKind { id, kind } => {
-                let node = scene.get_mut(id)?;
-                let vector_scene::NodeData::Group {
-                    kind: ref mut current,
-                    ..
-                } = node.data
-                else {
-                    return None;
-                };
-                let old = std::mem::replace(current, kind);
+                let old = scene.set_group_kind(id, kind)?;
                 Some(Command::SetGroupKind { id, kind: old })
             }
             Command::Reparent {

@@ -244,9 +244,10 @@ pub(crate) fn render_virtual_row(
             eye_color,
         );
         if eye_resp.clicked()
-            && let Some(n) = scene.get_mut(row.node_id)
+            && let Some(n) = scene.get(row.node_id)
         {
-            n.visible = !n.visible;
+            let new_visible = !n.visible;
+            scene.set_visible(row.node_id, new_visible);
             *scene_dirty = true;
         }
         let _ = eye_resp.on_hover_text(if row.visible { "Hide" } else { "Show" });

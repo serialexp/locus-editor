@@ -484,15 +484,13 @@ mod tests {
             .insert(root, Node::group("bool"))
             .expect("insert group");
         // Convert to a Boolean::Intersect group.
-        if let Some(node) = scene.get_mut(group_id) {
-            node.data = NodeData::Group {
-                is_defs: false,
-                kind: GroupKind::Boolean {
-                    op: BoolOp::Intersect,
-                    style: vector_scene::Style::default(),
-                },
-            };
-        }
+        scene.set_group_kind(
+            group_id,
+            GroupKind::Boolean {
+                op: BoolOp::Intersect,
+                style: vector_scene::Style::default(),
+            },
+        );
 
         scene
             .insert(group_id, Node::path("a", square(0.0, 0.0, 10.0)))

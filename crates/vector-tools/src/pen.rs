@@ -160,35 +160,29 @@ impl PenState {
         // anchor gives the incoming handle.
         let mirror = Point::new(2.0 * anchor.x - drag_pos.x, 2.0 * anchor.y - drag_pos.y);
 
-        let Some(subpath) = self.get_subpath_mut(scene) else {
-            return false;
-        };
+        // Read ctrl1 from the outgoing_stack before entering the closure
+        // (can't borrow self inside with_subpath_mut).
+        let outgoing = *self.outgoing_stack.last().unwrap_or(&None);
         let seg_idx = self.committed_count - 1;
 
-        // Read prev_anchor BEFORE taking the mutable borrow on the segment.
-        let prev_anchor = if seg_idx == 0 {
-            subpath.start
-        } else {
-            subpath.segments[seg_idx - 1].endpoint()
-        };
-
-        let Some(seg) = subpath.segments.get_mut(seg_idx) else {
-            return false;
-        };
-
-        // Determine ctrl1: the outgoing handle that was active when this
-        // segment was committed. We can read it from the outgoing_stack
-        // (the value pushed when this segment was added).
-        let ctrl1 = *self.outgoing_stack.last().unwrap_or(&None);
-        let ctrl1 = ctrl1.unwrap_or(prev_anchor);
-
-        *seg = Segment::Cubic {
-            ctrl1,
-            ctrl2: mirror,
-            to: anchor,
-        };
-
-        true
+        self.with_subpath_mut(scene, |subpath| {
+            let prev_anchor = if seg_idx == 0 {
+                subpath.start
+            } else {
+                subpath.segments[seg_idx - 1].endpoint()
+            };
+            let Some(seg) = subpath.segments.get_mut(seg_idx) else {
+                return false;
+            };
+            let ctrl1 = outgoing.unwrap_or(prev_anchor);
+            *seg = Segment::Cubic {
+                ctrl1,
+                ctrl2: mirror,
+                to: anchor,
+            };
+            true
+        })
+        .unwrap_or(false)
     }
 
     // ── Release ─────────────────────────────────────────────────────
@@ -209,18 +203,19 @@ impl PenState {
                 // First point: record start outgoing, upgrade start vertex mode.
                 self.start_outgoing = Some(drag_pos);
                 self.prev_outgoing = Some(drag_pos);
-                if let Some(subpath) = self.get_subpath_mut(scene) {
+                self.with_subpath_mut(scene, |subpath| {
                     subpath.vertex_modes[0] = vector_geom::VertexMode::Symmetric;
-                }
+                });
             } else {
                 self.prev_outgoing = Some(drag_pos);
                 // Upgrade the last committed endpoint to Symmetric.
-                if let Some(subpath) = self.get_subpath_mut(scene) {
+                let committed = self.committed_count;
+                self.with_subpath_mut(scene, |subpath| {
                     // vertex_modes index: 0 = start, committed_count = last endpoint.
-                    if let Some(mode) = subpath.vertex_modes.get_mut(self.committed_count) {
+                    if let Some(mode) = subpath.vertex_modes.get_mut(committed) {
                         *mode = vector_geom::VertexMode::Symmetric;
                     }
-                }
+                });
             }
         } else {
             // Click (no drag) — corner point, no outgoing handle.
@@ -252,21 +247,19 @@ impl PenState {
         // Build the preview segment.
         let preview = self.make_segment(prev_anchor, cursor);
 
-        let Some(subpath) = self.get_subpath_mut(scene) else {
-            return false;
-        };
-
-        // The subpath should have exactly committed_count segments before
-        // we add/update the preview.
-        if subpath.segments.len() > self.committed_count {
-            // Replace existing preview.
-            subpath.segments[self.committed_count] = preview;
-        } else {
-            // Add new preview.
-            subpath.push_segment(preview, vector_geom::VertexMode::Corner);
-        }
-
-        true
+        let committed = self.committed_count;
+        self.with_subpath_mut(scene, |subpath| {
+            // The subpath should have exactly committed_count segments
+            // before we add/update the preview.
+            if subpath.segments.len() > committed {
+                // Replace existing preview.
+                subpath.segments[committed] = preview;
+            } else {
+                // Add new preview.
+                subpath.push_segment(preview, vector_geom::VertexMode::Corner);
+            }
+        })
+        .is_some()
     }
 
     // ── Undo last point (right-click) ───────────────────────────────
@@ -283,12 +276,12 @@ impl PenState {
 
         if self.committed_count > 0 {
             // Remove the last committed segment.
-            if let Some(subpath) = self.get_subpath_mut(scene)
-                && !subpath.segments.is_empty()
-            {
-                subpath.segments.pop();
-                subpath.vertex_modes.pop();
-            }
+            self.with_subpath_mut(scene, |subpath| {
+                if !subpath.segments.is_empty() {
+                    subpath.segments.pop();
+                    subpath.vertex_modes.pop();
+                }
+            });
             self.committed_count -= 1;
             self.prev_outgoing = self.outgoing_stack.pop().flatten();
             // Also clear drag state in case undo happens mid-drag.
@@ -322,10 +315,12 @@ impl PenState {
 
         if close {
             // Add closing segment from last anchor back to start.
-            if let Some(node) = scene.get_mut(node_id)
-                && let NodeData::Path { ref mut path, .. } = node.data
-                && let Some(subpath) = path.subpaths.first_mut()
-            {
+            let prev_outgoing = self.prev_outgoing;
+            let start_outgoing = self.start_outgoing;
+            scene.with_path_data_mut(node_id, |path| {
+                let Some(subpath) = path.subpaths.first_mut() else {
+                    return;
+                };
                 let start = subpath.start;
                 let last_anchor = subpath
                     .segments
@@ -333,9 +328,8 @@ impl PenState {
                     .map(|s| s.endpoint())
                     .unwrap_or(start);
 
-                let ctrl1 = self.prev_outgoing.unwrap_or(last_anchor);
-                let ctrl2 = self
-                    .start_outgoing
+                let ctrl1 = prev_outgoing.unwrap_or(last_anchor);
+                let ctrl2 = start_outgoing
                     .map(|h| Point::new(2.0 * start.x - h.x, 2.0 * start.y - h.y))
                     .unwrap_or(start);
 
@@ -352,7 +346,7 @@ impl PenState {
 
                 subpath.push_segment(closing_seg, vector_geom::VertexMode::Corner);
                 subpath.closed = true;
-            }
+            });
         }
 
         // Remove degenerate paths (no segments).
@@ -437,36 +431,38 @@ impl PenState {
     }
 
     fn trim_to_committed_with_node(&self, scene: &mut Scene, node_id: NodeId) {
-        let Some(node) = scene.get_mut(node_id) else {
-            return;
-        };
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return;
-        };
-        let Some(subpath) = path.subpaths.first_mut() else {
-            return;
-        };
-        subpath.segments.truncate(self.committed_count);
-        // +1 because vertex_modes[0] is the start point.
-        subpath.vertex_modes.truncate(self.committed_count + 1);
+        let committed = self.committed_count;
+        scene.with_path_data_mut(node_id, |path| {
+            if let Some(subpath) = path.subpaths.first_mut() {
+                subpath.segments.truncate(committed);
+                // +1 because vertex_modes[0] is the start point.
+                subpath.vertex_modes.truncate(committed + 1);
+            }
+        });
     }
 
-    /// Get a mutable reference to the building subpath.
-    fn get_subpath_mut<'a>(&self, scene: &'a mut Scene) -> Option<&'a mut SubPath> {
-        let node = scene.get_mut(self.building_node?)?;
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return None;
-        };
-        path.subpaths.first_mut()
+    /// Run `f` with mutable access to the building subpath, returning
+    /// `f`'s result. Returns `None` if we're not building, the node was
+    /// lost, the node isn't a path, or the path has no subpath yet.
+    /// Auto-bumps `geometry_rev` via `with_path_data_mut` if the call
+    /// reached the closure.
+    fn with_subpath_mut<F, R>(&self, scene: &mut Scene, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut SubPath) -> R,
+    {
+        let node_id = self.building_node?;
+        scene
+            .with_path_data_mut(node_id, |path| path.subpaths.first_mut().map(f))
+            .flatten()
     }
 
     /// Push a segment onto the building subpath.
     /// The vertex mode for the new endpoint defaults to Corner;
     /// it gets upgraded to Symmetric on drag release.
     fn push_segment(&self, scene: &mut Scene, segment: Segment) {
-        if let Some(subpath) = self.get_subpath_mut(scene) {
+        self.with_subpath_mut(scene, |subpath| {
             subpath.push_segment(segment, vector_geom::VertexMode::Corner);
-        }
+        });
     }
 
     /// Build the appropriate segment type from `prev_anchor` to `to`,

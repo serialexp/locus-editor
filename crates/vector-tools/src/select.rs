@@ -80,160 +80,163 @@ impl VertexRef {
 
     /// Move this vertex by a delta in scene coordinates.
     pub fn translate(&self, scene: &mut Scene, dx: f64, dy: f64) {
-        let Some(node) = scene.get_mut(self.node) else {
-            return;
-        };
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return;
-        };
-        let Some(subpath) = path.subpaths.get_mut(self.subpath) else {
-            return;
-        };
+        let subpath_idx = self.subpath;
+        let segment_idx = self.segment;
+        let kind = self.kind;
+        scene.with_path_data_mut(self.node, |path| {
+            let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+                return;
+            };
 
-        match self.kind {
-            PointKind::SubpathStart => {
-                subpath.start.x += dx;
-                subpath.start.y += dy;
-            }
-            PointKind::Endpoint => {
-                if let Some(seg) = subpath.segments.get_mut(self.segment) {
-                    translate_endpoint(seg, dx, dy);
+            match kind {
+                PointKind::SubpathStart => {
+                    subpath.start.x += dx;
+                    subpath.start.y += dy;
+                }
+                PointKind::Endpoint => {
+                    if let Some(seg) = subpath.segments.get_mut(segment_idx) {
+                        translate_endpoint(seg, dx, dy);
+                    }
+                }
+                PointKind::QuadCtrl => {
+                    if let Some(Segment::Quad { ctrl, .. }) = subpath.segments.get_mut(segment_idx)
+                    {
+                        ctrl.x += dx;
+                        ctrl.y += dy;
+                    }
+                }
+                PointKind::CubicCtrl1 => {
+                    if let Some(Segment::Cubic { ctrl1, .. }) =
+                        subpath.segments.get_mut(segment_idx)
+                    {
+                        ctrl1.x += dx;
+                        ctrl1.y += dy;
+                    }
+                }
+                PointKind::CubicCtrl2 => {
+                    if let Some(Segment::Cubic { ctrl2, .. }) =
+                        subpath.segments.get_mut(segment_idx)
+                    {
+                        ctrl2.x += dx;
+                        ctrl2.y += dy;
+                    }
                 }
             }
-            PointKind::QuadCtrl => {
-                if let Some(Segment::Quad { ctrl, .. }) = subpath.segments.get_mut(self.segment) {
-                    ctrl.x += dx;
-                    ctrl.y += dy;
-                }
-            }
-            PointKind::CubicCtrl1 => {
-                if let Some(Segment::Cubic { ctrl1, .. }) = subpath.segments.get_mut(self.segment) {
-                    ctrl1.x += dx;
-                    ctrl1.y += dy;
-                }
-            }
-            PointKind::CubicCtrl2 => {
-                if let Some(Segment::Cubic { ctrl2, .. }) = subpath.segments.get_mut(self.segment) {
-                    ctrl2.x += dx;
-                    ctrl2.y += dy;
-                }
-            }
-        }
+        });
     }
 }
 
 /// After moving a control point, enforce the vertex mode constraint on
 /// the opposite handle at the same anchor vertex.
 fn enforce_vertex_constraint(vr: &VertexRef, scene: &mut Scene) {
-    let Some(node) = scene.get_mut(vr.node) else {
-        return;
-    };
-    let NodeData::Path { ref mut path, .. } = node.data else {
-        return;
-    };
-    let Some(subpath) = path.subpaths.get_mut(vr.subpath) else {
-        return;
-    };
+    let subpath_idx = vr.subpath;
+    let segment_idx = vr.segment;
+    let kind = vr.kind;
+    scene.with_path_data_mut(vr.node, |path| {
+        let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+            return;
+        };
 
-    match vr.kind {
-        PointKind::CubicCtrl1 => {
-            // ctrl1 of segment[seg] belongs to anchor at vertex_modes[seg].
-            let anchor_mode = subpath
-                .vertex_modes
-                .get(vr.segment)
-                .copied()
-                .unwrap_or(VertexMode::Corner);
-            if anchor_mode == VertexMode::Corner {
-                return;
+        match kind {
+            PointKind::CubicCtrl1 => {
+                // ctrl1 of segment[seg] belongs to anchor at vertex_modes[seg].
+                let anchor_mode = subpath
+                    .vertex_modes
+                    .get(segment_idx)
+                    .copied()
+                    .unwrap_or(VertexMode::Corner);
+                if anchor_mode == VertexMode::Corner {
+                    return;
+                }
+
+                // The anchor point is the endpoint of segment[seg-1], or subpath.start.
+                let anchor = if segment_idx == 0 {
+                    subpath.start
+                } else {
+                    subpath.segments[segment_idx - 1].endpoint()
+                };
+
+                let ctrl1 = match &subpath.segments[segment_idx] {
+                    Segment::Cubic { ctrl1, .. } => *ctrl1,
+                    _ => return,
+                };
+
+                // The opposite handle is ctrl2 of the previous segment (incoming to anchor).
+                // For closed paths, segment 0's anchor wraps to the last segment.
+                let prev_idx = if segment_idx > 0 {
+                    Some(segment_idx - 1)
+                } else if subpath.closed && !subpath.segments.is_empty() {
+                    Some(subpath.segments.len() - 1)
+                } else {
+                    None
+                };
+                let Some(prev_idx) = prev_idx else {
+                    return;
+                };
+                let prev = &mut subpath.segments[prev_idx];
+                match prev {
+                    Segment::Cubic { ctrl2, .. } => {
+                        mirror_handle(anchor, ctrl1, ctrl2, anchor_mode);
+                    }
+                    Segment::Quad { ctrl, .. } => {
+                        mirror_handle(anchor, ctrl1, ctrl, anchor_mode);
+                    }
+                    _ => {}
+                }
             }
-
-            // The anchor point is the endpoint of segment[seg-1], or subpath.start.
-            let anchor = if vr.segment == 0 {
-                subpath.start
-            } else {
-                subpath.segments[vr.segment - 1].endpoint()
-            };
-
-            let ctrl1 = match &subpath.segments[vr.segment] {
-                Segment::Cubic { ctrl1, .. } => *ctrl1,
-                _ => return,
-            };
-
-            // The opposite handle is ctrl2 of the previous segment (incoming to anchor).
-            // For closed paths, segment 0's anchor wraps to the last segment.
-            let prev_idx = if vr.segment > 0 {
-                Some(vr.segment - 1)
-            } else if subpath.closed && !subpath.segments.is_empty() {
-                Some(subpath.segments.len() - 1)
-            } else {
-                None
-            };
-            let Some(prev_idx) = prev_idx else {
-                return;
-            };
-            let prev = &mut subpath.segments[prev_idx];
-            match prev {
-                Segment::Cubic { ctrl2, .. } => {
-                    mirror_handle(anchor, ctrl1, ctrl2, anchor_mode);
+            PointKind::CubicCtrl2 => {
+                // ctrl2 of segment[seg] belongs to anchor at vertex_modes[seg+1].
+                let anchor_mode = subpath
+                    .vertex_modes
+                    .get(segment_idx + 1)
+                    .copied()
+                    .unwrap_or(VertexMode::Corner);
+                if anchor_mode == VertexMode::Corner {
+                    return;
                 }
-                Segment::Quad { ctrl, .. } => {
-                    mirror_handle(anchor, ctrl1, ctrl, anchor_mode);
+
+                let anchor = subpath.segments[segment_idx].endpoint();
+                let ctrl2 = match &subpath.segments[segment_idx] {
+                    Segment::Cubic { ctrl2, .. } => *ctrl2,
+                    _ => return,
+                };
+
+                // The opposite handle is ctrl1 of the next segment (outgoing from anchor).
+                // For closed paths, the last segment's anchor wraps to segment 0.
+                let next_idx = segment_idx + 1;
+                let wrap_idx = if next_idx < subpath.segments.len() {
+                    Some(next_idx)
+                } else if subpath.closed && !subpath.segments.is_empty() {
+                    Some(0)
+                } else {
+                    None
+                };
+                let Some(wrap_idx) = wrap_idx else {
+                    return;
+                };
+                let next = &mut subpath.segments[wrap_idx];
+                match next {
+                    Segment::Cubic { ctrl1, .. } => {
+                        mirror_handle(anchor, ctrl2, ctrl1, anchor_mode);
+                    }
+                    Segment::Quad { ctrl, .. } => {
+                        mirror_handle(anchor, ctrl2, ctrl, anchor_mode);
+                    }
+                    _ => {}
                 }
-                _ => {}
+            }
+            PointKind::QuadCtrl => {
+                // Quad control point affects both the "from" and "to" anchors.
+                // For simplicity, constrain the "from" anchor's opposite handle
+                // (incoming) and the "to" anchor's opposite handle (outgoing).
+                // This is complex for quads; skip for now since quads are rare
+                // in practice (most curves are cubics).
+            }
+            _ => {
+                // Endpoints and SubpathStart don't trigger handle constraints.
             }
         }
-        PointKind::CubicCtrl2 => {
-            // ctrl2 of segment[seg] belongs to anchor at vertex_modes[seg+1].
-            let anchor_mode = subpath
-                .vertex_modes
-                .get(vr.segment + 1)
-                .copied()
-                .unwrap_or(VertexMode::Corner);
-            if anchor_mode == VertexMode::Corner {
-                return;
-            }
-
-            let anchor = subpath.segments[vr.segment].endpoint();
-            let ctrl2 = match &subpath.segments[vr.segment] {
-                Segment::Cubic { ctrl2, .. } => *ctrl2,
-                _ => return,
-            };
-
-            // The opposite handle is ctrl1 of the next segment (outgoing from anchor).
-            // For closed paths, the last segment's anchor wraps to segment 0.
-            let next_idx = vr.segment + 1;
-            let wrap_idx = if next_idx < subpath.segments.len() {
-                Some(next_idx)
-            } else if subpath.closed && !subpath.segments.is_empty() {
-                Some(0)
-            } else {
-                None
-            };
-            let Some(wrap_idx) = wrap_idx else {
-                return;
-            };
-            let next = &mut subpath.segments[wrap_idx];
-            match next {
-                Segment::Cubic { ctrl1, .. } => {
-                    mirror_handle(anchor, ctrl2, ctrl1, anchor_mode);
-                }
-                Segment::Quad { ctrl, .. } => {
-                    mirror_handle(anchor, ctrl2, ctrl, anchor_mode);
-                }
-                _ => {}
-            }
-        }
-        PointKind::QuadCtrl => {
-            // Quad control point affects both the "from" and "to" anchors.
-            // For simplicity, constrain the "from" anchor's opposite handle
-            // (incoming) and the "to" anchor's opposite handle (outgoing).
-            // This is complex for quads; skip for now since quads are rare
-            // in practice (most curves are cubics).
-        }
-        _ => {
-            // Endpoints and SubpathStart don't trigger handle constraints.
-        }
-    }
+    });
 }
 
 /// Fraction of segment length to place initial cubic handles at.
@@ -988,12 +991,6 @@ impl SelectState {
         vr: &VertexRef,
         new_mode: VertexMode,
     ) -> Option<VertexMode> {
-        let node = scene.get_mut(vr.node)?;
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return None;
-        };
-        let subpath = path.subpaths.get_mut(vr.subpath)?;
-
         // Determine which vertex_modes index this anchor maps to.
         let mode_idx = match vr.kind {
             PointKind::SubpathStart => 0,
@@ -1003,27 +1000,31 @@ impl SelectState {
             PointKind::CubicCtrl2 => vr.segment + 1,
         };
 
-        let mode = subpath.vertex_modes.get_mut(mode_idx)?;
-        let old_mode = *mode;
-        if old_mode == new_mode {
-            return Some(new_mode);
-        }
-        *mode = new_mode;
+        let subpath_idx = vr.subpath;
+        scene.with_path_data_mut(vr.node, |path| {
+            let subpath = path.subpaths.get_mut(subpath_idx)?;
+            let mode = subpath.vertex_modes.get_mut(mode_idx)?;
+            let old_mode = *mode;
+            if old_mode == new_mode {
+                return Some(new_mode);
+            }
+            *mode = new_mode;
 
-        // Whenever we land in Smooth/Symmetric, make sure the adjacent
-        // segments are cubics with both handles visibly spread from the
-        // anchor and that the new mode's constraint is satisfied.
-        //
-        // We have to do this on EVERY transition into a non-Corner mode —
-        // not just from Corner — because Smooth permits handles with length
-        // 0 (one side collapsed at the anchor). Switching Smooth → Symmetric
-        // without re-spreading would leave the collapsed handle invisible,
-        // even though Symmetric implies it should mirror the other side.
-        if new_mode != VertexMode::Corner {
-            ensure_cubic_handles(subpath, mode_idx);
-        }
+            // Whenever we land in Smooth/Symmetric, make sure the adjacent
+            // segments are cubics with both handles visibly spread from the
+            // anchor and that the new mode's constraint is satisfied.
+            //
+            // We have to do this on EVERY transition into a non-Corner mode —
+            // not just from Corner — because Smooth permits handles with length
+            // 0 (one side collapsed at the anchor). Switching Smooth → Symmetric
+            // without re-spreading would leave the collapsed handle invisible,
+            // even though Symmetric implies it should mirror the other side.
+            if new_mode != VertexMode::Corner {
+                ensure_cubic_handles(subpath, mode_idx);
+            }
 
-        Some(new_mode)
+            Some(new_mode)
+        })?
     }
 
     /// Cycle a vertex's mode: Corner → Smooth → Symmetric → Corner.
@@ -1227,9 +1228,11 @@ impl SelectState {
                         continue;
                     };
 
-                    if let Some(node) = scene.get_mut(node_id) {
-                        node.transform.tx += local_dx;
-                        node.transform.ty += local_dy;
+                    if let Some(node) = scene.get(node_id) {
+                        let mut t = node.transform;
+                        t.tx += local_dx;
+                        t.ty += local_dy;
+                        scene.set_transform(node_id, t);
                     }
                 }
 
@@ -1253,7 +1256,7 @@ impl SelectState {
                     // Get the node's world-space position and compute where
                     // it should move after rotating around center_pt.
                     let parent_world = scene.parent_world_transform(node_id);
-                    let Some(node) = scene.get_mut(node_id) else {
+                    let Some(node) = scene.get(node_id) else {
                         continue;
                     };
 
@@ -1267,7 +1270,7 @@ impl SelectState {
                     let world = parent_world.then(old_local);
                     let new_world = rot.then(world);
                     if let Some(inv_parent) = parent_world.inverse() {
-                        node.transform = inv_parent.then(new_world);
+                        scene.set_transform(node_id, inv_parent.then(new_world));
                     }
                 }
 
@@ -1323,10 +1326,8 @@ impl SelectState {
                     let parent_world = scene.parent_world_transform(node_id);
                     let orig_world = parent_world.then(orig_local);
                     let new_world = scale_world.then(orig_world);
-                    if let Some(inv_parent) = parent_world.inverse()
-                        && let Some(node) = scene.get_mut(node_id)
-                    {
-                        node.transform = inv_parent.then(new_world);
+                    if let Some(inv_parent) = parent_world.inverse() {
+                        scene.set_transform(node_id, inv_parent.then(new_world));
                     }
                 }
 
@@ -1480,52 +1481,49 @@ impl SelectState {
         let mut nodes_to_remove = Vec::new();
 
         for vr in &anchor_vertices {
-            let Some(node) = scene.get_mut(vr.node) else {
-                continue;
-            };
-            let NodeData::Path { ref mut path, .. } = node.data else {
-                continue;
-            };
-            let Some(subpath) = path.subpaths.get_mut(vr.subpath) else {
-                continue;
-            };
+            let subpath_idx = vr.subpath;
+            let segment_idx = vr.segment;
+            let kind = vr.kind;
+            scene.with_path_data_mut(vr.node, |path| {
+                let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+                    return;
+                };
 
-            match vr.kind {
-                PointKind::SubpathStart if !subpath.segments.is_empty() => {
-                    // Move start to the first segment's endpoint and remove
-                    // that segment.
-                    subpath.start = subpath.segments[0].endpoint();
-                    subpath.segments.remove(0);
-                    // Remove the start point's mode, shift the next one
-                    // into position 0 (it becomes the new start).
-                    if subpath.vertex_modes.len() > 1 {
-                        subpath.vertex_modes.remove(0);
+                match kind {
+                    PointKind::SubpathStart if !subpath.segments.is_empty() => {
+                        // Move start to the first segment's endpoint and remove
+                        // that segment.
+                        subpath.start = subpath.segments[0].endpoint();
+                        subpath.segments.remove(0);
+                        // Remove the start point's mode, shift the next one
+                        // into position 0 (it becomes the new start).
+                        if subpath.vertex_modes.len() > 1 {
+                            subpath.vertex_modes.remove(0);
+                        }
                     }
-                }
-                PointKind::Endpoint if vr.segment < subpath.segments.len() => {
-                    subpath.segments.remove(vr.segment);
-                    // vertex_modes index for this endpoint is vr.segment + 1.
-                    let mode_idx = vr.segment + 1;
-                    if mode_idx < subpath.vertex_modes.len() {
-                        subpath.vertex_modes.remove(mode_idx);
+                    PointKind::Endpoint if segment_idx < subpath.segments.len() => {
+                        subpath.segments.remove(segment_idx);
+                        // vertex_modes index for this endpoint is segment_idx + 1.
+                        let mode_idx = segment_idx + 1;
+                        if mode_idx < subpath.vertex_modes.len() {
+                            subpath.vertex_modes.remove(mode_idx);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
+            });
         }
 
         // Clean up: remove empty subpaths and empty paths.
         for vr in &anchor_vertices {
-            let Some(node) = scene.get_mut(vr.node) else {
-                continue;
-            };
-            let NodeData::Path { ref mut path, .. } = node.data else {
-                continue;
-            };
-            // Remove subpaths with no segments (just a lone point).
-            path.subpaths.retain(|sp| !sp.segments.is_empty());
-            // Mark empty paths for removal.
-            if path.subpaths.is_empty() {
+            let is_empty = scene
+                .with_path_data_mut(vr.node, |path| {
+                    // Remove subpaths with no segments (just a lone point).
+                    path.subpaths.retain(|sp| !sp.segments.is_empty());
+                    path.subpaths.is_empty()
+                })
+                .unwrap_or(false);
+            if is_empty {
                 nodes_to_remove.push(vr.node);
             }
         }
@@ -1700,191 +1698,194 @@ impl SelectState {
     /// it as a new explicit `Line` segment appended to the subpath; the new
     /// closing line then runs from the inserted vertex back to start.
     pub fn insert_point_on_edge(scene: &mut Scene, hit: &EdgeHit) -> Option<VertexRef> {
-        let node = scene.get_mut(hit.node)?;
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return None;
-        };
-        let subpath = path.subpaths.get_mut(hit.subpath)?;
+        let subpath_idx = hit.subpath;
         let seg_idx = hit.segment;
+        let t = hit.t;
+        let node_id = hit.node;
+        scene
+            .with_path_data_mut(node_id, |path| {
+                let subpath = path.subpaths.get_mut(subpath_idx)?;
 
-        // Closing-edge case: hit is on the virtual line from the last
-        // endpoint back to subpath.start. Append a Line segment ending at
-        // the split point so the implicit closing line still terminates at
-        // subpath.start, just from the new vertex.
-        if seg_idx == subpath.segments.len() {
-            if !subpath.closed || subpath.segments.is_empty() {
-                return None;
-            }
-            let from = subpath.segments[seg_idx - 1].endpoint();
-            let closing = Segment::Line { to: subpath.start };
-            let (first, _second) = closing.split_at(from, hit.t);
-            subpath.segments.push(first);
-            subpath.vertex_modes.insert(seg_idx + 1, VertexMode::Corner);
-            return Some(VertexRef {
-                node: hit.node,
-                subpath: hit.subpath,
-                segment: seg_idx,
-                kind: PointKind::Endpoint,
-            });
-        }
+                // Closing-edge case: hit is on the virtual line from the last
+                // endpoint back to subpath.start. Append a Line segment ending at
+                // the split point so the implicit closing line still terminates at
+                // subpath.start, just from the new vertex.
+                if seg_idx == subpath.segments.len() {
+                    if !subpath.closed || subpath.segments.is_empty() {
+                        return None;
+                    }
+                    let from = subpath.segments[seg_idx - 1].endpoint();
+                    let closing = Segment::Line { to: subpath.start };
+                    let (first, _second) = closing.split_at(from, t);
+                    subpath.segments.push(first);
+                    subpath.vertex_modes.insert(seg_idx + 1, VertexMode::Corner);
+                    return Some(VertexRef {
+                        node: node_id,
+                        subpath: subpath_idx,
+                        segment: seg_idx,
+                        kind: PointKind::Endpoint,
+                    });
+                }
 
-        if seg_idx >= subpath.segments.len() {
-            return None;
-        }
+                if seg_idx >= subpath.segments.len() {
+                    return None;
+                }
 
-        // Determine the "from" point (implicit start of this segment).
-        let from = if seg_idx == 0 {
-            subpath.start
-        } else {
-            subpath.segments[seg_idx - 1].endpoint()
-        };
+                // Determine the "from" point (implicit start of this segment).
+                let from = if seg_idx == 0 {
+                    subpath.start
+                } else {
+                    subpath.segments[seg_idx - 1].endpoint()
+                };
 
-        // Split the segment at t.
-        let (first, second) = subpath.segments[seg_idx].split_at(from, hit.t);
+                // Split the segment at t.
+                let (first, second) = subpath.segments[seg_idx].split_at(from, t);
 
-        // Replace the original segment with the two halves.
-        subpath.segments[seg_idx] = first;
-        subpath.segments.insert(seg_idx + 1, second);
-        // Insert a vertex mode for the new split point (Corner by default).
-        subpath.vertex_modes.insert(seg_idx + 1, VertexMode::Corner);
+                // Replace the original segment with the two halves.
+                subpath.segments[seg_idx] = first;
+                subpath.segments.insert(seg_idx + 1, second);
+                // Insert a vertex mode for the new split point (Corner by default).
+                subpath.vertex_modes.insert(seg_idx + 1, VertexMode::Corner);
 
-        // The new point is the endpoint of `first` (at seg_idx).
-        Some(VertexRef {
-            node: hit.node,
-            subpath: hit.subpath,
-            segment: seg_idx,
-            kind: PointKind::Endpoint,
-        })
+                // The new point is the endpoint of `first` (at seg_idx).
+                Some(VertexRef {
+                    node: node_id,
+                    subpath: subpath_idx,
+                    segment: seg_idx,
+                    kind: PointKind::Endpoint,
+                })
+            })
+            .flatten()
     }
 
     /// Convert a segment to a Line (straight between its endpoints).
     /// Returns true if the segment was changed.
     pub fn convert_segment_to_line(scene: &mut Scene, hit: &EdgeHit) -> bool {
-        let Some(node) = scene.get_mut(hit.node) else {
-            return false;
-        };
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return false;
-        };
-        let Some(subpath) = path.subpaths.get_mut(hit.subpath) else {
-            return false;
-        };
-        let Some(seg) = subpath.segments.get_mut(hit.segment) else {
-            return false;
-        };
-        if matches!(seg, Segment::Line { .. }) {
-            return false; // already a line
-        }
-        let to = seg.endpoint();
-        *seg = Segment::Line { to };
-        true
+        let subpath_idx = hit.subpath;
+        let seg_idx = hit.segment;
+        scene
+            .with_path_data_mut(hit.node, |path| {
+                let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+                    return false;
+                };
+                let Some(seg) = subpath.segments.get_mut(seg_idx) else {
+                    return false;
+                };
+                if matches!(seg, Segment::Line { .. }) {
+                    return false; // already a line
+                }
+                let to = seg.endpoint();
+                *seg = Segment::Line { to };
+                true
+            })
+            .unwrap_or(false)
     }
 
     /// Convert a segment to a Quad. For Cubics, the control point is the
     /// average of ctrl1 and ctrl2. For Lines, the control point is the
     /// midpoint of the segment. Returns true if the segment was changed.
     pub fn convert_segment_to_quad(scene: &mut Scene, hit: &EdgeHit) -> bool {
-        let Some(node) = scene.get_mut(hit.node) else {
-            return false;
-        };
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return false;
-        };
-        let Some(subpath) = path.subpaths.get_mut(hit.subpath) else {
-            return false;
-        };
-        // Determine the "from" point for this segment.
-        let from = if hit.segment == 0 {
-            subpath.start
-        } else {
-            subpath.segments[hit.segment - 1].endpoint()
-        };
-        let Some(seg) = subpath.segments.get_mut(hit.segment) else {
-            return false;
-        };
-        if matches!(seg, Segment::Quad { .. }) {
-            return false; // already a quad
-        }
-        match seg {
-            Segment::Line { to } => {
-                let mid = Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
-                *seg = Segment::Quad { ctrl: mid, to: *to };
-            }
-            Segment::Cubic { ctrl1, ctrl2, to } => {
-                let ctrl = Point::new((ctrl1.x + ctrl2.x) * 0.5, (ctrl1.y + ctrl2.y) * 0.5);
-                *seg = Segment::Quad { ctrl, to: *to };
-            }
-            Segment::Arc { to, .. } => {
-                let mid = Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
-                *seg = Segment::Quad { ctrl: mid, to: *to };
-            }
-            _ => return false,
-        }
-        true
+        let subpath_idx = hit.subpath;
+        let seg_idx = hit.segment;
+        scene
+            .with_path_data_mut(hit.node, |path| {
+                let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+                    return false;
+                };
+                // Determine the "from" point for this segment.
+                let from = if seg_idx == 0 {
+                    subpath.start
+                } else {
+                    subpath.segments[seg_idx - 1].endpoint()
+                };
+                let Some(seg) = subpath.segments.get_mut(seg_idx) else {
+                    return false;
+                };
+                if matches!(seg, Segment::Quad { .. }) {
+                    return false; // already a quad
+                }
+                match seg {
+                    Segment::Line { to } => {
+                        let mid = Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+                        *seg = Segment::Quad { ctrl: mid, to: *to };
+                    }
+                    Segment::Cubic { ctrl1, ctrl2, to } => {
+                        let ctrl = Point::new((ctrl1.x + ctrl2.x) * 0.5, (ctrl1.y + ctrl2.y) * 0.5);
+                        *seg = Segment::Quad { ctrl, to: *to };
+                    }
+                    Segment::Arc { to, .. } => {
+                        let mid = Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+                        *seg = Segment::Quad { ctrl: mid, to: *to };
+                    }
+                    _ => return false,
+                }
+                true
+            })
+            .unwrap_or(false)
     }
 
     /// Convert a segment to a Cubic. Quads are degree-elevated (exact shape
     /// preservation). Lines get handles at 1/3 of the segment length.
     /// Returns true if the segment was changed.
     pub fn convert_segment_to_cubic(scene: &mut Scene, hit: &EdgeHit) -> bool {
-        let Some(node) = scene.get_mut(hit.node) else {
-            return false;
-        };
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return false;
-        };
-        let Some(subpath) = path.subpaths.get_mut(hit.subpath) else {
-            return false;
-        };
-        let from = if hit.segment == 0 {
-            subpath.start
-        } else {
-            subpath.segments[hit.segment - 1].endpoint()
-        };
-        let Some(seg) = subpath.segments.get_mut(hit.segment) else {
-            return false;
-        };
-        if matches!(seg, Segment::Cubic { .. }) {
-            return false; // already a cubic
-        }
-        match seg {
-            Segment::Line { to } => {
-                let dx = to.x - from.x;
-                let dy = to.y - from.y;
-                *seg = Segment::Cubic {
-                    ctrl1: Point::new(from.x + dx / 3.0, from.y + dy / 3.0),
-                    ctrl2: Point::new(from.x + 2.0 * dx / 3.0, from.y + 2.0 * dy / 3.0),
-                    to: *to,
+        let subpath_idx = hit.subpath;
+        let seg_idx = hit.segment;
+        scene
+            .with_path_data_mut(hit.node, |path| {
+                let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+                    return false;
                 };
-            }
-            Segment::Quad { ctrl, to } => {
-                // Degree elevation: exact shape preservation.
-                let c1 = Point::new(
-                    from.x + 2.0 / 3.0 * (ctrl.x - from.x),
-                    from.y + 2.0 / 3.0 * (ctrl.y - from.y),
-                );
-                let c2 = Point::new(
-                    to.x + 2.0 / 3.0 * (ctrl.x - to.x),
-                    to.y + 2.0 / 3.0 * (ctrl.y - to.y),
-                );
-                *seg = Segment::Cubic {
-                    ctrl1: c1,
-                    ctrl2: c2,
-                    to: *to,
+                let from = if seg_idx == 0 {
+                    subpath.start
+                } else {
+                    subpath.segments[seg_idx - 1].endpoint()
                 };
-            }
-            Segment::Arc { to, .. } => {
-                let dx = to.x - from.x;
-                let dy = to.y - from.y;
-                *seg = Segment::Cubic {
-                    ctrl1: Point::new(from.x + dx / 3.0, from.y + dy / 3.0),
-                    ctrl2: Point::new(from.x + 2.0 * dx / 3.0, from.y + 2.0 * dy / 3.0),
-                    to: *to,
+                let Some(seg) = subpath.segments.get_mut(seg_idx) else {
+                    return false;
                 };
-            }
-            _ => return false,
-        }
-        true
+                if matches!(seg, Segment::Cubic { .. }) {
+                    return false; // already a cubic
+                }
+                match seg {
+                    Segment::Line { to } => {
+                        let dx = to.x - from.x;
+                        let dy = to.y - from.y;
+                        *seg = Segment::Cubic {
+                            ctrl1: Point::new(from.x + dx / 3.0, from.y + dy / 3.0),
+                            ctrl2: Point::new(from.x + 2.0 * dx / 3.0, from.y + 2.0 * dy / 3.0),
+                            to: *to,
+                        };
+                    }
+                    Segment::Quad { ctrl, to } => {
+                        // Degree elevation: exact shape preservation.
+                        let c1 = Point::new(
+                            from.x + 2.0 / 3.0 * (ctrl.x - from.x),
+                            from.y + 2.0 / 3.0 * (ctrl.y - from.y),
+                        );
+                        let c2 = Point::new(
+                            to.x + 2.0 / 3.0 * (ctrl.x - to.x),
+                            to.y + 2.0 / 3.0 * (ctrl.y - to.y),
+                        );
+                        *seg = Segment::Cubic {
+                            ctrl1: c1,
+                            ctrl2: c2,
+                            to: *to,
+                        };
+                    }
+                    Segment::Arc { to, .. } => {
+                        let dx = to.x - from.x;
+                        let dy = to.y - from.y;
+                        *seg = Segment::Cubic {
+                            ctrl1: Point::new(from.x + dx / 3.0, from.y + dy / 3.0),
+                            ctrl2: Point::new(from.x + 2.0 * dx / 3.0, from.y + 2.0 * dy / 3.0),
+                            to: *to,
+                        };
+                    }
+                    _ => return false,
+                }
+                true
+            })
+            .unwrap_or(false)
     }
 
     /// Return the current type of a segment identified by an `EdgeHit`.

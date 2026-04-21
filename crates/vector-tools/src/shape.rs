@@ -52,16 +52,8 @@ impl ShapeDrawState {
         let Some(node_id) = self.preview_node else {
             return false;
         };
-        let Some(node) = scene.get_mut(node_id) else {
-            return false;
-        };
-
-        let NodeData::Path { ref mut path, .. } = node.data else {
-            return false;
-        };
-
-        *path = build_shape_path(tool, anchor, canvas_pos);
-        true
+        let new_path = build_shape_path(tool, anchor, canvas_pos);
+        scene.set_path_data(node_id, new_path).is_some()
     }
 
     /// Handle mouse release — finalize the shape. Returns the node ID of the
