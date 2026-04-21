@@ -164,17 +164,26 @@ impl Scene {
 
     /// Walk the tree depth-first from a given root, calling `f` for each node
     /// with its accumulated world transform.
+    ///
+    /// The visitor returns a `bool` indicating whether to descend into this
+    /// node's children: `true` = walk the subtree, `false` = prune the
+    /// subtree. This is how visibility cascades — if a group is hidden, its
+    /// visitor returns `false` and the entire subtree is skipped, so hidden
+    /// groups hide their children even though groups themselves render
+    /// nothing.
     pub fn walk_depth_first(
         &self,
         from: NodeId,
         parent_transform: vector_geom::Affine,
-        f: &mut impl FnMut(NodeId, &Node, vector_geom::Affine),
+        f: &mut impl FnMut(NodeId, &Node, vector_geom::Affine) -> bool,
     ) {
         let Some(node) = self.get(from) else {
             return;
         };
         let world = parent_transform.then(node.transform);
-        f(from, node, world);
+        if !f(from, node, world) {
+            return;
+        }
         // Clone children to avoid borrow issues
         let children: Vec<NodeId> = node.children.clone();
         for child in children {
@@ -242,12 +251,13 @@ impl Scene {
             vector_geom::Affine::IDENTITY,
             &mut |_id, node, world| {
                 if !node.visible {
-                    return;
+                    return false;
                 }
                 let node_bounds = node.data.visual_bounds(world);
                 if !node_bounds.is_empty() {
                     bounds = bounds.union(node_bounds);
                 }
+                true
             },
         );
         bounds

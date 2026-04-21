@@ -203,6 +203,10 @@ pub struct Renderer {
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     num_indices: u32,
+    /// Number of vertices in the scene vertex buffer (for stats/debugging).
+    num_vertices: u32,
+    /// Number of path nodes contributing to the scene mesh (for stats/debugging).
+    num_paths: u32,
     /// Grid overlay buffers — rebuilt every frame (depends on camera).
     grid_vertex_buffer: Option<wgpu::Buffer>,
     grid_index_buffer: Option<wgpu::Buffer>,
@@ -235,6 +239,18 @@ pub struct Renderer {
     pub text_cursor: Option<TextCursorInfo>,
     /// Node currently being text-edited (for drawing a distinct bounding box).
     pub text_editing_node: Option<NodeId>,
+}
+
+/// Post-tessellation geometry stats for the scene (excluding grid / handle
+/// overlays). Useful for a performance HUD.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RenderStats {
+    /// Number of path (and text) nodes that contributed geometry.
+    pub paths: u32,
+    /// Total vertex count in the scene mesh.
+    pub vertices: u32,
+    /// Total triangle count in the scene mesh.
+    pub triangles: u32,
 }
 
 /// Information needed to render a text editing cursor (caret).
@@ -324,6 +340,8 @@ impl Renderer {
             vertex_buffer: None,
             index_buffer: None,
             num_indices: 0,
+            num_vertices: 0,
+            num_paths: 0,
             grid_vertex_buffer: None,
             grid_index_buffer: None,
             grid_num_indices: 0,
@@ -350,6 +368,17 @@ impl Renderer {
         self.dirty = true;
     }
 
+    /// Post-tessellation counts for the scene geometry — useful for perf
+    /// HUDs and debugging. Does not include grid or handle overlays. Values
+    /// reflect the most recent successful `prepare()` call.
+    pub fn scene_stats(&self) -> RenderStats {
+        RenderStats {
+            paths: self.num_paths,
+            vertices: self.num_vertices,
+            triangles: self.num_indices / 3,
+        }
+    }
+
     /// Update the viewport size and camera transform.
     pub fn resize(&mut self, width: f32, height: f32) {
         self.set_camera(width, height, [0.0, 0.0], 1.0);
@@ -372,6 +401,7 @@ impl Renderer {
         scene: &Scene,
         selection: &SelectState,
     ) {
+        profiling::scope!("Renderer::prepare");
         // Always upload the view-projection matrix (it may have changed on resize)
         queue.write_buffer(
             &self.globals_buffer,
@@ -380,14 +410,21 @@ impl Renderer {
         );
 
         // Rebuild grid every frame (depends on camera, which changes without dirtying scene)
-        self.build_grid(device);
+        {
+            profiling::scope!("build_grid");
+            self.build_grid(device);
+        }
 
         // Always rebuild handle overlay (selection can change without scene changing)
-        self.build_handles(device, scene, selection, self.zoom);
+        {
+            profiling::scope!("build_handles");
+            self.build_handles(device, scene, selection, self.zoom);
+        }
 
         if !self.dirty {
             return;
         }
+        profiling::scope!("scene_tessellation");
         self.dirty = false;
 
         // ── Collect gradient descriptors from the defs subtree ──────────
@@ -854,15 +891,17 @@ impl Renderer {
         let mut font_db = global_font_db();
 
         let root = scene.root();
+        let mut path_count: u32 = 0;
         scene.walk_depth_first(root, Affine::IDENTITY, &mut |_id, node, world_transform| {
             if !node.visible {
-                return;
+                return false;
             }
             match node.data {
                 NodeData::Path {
                     ref path,
                     ref style,
                 } => {
+                    path_count += 1;
                     let fill = style.fill.as_ref().map(|f| FillParams {
                         paint: resolve_paint(&f.paint),
                         opacity: f.opacity,
@@ -873,6 +912,7 @@ impl Renderer {
                     push_mesh(mesh, &world_transform, &mut all_vertices, &mut all_indices);
                 }
                 NodeData::Text(ref text) => {
+                    path_count += 1;
                     let shaped =
                         font_db.shape_text(&text.content, &text.font_family, text.font_size);
                     let fill = text.style.fill.as_ref().map(|f| FillParams {
@@ -886,9 +926,12 @@ impl Renderer {
                 }
                 _ => {}
             }
+            true
         });
 
         self.num_indices = all_indices.len() as u32;
+        self.num_vertices = all_vertices.len() as u32;
+        self.num_paths = path_count;
 
         if self.num_indices > 0 {
             use wgpu::util::DeviceExt;
@@ -1259,8 +1302,11 @@ impl Renderer {
 
             let root = scene.root();
             scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
-                if !node.visible || !selection.is_node_selected(id) {
-                    return;
+                if !node.visible {
+                    return false;
+                }
+                if !selection.is_node_selected(id) {
+                    return true;
                 }
 
                 // Compute the world-space bounding box for this node,
@@ -1271,12 +1317,13 @@ impl Renderer {
                         let mut b = vector_geom::Bounds::EMPTY;
                         scene.walk_depth_first(id, world_transform, &mut |_cid, cnode, cworld| {
                             if !cnode.visible {
-                                return;
+                                return false;
                             }
                             let cb = cnode.data.visual_bounds(cworld);
                             if !cb.is_empty() {
                                 b = b.union(cb);
                             }
+                            true
                         });
                         b
                     }
@@ -1284,7 +1331,7 @@ impl Renderer {
                 };
 
                 if bounds.is_empty() {
-                    return;
+                    return true;
                 }
 
                 let x0 = bounds.min.x as f32;
@@ -1342,6 +1389,7 @@ impl Renderer {
                     vert_half_height,
                     bbox_color,
                 );
+                true
             });
 
             // ── Scale handles (8 squares on the combined selection bbox) ──
@@ -1358,12 +1406,13 @@ impl Renderer {
                             let mut gb = vector_geom::Bounds::EMPTY;
                             scene.walk_depth_first(id, world, &mut |_cid, cnode, cworld| {
                                 if !cnode.visible {
-                                    return;
+                                    return false;
                                 }
                                 let cb = cnode.data.visual_bounds(cworld);
                                 if !cb.is_empty() {
                                     gb = gb.union(cb);
                                 }
+                                true
                             });
                             gb
                         }
@@ -1409,8 +1458,11 @@ impl Renderer {
                 scene.root(),
                 Affine::IDENTITY,
                 &mut |id, node, world_transform| {
-                    if id != edit_id || !node.visible {
-                        return;
+                    if !node.visible {
+                        return false;
+                    }
+                    if id != edit_id {
+                        return true;
                     }
                     let bounds = node.data.visual_bounds(world_transform);
                     // For empty text, use font metrics to show a minimal box.
@@ -1430,7 +1482,7 @@ impl Renderer {
                             };
                             local.transform(world_transform)
                         } else {
-                            return;
+                            return true;
                         }
                     } else {
                         bounds
@@ -1484,6 +1536,7 @@ impl Renderer {
                         vert_half_height,
                         text_bbox_color,
                     );
+                    true
                 },
             );
         }
@@ -1524,8 +1577,11 @@ impl Renderer {
             // First pass: draw handle lines (behind the handle squares).
             let root = scene.root();
             scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
-                if !node.visible || !selection.is_node_selected(id) {
-                    return;
+                if !node.visible {
+                    return false;
+                }
+                if !selection.is_node_selected(id) {
+                    return true;
                 }
                 if let NodeData::Path { ref path, .. } = node.data {
                     let xf = |p: Point| -> Point {
@@ -1614,17 +1670,18 @@ impl Renderer {
                         }
                     }
                 }
+                true
             });
 
             // Second pass: draw handle squares (on top of lines).
             let root = scene.root();
             scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
                 if !node.visible {
-                    return;
+                    return false;
                 }
                 // Only show handles for object-selected nodes.
                 if !selection.is_node_selected(id) {
-                    return;
+                    return true;
                 }
                 if let NodeData::Path { ref path, .. } = node.data {
                     // Helper: transform a point from local to world coordinates for handle display.
@@ -1841,6 +1898,7 @@ impl Renderer {
                         }
                     }
                 }
+                true
             });
 
             // Ghost vertex on edge hover — shows where a double-click would insert.
@@ -2273,6 +2331,7 @@ fn collect_pattern_paint_refs(
                 refs.push(*ref_id);
             }
         }
+        true
     });
 
     refs
@@ -2416,7 +2475,7 @@ fn tessellate_pattern_content(
         Affine::IDENTITY,
         &mut |_id, node, world_transform| {
             if !node.visible {
-                return;
+                return false;
             }
             match node.data {
                 NodeData::Path {
@@ -2444,6 +2503,7 @@ fn tessellate_pattern_content(
                 }
                 _ => {}
             }
+            true
         },
     );
 

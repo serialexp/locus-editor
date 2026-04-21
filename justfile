@@ -19,6 +19,12 @@ run:
 run-release:
     cargo run -p vector-editor --release
 
+# Run the editor with Tracy profiling enabled. Launch `tracy-profiler` (the
+# Tracy capture UI) first, or start it after — it will connect to a running
+# client. Use release to get realistic timings.
+run-tracy:
+    cargo run -p vector-editor --release --features tracy
+
 # Run all tests
 test:
     cargo test --workspace

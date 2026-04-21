@@ -130,6 +130,7 @@ pub fn tessellate_path(
     fill: Option<FillParams>,
     stroke: Option<StrokeParams>,
 ) -> TessellatedMesh {
+    profiling::scope!("tessellate_path");
     let lyon_path = to_lyon_path(path);
 
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();

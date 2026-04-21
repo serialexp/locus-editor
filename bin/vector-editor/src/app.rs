@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,6 +15,130 @@ use vector_tools::{
     EdgeHit, PenAction, PenState, PointKind, SelectState, ShapeDrawState, TextAction,
     TextToolState, ToolType, VertexRef,
 };
+
+/// Classification of a file dropped onto the window.
+#[derive(Copy, Clone, Debug)]
+enum DroppedKind {
+    Svg,
+    Raster,
+}
+
+impl DroppedKind {
+    fn label(self) -> &'static str {
+        match self {
+            DroppedKind::Svg => "SVG",
+            DroppedKind::Raster => "traced raster",
+        }
+    }
+}
+
+/// Rolling performance stats for the title-bar HUD: frame rate plus process
+/// resident-set size. `tick()` is called once per rendered frame.
+///
+/// Frame time is exponentially smoothed (90/10 weighting) so the displayed
+/// FPS doesn't jitter. RSS is sampled on a cheap cadence (every ~500ms) so
+/// we don't pay for a `/proc` parse every frame on Linux.
+struct PerfStats {
+    last_frame: Option<Instant>,
+    /// Exponentially smoothed frame time, in seconds. 0.0 means no samples yet.
+    smoothed_dt: f32,
+    /// Most recent raw frame interval, in seconds.
+    last_dt: f32,
+    /// Last RSS reading, in bytes. `None` if the platform sample failed.
+    rss_bytes: Option<usize>,
+    /// When we last sampled RSS.
+    last_rss_sample: Option<Instant>,
+}
+
+impl PerfStats {
+    fn new() -> Self {
+        Self {
+            last_frame: None,
+            smoothed_dt: 0.0,
+            last_dt: 0.0,
+            rss_bytes: None,
+            last_rss_sample: None,
+        }
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_frame {
+            let dt = (now - prev).as_secs_f32();
+            self.last_dt = dt;
+            // Clamp crazy gaps (e.g. app was idle for seconds) so the EMA
+            // doesn't get dragged to 0 fps and take forever to recover.
+            let dt_clamped = dt.min(0.5);
+            self.smoothed_dt = if self.smoothed_dt == 0.0 {
+                dt_clamped
+            } else {
+                self.smoothed_dt * 0.9 + dt_clamped * 0.1
+            };
+        }
+        self.last_frame = Some(now);
+
+        // Sample RSS at most ~2 Hz to avoid the syscall/proc parse per frame.
+        let should_sample = match self.last_rss_sample {
+            None => true,
+            Some(t) => now.duration_since(t).as_millis() >= 500,
+        };
+        if should_sample {
+            self.rss_bytes = memory_stats::memory_stats().map(|s| s.physical_mem);
+            self.last_rss_sample = Some(now);
+        }
+    }
+
+    fn fps(&self) -> f32 {
+        if self.smoothed_dt > 0.0 {
+            1.0 / self.smoothed_dt
+        } else {
+            0.0
+        }
+    }
+
+    fn frame_ms(&self) -> f32 {
+        self.last_dt * 1000.0
+    }
+
+    /// RSS formatted as e.g. `142.3 MB`. Empty string if sampling failed.
+    fn rss_display(&self) -> String {
+        match self.rss_bytes {
+            Some(b) => format_bytes(b),
+            None => String::from("— MB"),
+        }
+    }
+}
+
+/// Format an integer count with k/M suffixes for HUD density (e.g.
+/// `1500` → `1.5k`, `2_300_000` → `2.3M`). Values below 1000 render as-is.
+fn format_count(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Format a byte count as a short human-readable string (KiB/MiB/GiB).
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 /// Camera state for canvas pan/zoom.
 struct Camera {
@@ -182,6 +307,15 @@ struct EditorState {
     drag_transform_snapshots: Vec<(NodeId, Affine)>,
     /// Active canvas context menu (right-click on vertex/segment).
     canvas_context_menu: Option<CanvasContextMenu>,
+    /// Performance stats (FPS + RSS), updated once per rendered frame.
+    perf: PerfStats,
+    /// Whether the title-bar performance HUD is visible.
+    show_perf_hud: bool,
+    /// Structure-panel collapse state. Absence = expanded; `true` = collapsed.
+    /// We own this rather than relying on `CollapsingHeader`'s widget-owned
+    /// state because the tree is virtualized — a given group's widget may
+    /// not exist on every frame, so egui can't persist collapse state for it.
+    structure_collapse: HashMap<NodeId, bool>,
 }
 
 impl Default for EditorState {
@@ -206,6 +340,9 @@ impl Default for EditorState {
             drag_path_snapshots: Vec::new(),
             drag_transform_snapshots: Vec::new(),
             canvas_context_menu: None,
+            perf: PerfStats::new(),
+            show_perf_hud: true,
+            structure_collapse: HashMap::new(),
         }
     }
 }
@@ -724,23 +861,46 @@ impl ApplicationHandler for App {
                 gpu.renderer.resize(size.width as f32, size.height as f32);
                 gpu.window.request_redraw();
             }
-            WindowEvent::DroppedFile(path) if path.extension().is_some_and(|e| e == "svg") => {
-                match std::fs::read(&path) {
-                    Ok(data) => match vector_svg::import_svg(&data) {
-                        Ok(scene) => {
-                            self.state.scene = scene;
-                            self.state.history = History::new();
-                            self.state.select_state = SelectState::default();
-                            self.state.pending_zoom_to_fit = true;
-                            if let Some(gpu) = &mut self.gpu {
-                                gpu.renderer.mark_dirty();
-                                gpu.window.request_redraw();
+            WindowEvent::DroppedFile(path) => {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                let kind = match ext.as_deref() {
+                    Some("svg") => Some(DroppedKind::Svg),
+                    Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp")
+                    | Some("webp") | Some("tiff") | Some("tif") => Some(DroppedKind::Raster),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    match std::fs::read(&path) {
+                        Ok(data) => {
+                            let result = match kind {
+                                DroppedKind::Svg => vector_svg::import_svg(&data)
+                                    .map_err(|e| format!("SVG import: {e}")),
+                                DroppedKind::Raster => vector_trace::trace_image_bytes(
+                                    &data,
+                                    vector_trace::TracePreset::default(),
+                                )
+                                .map_err(|e| format!("raster trace: {e}")),
+                            };
+                            match result {
+                                Ok(scene) => {
+                                    self.state.scene = scene;
+                                    self.state.history = History::new();
+                                    self.state.select_state = SelectState::default();
+                                    self.state.pending_zoom_to_fit = true;
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.renderer.mark_dirty();
+                                        gpu.window.request_redraw();
+                                    }
+                                    log::info!("Loaded {}: {}", kind.label(), path.display());
+                                }
+                                Err(e) => log::error!("Failed to load {}: {e}", kind.label()),
                             }
-                            log::info!("Loaded SVG: {}", path.display());
                         }
-                        Err(e) => log::error!("Failed to import SVG: {e}"),
-                    },
-                    Err(e) => log::error!("Failed to read file: {e}"),
+                        Err(e) => log::error!("Failed to read file: {e}"),
+                    }
                 }
             }
             // --- Canvas input events: guard with wants_pointer/wants_keyboard ---
@@ -1274,6 +1434,9 @@ impl App {
 }
 
 fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
+    profiling::scope!("draw_frame");
+    state.perf.tick();
+
     let output = match gpu.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(t) => t,
         wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
@@ -1290,19 +1453,29 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
 
     // Run egui — use begin_pass/end_pass so the canvas area is NOT part of
     // any egui Ui, which lets is_pointer_over_egui() return false for it.
-    let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
-    gpu.egui_ctx.begin_pass(raw_input);
-    let (structure_cmds, ui_scene_dirty) = run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
+    let full_output = {
+        profiling::scope!("egui_pass");
+        let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
+        gpu.egui_ctx.begin_pass(raw_input);
+        let (structure_cmds_inner, ui_scene_dirty_inner) =
+            run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
 
-    // Canvas context menu (right-click on vertex/segment in node mode).
-    show_canvas_context_menu(&gpu.egui_ctx, state, &mut gpu.renderer);
+        // Canvas context menu (right-click on vertex/segment in node mode).
+        show_canvas_context_menu(&gpu.egui_ctx, state, &mut gpu.renderer);
 
-    // Capture the canvas rect (area not covered by egui panels) before ending the pass.
-    #[expect(deprecated)] // content_rect may not exist in this egui version yet
-    let avail = gpu.egui_ctx.available_rect();
-    state.canvas_rect = [avail.min.x, avail.min.y, avail.width(), avail.height()];
+        // Capture the canvas rect (area not covered by egui panels) before ending the pass.
+        #[expect(deprecated)] // content_rect may not exist in this egui version yet
+        let avail = gpu.egui_ctx.available_rect();
+        state.canvas_rect = [avail.min.x, avail.min.y, avail.width(), avail.height()];
 
-    let full_output = gpu.egui_ctx.end_pass();
+        // Stash outputs for the outer scope via tuple.
+        (
+            gpu.egui_ctx.end_pass(),
+            structure_cmds_inner,
+            ui_scene_dirty_inner,
+        )
+    };
+    let (full_output, structure_cmds, ui_scene_dirty) = full_output;
 
     // Mark dirty if the UI changed the scene (e.g. visibility toggle).
     if ui_scene_dirty {
@@ -1393,8 +1566,11 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     };
     gpu.renderer.text_editing_node = state.text_tool.editing_node();
 
-    gpu.renderer
-        .prepare(&gpu.device, &gpu.queue, &state.scene, &state.select_state);
+    {
+        profiling::scope!("renderer.prepare");
+        gpu.renderer
+            .prepare(&gpu.device, &gpu.queue, &state.scene, &state.select_state);
+    }
 
     // Create render pass — forget_lifetime() decouples the pass from the encoder
     // borrow, which is required by egui-wgpu 0.31's render() expecting RenderPass<'static>.
@@ -1429,19 +1605,32 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
             .render(&mut pass, &paint_jobs, &screen_descriptor);
     }
 
-    gpu.queue.submit(Some(encoder.finish()));
-    output.present();
+    {
+        profiling::scope!("gpu_submit");
+        gpu.queue.submit(Some(encoder.finish()));
+    }
+    {
+        profiling::scope!("gpu_present");
+        output.present();
+    }
 
     for id in &full_output.textures_delta.free {
         gpu.egui_renderer.free_texture(id);
     }
 
-    // If egui wants a repaint (e.g. animation, menu opening), request one
-    if let Some(viewport_output) = full_output.viewport_output.get(&egui::ViewportId::ROOT)
-        && viewport_output.repaint_delay.is_zero()
-    {
-        gpu.window.request_redraw();
-    }
+    // Continuous redraw: schedule another frame immediately. This gives us a
+    // real FPS reading in the HUD and avoids the "frozen UI" feel when egui
+    // doesn't explicitly ask for a repaint. Cost is one GPU frame per vsync
+    // tick (~16ms at 60Hz); scene re-tessellation is still gated by
+    // `renderer.mark_dirty()`, so we're only paying for the draw itself.
+    //
+    // (The older egui-driven conditional redraw is subsumed by this — we
+    // redraw unconditionally, which is a strict superset.)
+    gpu.window.request_redraw();
+
+    // Mark the frame boundary for profilers (Tracy, etc.). No-op when the
+    // `tracy` feature isn't enabled on the editor binary.
+    profiling::finish_frame!();
 }
 
 /// A pending reorder: (node to move, new parent, index within new parent).
@@ -1721,12 +1910,16 @@ fn run_ui(
     let pending_zoom_to_fit = &mut state.pending_zoom_to_fit;
     let snap = &mut state.snap;
     let checker_fixed_size = &mut state.checker_fixed_size;
+    let show_perf_hud = &mut state.show_perf_hud;
+    let perf = &state.perf;
+    let structure_collapse = &mut state.structure_collapse;
     let mut dump_requested = false;
     let mut reorder_cmd: ReorderCommand = None;
     let mut structure_cmds: StructureCommands = Vec::new();
     let mut scene_dirty = false;
     let mut open_requested = false;
     let mut save_requested = false;
+    let mut trace_requested = false;
     let mut undo_requested = false;
     let mut redo_requested = false;
 
@@ -1739,6 +1932,11 @@ fn run_ui(
                 }
                 if ui.button("Save SVG...").clicked() {
                     save_requested = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Trace raster image...").clicked() {
+                    trace_requested = true;
                     ui.close();
                 }
             });
@@ -1771,6 +1969,8 @@ fn run_ui(
                 });
                 ui.separator();
                 ui.checkbox(checker_fixed_size, "Fixed-size checkerboard");
+                ui.separator();
+                ui.checkbox(show_perf_hud, "Show FPS / RSS");
             });
             ui.menu_button("Debug", |ui| {
                 if ui.button("Dump layout").clicked() {
@@ -1778,6 +1978,45 @@ fn run_ui(
                     ui.close();
                 }
             });
+
+            // Performance HUD, right-aligned. Laying out right-to-left means
+            // items are added from the right edge inward — so the last thing
+            // added appears leftmost of the group.
+            if *show_perf_hud {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let fps = perf.fps();
+                    let ms = perf.frame_ms();
+                    let rss = perf.rss_display();
+                    let stats = renderer.scene_stats();
+                    // right_to_left: items are added right-edge first, so
+                    // to read RSS | FPS | geometry left→right we push in
+                    // reverse here.
+                    ui.label(egui::RichText::new(rss).monospace().weak())
+                        .on_hover_text("Resident set size (process physical memory)");
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("{fps:5.1} fps  {ms:4.1} ms"))
+                            .monospace()
+                            .weak(),
+                    )
+                    .on_hover_text("Frame rate (vsync-capped)");
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} paths  {} vtx  {} tri",
+                            format_count(stats.paths),
+                            format_count(stats.vertices),
+                            format_count(stats.triangles),
+                        ))
+                        .monospace()
+                        .weak(),
+                    )
+                    .on_hover_text(
+                        "Post-tessellation geometry in the scene \
+                         (excluding grid and handle overlays)",
+                    );
+                });
+            }
         });
     });
 
@@ -1851,6 +2090,7 @@ fn run_ui(
                 .default_size(half)
                 .min_size(half)
                 .show_inside(ui, |ui| {
+                    profiling::scope!("properties_panel");
                     ui.heading("Properties");
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -1863,6 +2103,7 @@ fn run_ui(
 
             // Structure — bottom half (scene graph tree)
             let structure_resp = egui::CentralPanel::default().show_inside(ui, |ui| {
+                profiling::scope!("structure_panel");
                 ui.horizontal(|ui| {
                     ui.heading("Structure");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1892,18 +2133,29 @@ fn run_ui(
                     });
                 });
                 ui.separator();
+
+                // Virtualized tree: flatten the visible tree O(n), then use
+                // `ScrollArea::show_rows` so egui only builds widgets for
+                // rows inside the viewport. This makes per-frame cost
+                // proportional to visible rows, not total scene size.
+                let flat = {
+                    profiling::scope!("flatten_tree");
+                    flatten_tree(scene, structure_collapse)
+                };
+
+                let row_height = ui.spacing().interact_size.y;
                 egui::ScrollArea::vertical()
                     .id_salt("structure_scroll")
-                    .show(ui, |ui| {
-                        let root = scene.root();
-                        if let Some(root_node) = scene.get(root) {
-                            // Don't show root itself, just its children
-                            let children: Vec<_> = root_node.children.clone();
-                            show_children(
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, flat.len(), |ui, row_range| {
+                        profiling::scope!("virtual_rows", &format!("{}", row_range.len()));
+                        for i in row_range {
+                            render_virtual_row(
                                 ui,
+                                &flat[i],
+                                row_height,
                                 scene,
-                                root,
-                                &children,
+                                structure_collapse,
                                 selection,
                                 &mut reorder_cmd,
                                 &mut structure_cmds,
@@ -2009,6 +2261,32 @@ fn run_ui(
         match std::fs::write(&path, &svg) {
             Ok(()) => log::info!("Saved SVG: {}", path.display()),
             Err(e) => log::error!("Failed to save file: {e}"),
+        }
+    }
+
+    if trace_requested
+        && let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Raster images",
+                &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"],
+            )
+            .pick_file()
+    {
+        match std::fs::read(&path) {
+            Ok(data) => {
+                match vector_trace::trace_image_bytes(&data, vector_trace::TracePreset::default()) {
+                    Ok(new_scene) => {
+                        *scene = new_scene;
+                        *history = History::new();
+                        *selection = SelectState::default();
+                        *pending_zoom_to_fit = true;
+                        renderer.mark_dirty();
+                        log::info!("Traced raster: {}", path.display());
+                    }
+                    Err(e) => log::error!("Failed to trace image: {e}"),
+                }
+            }
+            Err(e) => log::error!("Failed to read file: {e}"),
         }
     }
 
@@ -2800,99 +3078,289 @@ fn node_display(node: &vector_scene::Node) -> (&'static str, String) {
     (icon, label)
 }
 
-/// Render a list of sibling nodes with drop-slots between them for reordering.
+/// One pre-flattened row of the structure panel's visible tree.
 ///
-/// `parent_id` is the parent whose children we're rendering. Each child gets a
-/// drop slot before it, plus one final slot after the last child.
-#[expect(clippy::too_many_arguments)]
-fn show_children(
-    ui: &mut egui::Ui,
-    scene: &mut Scene,
+/// Produced by [`flatten_tree`] each frame and consumed by
+/// [`render_virtual_row`]. Pre-resolving `icon`/`label`/`visible` here
+/// keeps scene access out of the inner render loop and lets us drive
+/// `ScrollArea::show_rows` with a fixed row height.
+#[derive(Clone)]
+struct FlatRow {
+    node_id: vector_scene::NodeId,
     parent_id: vector_scene::NodeId,
-    children: &[vector_scene::NodeId],
+    /// Index of this node within its parent's children — needed so drop
+    /// targets can address "insert before child #N of parent" precisely.
+    index_in_parent: usize,
+    /// Depth in the tree (root's direct children = 0).
+    depth: u16,
+    is_group: bool,
+    is_defs: bool,
+    /// Whether the group has children (always false for non-groups and defs).
+    has_children: bool,
+    /// Collapse state snapshot. Only meaningful for groups.
+    collapsed: bool,
+    icon: &'static str,
+    label: String,
+    visible: bool,
+}
+
+/// Walk the scene once and produce a flat list of rows to render. Collapsed
+/// groups contribute only themselves; their descendants are omitted. This
+/// is what makes virtualization possible: `ScrollArea::show_rows` can index
+/// into the flat list by visible-row number.
+fn flatten_tree(scene: &Scene, collapse: &HashMap<vector_scene::NodeId, bool>) -> Vec<FlatRow> {
+    profiling::scope!("flatten_tree.walk");
+    let mut out = Vec::new();
+    let root = scene.root();
+    if let Some(root_node) = scene.get(root) {
+        let children: Vec<_> = root_node.children.clone();
+        for (i, child) in children.into_iter().enumerate() {
+            flatten_recurse(scene, collapse, child, root, i, 0, &mut out);
+        }
+    }
+    out
+}
+
+fn flatten_recurse(
+    scene: &Scene,
+    collapse: &HashMap<vector_scene::NodeId, bool>,
+    node_id: vector_scene::NodeId,
+    parent_id: vector_scene::NodeId,
+    index_in_parent: usize,
+    depth: u16,
+    out: &mut Vec<FlatRow>,
+) {
+    use vector_scene::NodeData;
+    let Some(node) = scene.get(node_id) else {
+        return;
+    };
+
+    let is_defs = matches!(&node.data, NodeData::Group { is_defs: true });
+    let is_group = matches!(&node.data, NodeData::Group { .. });
+    // Preserve current behavior: defs is rendered as a leaf — its children
+    // (gradients, patterns) aren't shown in the structure panel.
+    let has_children = !node.children.is_empty() && !is_defs;
+    let collapsed = collapse.get(&node_id).copied().unwrap_or(false);
+    let (icon, label) = node_display(node);
+    let visible = node.visible;
+    let child_ids = if is_group && has_children && !collapsed {
+        node.children.clone()
+    } else {
+        Vec::new()
+    };
+
+    out.push(FlatRow {
+        node_id,
+        parent_id,
+        index_in_parent,
+        depth,
+        is_group,
+        is_defs,
+        has_children,
+        collapsed,
+        icon,
+        label,
+        visible,
+    });
+
+    for (i, child) in child_ids.into_iter().enumerate() {
+        flatten_recurse(scene, collapse, child, node_id, i, depth + 1, out);
+    }
+}
+
+/// Render a single virtualized row. Paints everything with direct
+/// `painter.text()` and `painter.rect_filled()` calls rather than egui
+/// widgets — we don't need full widget machinery for a glyph + hit-rect,
+/// and the savings are material at scale.
+///
+/// Interaction rects:
+///   - `chevron` (if group): toggles collapse
+///   - `eye` (if not defs): toggles visibility
+///   - `label_area`: row click (select) + drag source
+///   - top 4px band: drop target (only active during a drag)
+#[expect(clippy::too_many_arguments)]
+fn render_virtual_row(
+    ui: &mut egui::Ui,
+    row: &FlatRow,
+    row_height: f32,
+    scene: &mut Scene,
+    collapse: &mut HashMap<vector_scene::NodeId, bool>,
     selection: &mut SelectState,
     reorder_cmd: &mut ReorderCommand,
     structure_cmds: &mut StructureCommands,
     scene_dirty: &mut bool,
 ) {
-    for (i, &child_id) in children.iter().enumerate() {
-        // Drop slot before this child (insert at index i)
-        drop_slot(ui, parent_id, i, reorder_cmd);
-        // The node itself
-        show_scene_node(
-            ui,
-            scene,
-            child_id,
-            selection,
-            reorder_cmd,
-            structure_cmds,
-            scene_dirty,
+    profiling::scope!("render_virtual_row");
+
+    let node_selected = selection.is_node_selected(row.node_id);
+    let text_color = if !row.visible || row.is_defs {
+        ui.visuals().weak_text_color()
+    } else if node_selected {
+        egui::Color32::from_rgb(80, 160, 255)
+    } else {
+        ui.visuals().text_color()
+    };
+
+    // Reserve the full row rect (hover-only; clicks go to sub-rects below).
+    let (row_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Sense::hover(),
+    );
+
+    // Selection tint behind everything.
+    if node_selected {
+        ui.painter().rect_filled(
+            row_rect,
+            2.0,
+            egui::Color32::from_rgba_premultiplied(40, 90, 160, 60),
         );
     }
-    // Final drop slot after last child
-    drop_slot(ui, parent_id, children.len(), reorder_cmd);
-}
 
-/// A thin drop target between sibling rows. When a node is dragged over it,
-/// it highlights; when released, it emits a reorder command.
-fn drop_slot(
-    ui: &mut egui::Ui,
-    parent_id: vector_scene::NodeId,
-    index: usize,
-    reorder_cmd: &mut ReorderCommand,
-) {
-    // Only show/interact when a drag is active
-    if !egui::DragAndDrop::has_any_payload(ui.ctx()) {
-        return;
+    const INDENT_STEP: f32 = 12.0;
+    const CHEVRON_W: f32 = 14.0;
+    const EYE_W: f32 = 16.0;
+    const GLYPH_GAP: f32 = 4.0;
+
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let mut cursor_x = row_rect.left() + (row.depth as f32) * INDENT_STEP + 2.0;
+
+    // Chevron (interactive) for groups with children.
+    if row.is_group && row.has_children {
+        let chevron_icon = if row.collapsed {
+            egui_phosphor::regular::CARET_RIGHT
+        } else {
+            egui_phosphor::regular::CARET_DOWN
+        };
+        let chevron_rect = egui::Rect::from_min_size(
+            egui::pos2(cursor_x, row_rect.top()),
+            egui::vec2(CHEVRON_W, row_height),
+        );
+        let chevron_resp = ui.interact(
+            chevron_rect,
+            egui::Id::new(("chevron", row.node_id)),
+            egui::Sense::click(),
+        );
+        ui.painter().text(
+            chevron_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            chevron_icon,
+            font_id.clone(),
+            text_color,
+        );
+        if chevron_resp.clicked() {
+            let e = collapse.entry(row.node_id).or_insert(false);
+            *e = !*e;
+        }
     }
+    cursor_x += CHEVRON_W + GLYPH_GAP;
 
-    let id = egui::Id::new(("drop_slot", parent_id, index));
-    let is_being_dragged_here = ui.ctx().is_being_dragged(id);
-    _ = is_being_dragged_here;
-
-    // Allocate a thin horizontal strip
-    let desired = egui::vec2(ui.available_width(), 4.0);
-    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
-
-    // Check if a NodeId payload is hovering over this slot
-    let hovering = response.contains_pointer()
-        && egui::DragAndDrop::has_payload_of_type::<vector_scene::NodeId>(ui.ctx());
-
-    if hovering {
-        // Visual feedback: draw a bright line
-        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255));
-        ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+    // Visibility eye (interactive) — defs can't be toggled.
+    if !row.is_defs {
+        let eye_icon = if row.visible {
+            egui_phosphor::regular::EYE
+        } else {
+            egui_phosphor::regular::EYE_SLASH
+        };
+        let eye_color = if row.visible {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let eye_rect = egui::Rect::from_min_size(
+            egui::pos2(cursor_x, row_rect.top()),
+            egui::vec2(EYE_W, row_height),
+        );
+        let eye_resp = ui.interact(
+            eye_rect,
+            egui::Id::new(("eye", row.node_id)),
+            egui::Sense::click(),
+        );
+        ui.painter().text(
+            eye_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            eye_icon,
+            font_id.clone(),
+            eye_color,
+        );
+        if eye_resp.clicked()
+            && let Some(n) = scene.get_mut(row.node_id)
+        {
+            n.visible = !n.visible;
+            *scene_dirty = true;
+        }
+        let _ = eye_resp.on_hover_text(if row.visible { "Hide" } else { "Show" });
     }
+    cursor_x += EYE_W + GLYPH_GAP;
 
-    // Check for drop
-    if hovering
-        && ui.input(|i| i.pointer.any_released())
-        && let Some(dragged_id) = egui::DragAndDrop::take_payload::<vector_scene::NodeId>(ui.ctx())
-    {
-        *reorder_cmd = Some((*dragged_id, parent_id, index));
-    }
-}
-
-/// Render a small clickable eye button that toggles node visibility.
-/// Returns true if visibility was toggled.
-fn visibility_button(ui: &mut egui::Ui, visible: bool) -> bool {
-    let icon = if visible {
-        egui_phosphor::regular::EYE
-    } else {
-        egui_phosphor::regular::EYE_SLASH
-    };
-    let color = if visible {
-        ui.visuals().text_color()
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    let btn = ui.add(
-        egui::Button::new(egui::RichText::new(icon).color(color))
-            .frame(false)
-            .small(),
+    // Icon + label, painted directly.
+    let label_text = format!("{} {}", row.icon, row.label);
+    ui.painter().text(
+        egui::pos2(cursor_x, row_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &label_text,
+        font_id,
+        text_color,
     );
-    btn.on_hover_text(if visible { "Hide" } else { "Show" })
-        .clicked()
+
+    // The "rest of the row" (everything right of the eye) is the row's
+    // click + drag target.
+    let label_area = egui::Rect::from_min_max(
+        egui::pos2(cursor_x, row_rect.top()),
+        row_rect.right_bottom(),
+    );
+    let row_response = ui.interact(
+        label_area,
+        egui::Id::new(("row_click", row.node_id)),
+        egui::Sense::click_and_drag(),
+    );
+
+    if row_response.clicked() {
+        let shift = ui.input(|i| i.modifiers.shift);
+        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+        structure_panel_click(selection, row.node_id, shift || ctrl);
+    } else if row_response.drag_started() && !row.is_defs {
+        egui::DragAndDrop::set_payload(ui.ctx(), row.node_id);
+        ui.ctx()
+            .set_dragged_id(egui::Id::new(("struct_drag", row.node_id)));
+    }
+
+    // Context menu on right-click anywhere in the row.
+    row_response.context_menu(|ui| {
+        node_context_menu(
+            ui,
+            row.node_id,
+            row.is_group,
+            row.is_defs,
+            selection,
+            structure_cmds,
+        );
+    });
+
+    // Drop target at top band — only material during a drag. A drop here
+    // means "insert before this row, as sibling #N of parent".
+    if egui::DragAndDrop::has_any_payload(ui.ctx()) {
+        let top_band = egui::Rect::from_min_size(row_rect.min, egui::vec2(row_rect.width(), 4.0));
+        let drop_resp = ui.interact(
+            top_band,
+            egui::Id::new(("drop_slot", row.parent_id, row.index_in_parent)),
+            egui::Sense::hover(),
+        );
+        let hovering = drop_resp.contains_pointer()
+            && egui::DragAndDrop::has_payload_of_type::<vector_scene::NodeId>(ui.ctx());
+        if hovering {
+            ui.painter().hline(
+                top_band.x_range(),
+                top_band.center().y,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255)),
+            );
+            if ui.input(|i| i.pointer.any_released())
+                && let Some(dragged_id) =
+                    egui::DragAndDrop::take_payload::<vector_scene::NodeId>(ui.ctx())
+            {
+                *reorder_cmd = Some((*dragged_id, row.parent_id, row.index_in_parent));
+            }
+        }
+    }
 }
 
 /// Context menu for a scene node in the structure panel.
@@ -2979,236 +3447,6 @@ fn structure_panel_click(
     } else {
         selection.selected_nodes.clear();
         selection.selected_nodes.push(node_id);
-    }
-}
-
-/// Recursively render a scene node and its children in the structure panel.
-/// Each node is a drag source for reordering; clicking selects the node.
-fn show_scene_node(
-    ui: &mut egui::Ui,
-    scene: &mut Scene,
-    node_id: vector_scene::NodeId,
-    selection: &mut SelectState,
-    reorder_cmd: &mut ReorderCommand,
-    structure_cmds: &mut StructureCommands,
-    scene_dirty: &mut bool,
-) {
-    use vector_scene::NodeData;
-
-    // Extract all data we need from the node upfront so we can release the
-    // immutable borrow and later mutably borrow for visibility toggle.
-    let Some(node) = scene.get(node_id) else {
-        return;
-    };
-
-    let is_defs = matches!(&node.data, NodeData::Group { is_defs: true });
-    let is_group = matches!(&node.data, NodeData::Group { .. });
-    let has_children = !node.children.is_empty() && !is_defs;
-    let visible = node.visible;
-
-    let (icon, label) = node_display(node);
-    let children: Vec<_> = node.children.clone();
-
-    // Check if this node is object-selected
-    let node_selected = selection.is_node_selected(node_id);
-
-    // Text color: dim invisible/defs, highlight selected
-    let text_color = if !visible || is_defs {
-        ui.visuals().weak_text_color()
-    } else if node_selected {
-        egui::Color32::from_rgb(80, 160, 255) // selection blue
-    } else {
-        ui.visuals().text_color()
-    };
-
-    // Don't allow dragging the defs group
-    let draggable = !is_defs;
-
-    if has_children && is_group {
-        // Collapsible group with drag support
-        let node_text = format!("{icon} {label}");
-
-        if draggable {
-            let drag_id = egui::Id::new(("struct_drag", node_id));
-
-            // Check if THIS node is currently being dragged
-            if ui.ctx().is_being_dragged(drag_id) {
-                // Render a ghost at the cursor
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                egui::Area::new(egui::Id::new(("drag_ghost", node_id)))
-                    .interactable(false)
-                    .pivot(egui::Align2::LEFT_CENTER)
-                    .current_pos(ui.ctx().pointer_hover_pos().unwrap_or_default())
-                    .show(ui.ctx(), |ui| {
-                        let frame = egui::Frame::popup(ui.style())
-                            .fill(egui::Color32::from_rgba_premultiplied(50, 50, 50, 200));
-                        frame.show(ui, |ui| {
-                            ui.label(egui::RichText::new(&node_text).color(text_color));
-                        });
-                    });
-
-                // Show a placeholder in the original position
-                ui.label(egui::RichText::new(&node_text).color(ui.visuals().weak_text_color()));
-            } else {
-                // Eye button + collapsing header on the same line.
-                // We use a horizontal layout for the eye button, then let the
-                // CollapsingHeader take the rest.
-                ui.horizontal(|ui| {
-                    if visibility_button(ui, visible)
-                        && let Some(n) = scene.get_mut(node_id)
-                    {
-                        n.visible = !n.visible;
-                        *scene_dirty = true;
-                    }
-
-                    let header = egui::CollapsingHeader::new(
-                        egui::RichText::new(&node_text).color(text_color),
-                    )
-                    .id_salt(node_id)
-                    .default_open(true);
-
-                    let resp = header.show(ui, |ui| {
-                        show_children(
-                            ui,
-                            scene,
-                            node_id,
-                            &children,
-                            selection,
-                            reorder_cmd,
-                            structure_cmds,
-                            scene_dirty,
-                        );
-                    });
-
-                    // Make the header row a drag source; click to select
-                    let header_resp = resp.header_response;
-                    if header_resp.clicked() {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
-                        structure_panel_click(selection, node_id, shift || ctrl);
-                    } else if header_resp.drag_started() {
-                        egui::DragAndDrop::set_payload(ui.ctx(), node_id);
-                        ui.ctx().set_dragged_id(drag_id);
-                    }
-
-                    // Context menu on group header
-                    header_resp.context_menu(|ui| {
-                        node_context_menu(
-                            ui,
-                            node_id,
-                            is_group,
-                            is_defs,
-                            selection,
-                            structure_cmds,
-                        );
-                    });
-                });
-            }
-        } else {
-            // Non-draggable (defs) — just show the header
-            let header = egui::CollapsingHeader::new(
-                egui::RichText::new(format!("{icon} {label}")).color(text_color),
-            )
-            .id_salt(node_id)
-            .default_open(true);
-
-            header.show(ui, |ui| {
-                show_children(
-                    ui,
-                    scene,
-                    node_id,
-                    &children,
-                    selection,
-                    reorder_cmd,
-                    structure_cmds,
-                    scene_dirty,
-                );
-            });
-        }
-    } else {
-        // Leaf node — draggable row
-        let node_text = format!("{icon} {label}");
-
-        if draggable {
-            let drag_id = egui::Id::new(("struct_drag", node_id));
-
-            if ui.ctx().is_being_dragged(drag_id) {
-                // Ghost at cursor
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                egui::Area::new(egui::Id::new(("drag_ghost", node_id)))
-                    .interactable(false)
-                    .pivot(egui::Align2::LEFT_CENTER)
-                    .current_pos(ui.ctx().pointer_hover_pos().unwrap_or_default())
-                    .show(ui.ctx(), |ui| {
-                        let frame = egui::Frame::popup(ui.style())
-                            .fill(egui::Color32::from_rgba_premultiplied(50, 50, 50, 200));
-                        frame.show(ui, |ui| {
-                            ui.label(egui::RichText::new(&node_text).color(text_color));
-                        });
-                    });
-
-                // Placeholder in original position
-                ui.label(egui::RichText::new(&node_text).color(ui.visuals().weak_text_color()));
-            } else {
-                // Eye button + label row
-                ui.horizontal(|ui| {
-                    if visibility_button(ui, visible)
-                        && let Some(n) = scene.get_mut(node_id)
-                    {
-                        n.visible = !n.visible;
-                        *scene_dirty = true;
-                    }
-
-                    let remaining = ui.available_width();
-                    let desired_size = egui::vec2(remaining, ui.spacing().interact_size.y);
-                    let (rect, response) =
-                        ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
-
-                    // Selection tint
-                    if node_selected {
-                        ui.painter().rect_filled(
-                            rect,
-                            2.0,
-                            egui::Color32::from_rgba_premultiplied(40, 90, 160, 60),
-                        );
-                    }
-
-                    // Left-aligned label inside the allocated rect.
-                    ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .max_rect(rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        |ui| {
-                            ui.label(egui::RichText::new(&node_text).color(text_color));
-                        },
-                    );
-
-                    if response.clicked() {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
-                        structure_panel_click(selection, node_id, shift || ctrl);
-                    } else if response.drag_started() {
-                        egui::DragAndDrop::set_payload(ui.ctx(), node_id);
-                        ui.ctx().set_dragged_id(drag_id);
-                    }
-
-                    // Context menu on leaf node
-                    response.context_menu(|ui| {
-                        node_context_menu(
-                            ui,
-                            node_id,
-                            is_group,
-                            is_defs,
-                            selection,
-                            structure_cmds,
-                        );
-                    });
-                });
-            }
-        } else {
-            // Non-draggable leaf (shouldn't happen in practice, but handle gracefully)
-            ui.label(egui::RichText::new(node_text).color(text_color));
-        }
     }
 }
 

@@ -8,6 +8,7 @@ members = [
     "crates/vector-render",
     "crates/vector-ops",
     "crates/vector-tools",
+    "crates/vector-trace",
     "bin/vector-editor",
 ]
 resolver = "2"
@@ -58,4 +59,8 @@ slotmap = { version = "1.0", features = ["serde"] }
 
 # File dialog
 rfd = "0.15"
+
+# Profiling. No-op by default; the `tracy` feature on `vector-editor` flips
+# the backend on across all crates that declare this dep.
+profiling = "1"
 

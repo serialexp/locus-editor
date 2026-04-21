@@ -47,3 +47,9 @@
 - [x] Canvas context menus — right-click on vertex (mode toggle + delete) or segment (Line/Quad/Cubic conversion + insert vertex)
 - [x] Segment type conversion — convert_segment_to_line/quad/cubic with undo support
 - [ ] Snap to points/vertices — snap to existing geometry, not just grid
+
+### Raster tracing (`vector-trace`)
+- [ ] Preset/parameter tuning UI — egui dialog exposing TracePreset (Bw/Poster/Photo) and the key vtracer knobs (filter_speckle, color_precision, corner_threshold, splice_threshold, layer_difference, path simplify mode). Currently hard-coded to Poster default.
+- [ ] Async tracing — run `vector_trace::trace_image_bytes` off the UI thread (std::thread + channel, or a simple worker). Large images block the UI for seconds.
+- [ ] Live preview while tuning — reduced-resolution preview that re-traces on parameter change (depends on async tracing + parameter UI).
+- [ ] Centerline tracing — v2 feature for line art / technical drawings where strokes should become single stroked paths instead of filled outlines. No good Rust crate exists; custom skeletonization (medial axis) required.

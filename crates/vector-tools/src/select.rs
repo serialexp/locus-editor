@@ -380,10 +380,24 @@ fn ensure_cubic_handles(subpath: &mut vector_geom::SubPath, mode_idx: usize) {
     }
 
     if let (Some(out_idx), Some(in_idx)) = (outgoing_idx, incoming_idx)
-        && let Segment::Cubic { ctrl1, .. } = subpath.segments[out_idx]
-        && let Segment::Cubic { ctrl2, .. } = &mut subpath.segments[in_idx]
+        && let Segment::Cubic {
+            ctrl1: out_ctrl, ..
+        } = subpath.segments[out_idx]
+        && let Segment::Cubic { ctrl2: in_ctrl, .. } = subpath.segments[in_idx]
     {
-        mirror_handle(anchor, ctrl1, ctrl2, new_mode);
+        // Pick the LONGER of the two handles as the source for the mirror so
+        // we don't shrink a meaningful handle to match a collapsed-then-just-
+        // spread one. This keeps the visible geometry stable across mode
+        // switches (Symmetric especially).
+        let out_d = (out_ctrl.x - anchor.x).hypot(out_ctrl.y - anchor.y);
+        let in_d = (in_ctrl.x - anchor.x).hypot(in_ctrl.y - anchor.y);
+        if out_d >= in_d {
+            if let Segment::Cubic { ctrl2, .. } = &mut subpath.segments[in_idx] {
+                mirror_handle(anchor, out_ctrl, ctrl2, new_mode);
+            }
+        } else if let Segment::Cubic { ctrl1, .. } = &mut subpath.segments[out_idx] {
+            mirror_handle(anchor, in_ctrl, ctrl1, new_mode);
+        }
     }
 }
 
@@ -407,8 +421,14 @@ fn mirror_handle(anchor: Point, moved: Point, opposite: &mut Point, mode: Vertex
             }
             let opp_dx = opposite.x - anchor.x;
             let opp_dy = opposite.y - anchor.y;
-            let opp_len = (opp_dx * opp_dx + opp_dy * opp_dy).sqrt();
-            // Opposite direction, same length as before.
+            let mut opp_len = (opp_dx * opp_dx + opp_dy * opp_dy).sqrt();
+            // If the opposite handle is collapsed at the anchor we'd compute
+            // `anchor - 0 = anchor` and leave it invisible. Fall back to the
+            // moved handle's length so the user sees a usable handle to grab.
+            if opp_len < 1e-12 {
+                opp_len = moved_len;
+            }
+            // Opposite direction, length = opp_len.
             opposite.x = anchor.x - dx / moved_len * opp_len;
             opposite.y = anchor.y - dy / moved_len * opp_len;
         }
@@ -741,12 +761,13 @@ impl SelectState {
             vector_geom::Affine::IDENTITY,
             &mut |id, node, world| {
                 if !node.visible {
-                    return;
+                    return false;
                 }
                 let bounds = node_bounds(&node.data, world);
                 if !bounds.is_empty() && bounds.contains_point(target) {
                     best = Some(id);
                 }
+                true
             },
         );
 
@@ -765,12 +786,13 @@ impl SelectState {
             vector_geom::Affine::IDENTITY,
             &mut |id, node, world| {
                 if !node.visible {
-                    return;
+                    return false;
                 }
                 let bounds = node_bounds(&node.data, world);
                 if !bounds.is_empty() && bounds.intersects(query) {
                     result.push(id);
                 }
+                true
             },
         );
 
@@ -961,11 +983,16 @@ impl SelectState {
         }
         *mode = new_mode;
 
-        // When switching FROM Corner TO Smooth/Symmetric, ensure adjacent
-        // segments are cubics with handles spread out from the anchor.
-        // Otherwise the control points sit on top of the vertex and are
-        // invisible/unselectable.
-        if old_mode == VertexMode::Corner && new_mode != VertexMode::Corner {
+        // Whenever we land in Smooth/Symmetric, make sure the adjacent
+        // segments are cubics with both handles visibly spread from the
+        // anchor and that the new mode's constraint is satisfied.
+        //
+        // We have to do this on EVERY transition into a non-Corner mode —
+        // not just from Corner — because Smooth permits handles with length
+        // 0 (one side collapsed at the anchor). Switching Smooth → Symmetric
+        // without re-spreading would leave the collapsed handle invisible,
+        // even though Symmetric implies it should mirror the other side.
+        if new_mode != VertexMode::Corner {
             ensure_cubic_handles(subpath, mode_idx);
         }
 

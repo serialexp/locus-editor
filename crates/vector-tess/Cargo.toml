@@ -12,3 +12,4 @@ lyon_tessellation = { workspace = true }
 lyon_geom = { workspace = true }
 bytemuck = { workspace = true }
 wgpu = { workspace = true }
+profiling = { workspace = true }
