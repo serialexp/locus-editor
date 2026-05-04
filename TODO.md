@@ -57,12 +57,12 @@
 - [x] Boolean groups: Inkscape-style keybindings — Ctrl++ / Ctrl+= (Union), Ctrl+- (Difference), Ctrl+* (Intersect), Ctrl+^ (Exclude). Requires ≥2 selected nodes. Wired directly into the winit key handler; menu labels show the shortcut.
 - [ ] Boolean groups: allow `Text` nodes as operands (auto-convert to path on evaluation).
 - [ ] Convert stroke to path — outline the stroked region as a fillable path. Reuses the stroke-tessellation machinery in `vector-tess`.
-- [ ] Zoom-to-fit and zoom-to-selection — bind to `1` and `3` (Inkscape convention). Uses `Scene::content_bounds` and `combined_bounds`.
+- [x] Zoom-to-fit and zoom-to-selection — `1` zooms to `vector_bool::scene_content_bounds`, `3` zooms to `vector_bool::selection_visual_bounds(scene, &selected_nodes)` (boolean-group-aware: baked path bounds for boolean operands, recursive descendant union for regular groups). Suppressed while pen/shape/text tools are mid-action; ignored with ctrl/alt held to leave Ctrl+1/3 free for future bindings.
 - [ ] Layers as first-class concept — a layer is a group with a UI role (name, lock, solo). Structure-panel affordance + `is_layer` flag on groups.
 
 ### Performance
-- [ ] Gate `build_handles` on selection/scene change — currently rebuilt every frame even when nothing changed, wasteful under continuous redraw.
-- [ ] Cache `flatten_tree` output — currently re-flattened every frame; invalidate only when scene or `structure_collapse` changes.
+- [x] Gate `build_handles` on selection/scene change — `Renderer::last_handles_key` (u64 hash of `Scene::ui_revision()` + zoom + selection state + text-edit target). Rebuild skipped when key matches and the buffer exists; idle frames produce zero handle vertex writes.
+- [x] Cache `flatten_tree` output — `EditorState::cached_flatten` keyed on `(Scene::ui_revision(), structure_collapse_rev)`. New `Scene::ui_revision()` bumps on every mutation (including the visible/locked/label setters that intentionally don't bump the geometry/subtree revs); `structure_collapse_rev` bumps when the chevron toggles collapse state.
 - [x] Per-path tessellation cache — `TessCache` in `vector-render`, keyed on each node's `Scene::geometry_revision`. Vertices live in local space; per-path `path_id` indexes a `transforms` storage buffer rebuilt per frame. Transform-only edits reuse cached vertex/index buffers verbatim.
 - [x] Per-boolean-group computed-path cache — `BoolPathCache` in `vector-render`, keyed on `Scene::subtree_revision`. Eliminates per-frame `i_overlay` calls for idle boolean groups.
 - [ ] Nice-to-have: thread `BoolPathCache` through `vector_bool::compute_boolean_group_path`'s recursion so nested boolean groups hit their own cache while the outer group is being recomputed. Only matters when a wide/deeply-nested boolean tree has active edits in one branch while siblings stay idle — uncommon enough that the outer-only cache is fine for now.

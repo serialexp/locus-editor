@@ -41,6 +41,10 @@ pub(crate) fn run_ui(
     let show_perf_hud = &mut state.show_perf_hud;
     let perf = &state.perf;
     let structure_collapse = &mut state.structure_collapse;
+    let structure_collapse_rev = &mut state.structure_collapse_rev;
+    let cached_flatten = &mut state.cached_flatten;
+    let trace_dialog = &mut state.trace_dialog;
+    let last_trace_params = &mut state.last_trace_params;
     let mut dump_requested = false;
     let mut reorder_cmd: ReorderCommand = None;
     let mut structure_cmds: StructureCommands = Vec::new();
@@ -68,7 +72,16 @@ pub(crate) fn run_ui(
                     insert_image_requested = true;
                     ui.close();
                 }
-                if ui.button("Trace raster image...").clicked() {
+                // Greyed out while a trace dialog is already open —
+                // single-instance, since the dialog owns a live preview
+                // group in the scene.
+                if ui
+                    .add_enabled(
+                        trace_dialog.is_none(),
+                        egui::Button::new("Trace raster image..."),
+                    )
+                    .clicked()
+                {
                     trace_requested = true;
                     ui.close();
                 }
@@ -361,10 +374,23 @@ pub(crate) fn run_ui(
                 // `ScrollArea::show_rows` so egui only builds widgets for
                 // rows inside the viewport. This makes per-frame cost
                 // proportional to visible rows, not total scene size.
-                let flat = {
+                let ui_rev_now = scene.ui_revision();
+                let collapse_rev_now = *structure_collapse_rev;
+                let cache_valid = cached_flatten
+                    .as_ref()
+                    .is_some_and(|c| c.ui_rev == ui_rev_now && c.collapse_rev == collapse_rev_now);
+                if !cache_valid {
                     profiling::scope!("flatten_tree");
-                    flatten_tree(scene, structure_collapse)
-                };
+                    *cached_flatten = Some(crate::structure_panel::FlattenCache {
+                        ui_rev: ui_rev_now,
+                        collapse_rev: collapse_rev_now,
+                        rows: flatten_tree(scene, structure_collapse),
+                    });
+                }
+                // Borrow the cached rows for this frame's render. The
+                // cache itself is owned by `EditorState` so it survives
+                // across frames, which is the whole point.
+                let flat = &cached_flatten.as_ref().unwrap().rows;
 
                 let row_height = ui.spacing().interact_size.y;
                 egui::ScrollArea::vertical()
@@ -379,6 +405,7 @@ pub(crate) fn run_ui(
                                 row_height,
                                 scene,
                                 structure_collapse,
+                                structure_collapse_rev,
                                 selection,
                                 &mut reorder_cmd,
                                 &mut structure_cmds,
@@ -488,6 +515,7 @@ pub(crate) fn run_ui(
     }
 
     if trace_requested
+        && trace_dialog.is_none()
         && let Some(path) = rfd::FileDialog::new()
             .add_filter(
                 "Raster images",
@@ -497,17 +525,16 @@ pub(crate) fn run_ui(
     {
         match std::fs::read(&path) {
             Ok(data) => {
-                match vector_trace::trace_image_bytes(&data, vector_trace::TracePreset::default()) {
-                    Ok(new_scene) => {
-                        *scene = new_scene;
-                        *history = History::new();
-                        *selection = SelectState::default();
-                        *pending_zoom_to_fit = true;
-                        renderer.mark_dirty();
-                        log::info!("Traced raster: {}", path.display());
-                    }
-                    Err(e) => log::error!("Failed to trace image: {e}"),
-                }
+                // Open the trace dialog rather than running a one-shot
+                // trace. The dialog spawns background traces, manages a
+                // live preview group, and records a single undo entry
+                // on Apply. See `trace_dialog::poll` / `show` / `apply`.
+                *trace_dialog = Some(crate::trace_dialog::TraceDialogState::new_from_open(
+                    data,
+                    path.clone(),
+                    last_trace_params.clone(),
+                ));
+                log::info!("Opening trace dialog for: {}", path.display());
             }
             Err(e) => log::error!("Failed to read file: {e}"),
         }

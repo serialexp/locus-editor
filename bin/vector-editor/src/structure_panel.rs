@@ -71,6 +71,16 @@ pub(crate) struct FlatRow {
     pub(crate) locked: bool,
 }
 
+/// Cached flat-tree output, keyed on the `Scene::ui_revision()` at the
+/// time of build plus a local "collapse revision" counter that the
+/// structure panel bumps whenever it mutates the collapse map. Together
+/// these capture every input that `flatten_tree` reads.
+pub(crate) struct FlattenCache {
+    pub(crate) ui_rev: u64,
+    pub(crate) collapse_rev: u64,
+    pub(crate) rows: Vec<FlatRow>,
+}
+
 /// Walk the scene once and produce a flat list of rows to render. Collapsed
 /// groups contribute only themselves; their descendants are omitted. This
 /// is what makes virtualization possible: `ScrollArea::show_rows` can index
@@ -155,6 +165,7 @@ pub(crate) fn render_virtual_row(
     row_height: f32,
     scene: &mut Scene,
     collapse: &mut HashMap<NodeId, bool>,
+    collapse_rev: &mut u64,
     selection: &mut SelectState,
     reorder_cmd: &mut ReorderCommand,
     structure_cmds: &mut StructureCommands,
@@ -223,6 +234,7 @@ pub(crate) fn render_virtual_row(
         if chevron_resp.clicked() {
             let e = collapse.entry(row.node_id).or_insert(false);
             *e = !*e;
+            *collapse_rev = collapse_rev.wrapping_add(1);
         }
     }
     cursor_x += CHEVRON_W + GLYPH_GAP;

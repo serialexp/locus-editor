@@ -322,6 +322,64 @@ pub fn boolean_group_visual_bounds(scene: &Scene, group_id: NodeId, world: Affin
     local.transform(world)
 }
 
+/// World-space visual bounds for the union of a set of nodes. Boolean groups
+/// contribute their baked tight bounds; regular groups recursively union
+/// their visible descendants (also short-circuiting at any nested boolean
+/// groups). Hidden nodes are skipped, but the hidden flag of the supplied
+/// roots themselves is honored — a hidden root contributes nothing.
+///
+/// Useful for zoom-to-selection / fit-to-selection.
+pub fn selection_visual_bounds(scene: &Scene, ids: &[NodeId]) -> Bounds {
+    let mut bounds = Bounds::EMPTY;
+    for &id in ids {
+        let Some(node) = scene.get(id) else { continue };
+        if !node.visible {
+            continue;
+        }
+        let world = scene.world_transform(id);
+        let nb = match &node.data {
+            NodeData::Group {
+                kind: GroupKind::Boolean { .. },
+                ..
+            } => boolean_group_visual_bounds(scene, id, world),
+            NodeData::Group { is_defs: true, .. } => Bounds::EMPTY,
+            NodeData::Group { .. } => {
+                let mut gb = Bounds::EMPTY;
+                scene.walk_depth_first(id, world, &mut |_cid, cnode, cworld| {
+                    if !cnode.visible {
+                        return false;
+                    }
+                    if let NodeData::Group { is_defs: true, .. } = cnode.data {
+                        return false;
+                    }
+                    if let NodeData::Group {
+                        kind: GroupKind::Boolean { .. },
+                        ..
+                    } = &cnode.data
+                    {
+                        let cb = boolean_group_visual_bounds(scene, _cid, cworld);
+                        if !cb.is_empty() {
+                            gb = gb.union(cb);
+                        }
+                        return false;
+                    }
+                    let cb = cnode.data.visual_bounds(cworld);
+                    if !cb.is_empty() {
+                        gb = gb.union(cb);
+                    }
+                    true
+                });
+                gb
+            }
+            _ => node.data.visual_bounds(world),
+        };
+        if !nb.is_empty() {
+            bounds = bounds.union(nb);
+        }
+    }
+    bounds
+}
+
 /// Bounding box over all visible rendered content in a scene, short-circuiting
 /// at Boolean groups (so they contribute the tight bounds of their baked
 /// computed path, not the naive union of their operands).

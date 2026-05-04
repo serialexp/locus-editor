@@ -660,7 +660,7 @@ enum DragMode {
 
 /// Whether we're showing the bounding box (object level) or individual
 /// vertex handles (node editing level).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectionMode {
     /// Show bounding box around selected objects. Dragging moves the whole object.
     Object,

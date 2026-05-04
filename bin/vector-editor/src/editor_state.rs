@@ -17,10 +17,12 @@ use vector_tools::{
     EdgeHit, PenAction, PenState, SelectState, ShapeDrawState, TextAction, TextToolState, ToolType,
     VertexRef,
 };
+use vector_trace::TraceParams;
 
 use crate::camera::Camera;
 use crate::hud::PerfStats;
 use crate::snap::SnapSettings;
+use crate::trace_dialog::TraceDialogState;
 
 /// What kind of canvas element was right-clicked, driving the context menu.
 pub(crate) enum CanvasContextTarget {
@@ -80,6 +82,17 @@ pub(crate) struct EditorState {
     pub(crate) drag_gradient_snapshot: Option<(NodeId, Gradient)>,
     /// Active canvas context menu (right-click on vertex/segment).
     pub(crate) canvas_context_menu: Option<CanvasContextMenu>,
+    /// Active raster-trace dialog (None when closed). While `Some`,
+    /// the canvas hosts a live preview group that re-runs the tracer
+    /// in the background as parameters change. The "Trace raster
+    /// image…" menu item is greyed out while this is `Some` so the
+    /// user can't open a second one on top.
+    pub(crate) trace_dialog: Option<TraceDialogState>,
+    /// Last-used trace parameters, persisted across re-imports for
+    /// the lifetime of the session. Initialised to vtracer's `Poster`
+    /// preset (matches the previous one-shot import default), then
+    /// updated whenever the trace dialog closes (Apply or Cancel).
+    pub(crate) last_trace_params: TraceParams,
     /// Performance stats (FPS + RSS), updated once per rendered frame.
     pub(crate) perf: PerfStats,
     /// Whether the title-bar performance HUD is visible.
@@ -89,6 +102,15 @@ pub(crate) struct EditorState {
     /// state because the tree is virtualized — a given group's widget may
     /// not exist on every frame, so egui can't persist collapse state for it.
     pub(crate) structure_collapse: HashMap<NodeId, bool>,
+    /// Monotonic counter bumped whenever `structure_collapse` is mutated
+    /// from the structure panel. Combined with `Scene::ui_revision()`, this
+    /// is the cache key for `cached_flatten` — re-flattening only happens
+    /// when one of the two changes.
+    pub(crate) structure_collapse_rev: u64,
+    /// Cached output of `flatten_tree(scene, structure_collapse)`. Kept on
+    /// the editor state so per-frame re-flattening is avoided when
+    /// nothing the structure panel cares about has changed.
+    pub(crate) cached_flatten: Option<crate::structure_panel::FlattenCache>,
 }
 
 impl Default for EditorState {
@@ -114,9 +136,13 @@ impl Default for EditorState {
             drag_transform_snapshots: Vec::new(),
             drag_gradient_snapshot: None,
             canvas_context_menu: None,
+            trace_dialog: None,
+            last_trace_params: TraceParams::default(),
             perf: PerfStats::new(),
             show_perf_hud: true,
             structure_collapse: HashMap::new(),
+            structure_collapse_rev: 0,
+            cached_flatten: None,
         }
     }
 }

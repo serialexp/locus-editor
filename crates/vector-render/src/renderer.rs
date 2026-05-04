@@ -42,6 +42,36 @@ enum DrawOp {
     Raster { node_id: NodeId },
 }
 
+/// Compute a u64 fingerprint of every input `build_handles` consumes.
+/// Reused on subsequent frames to skip the rebuild when nothing changed.
+fn compute_handles_key(
+    scene: &Scene,
+    selection: &SelectState,
+    zoom: f32,
+    text_editing_node: Option<NodeId>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Scene-wide signal: bumps on every mutation routed through Scene.
+    scene.ui_revision().hash(&mut h);
+    zoom.to_bits().hash(&mut h);
+    text_editing_node.hash(&mut h);
+    selection.mode.hash(&mut h);
+    selection.selected_nodes.hash(&mut h);
+    selection.marquee_preview_nodes.hash(&mut h);
+    selection.selected.hash(&mut h);
+    selection.hovered.hash(&mut h);
+    selection.gradient_hovered.hash(&mut h);
+    if let Some(p) = selection.edge_hover_point {
+        1u8.hash(&mut h);
+        p.x.to_bits().hash(&mut h);
+        p.y.to_bits().hash(&mut h);
+    } else {
+        0u8.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Size of an anchor point handle in pixels (half-width).
 const HANDLE_SIZE: f32 = 4.0;
 /// Size of a control point handle in pixels (half-width).
@@ -270,6 +300,12 @@ pub struct Renderer {
     handle_vertex_buffer: Option<wgpu::Buffer>,
     handle_index_buffer: Option<wgpu::Buffer>,
     handle_num_indices: u32,
+    /// Hash of the inputs `build_handles` consumes, captured at the time
+    /// the current handle buffers were built. Re-running `build_handles`
+    /// is skipped on frames where this hasn't changed — selection /
+    /// zoom / scene-content idleness lets the GPU buffers stay valid.
+    /// `None` forces a rebuild on the next prepare().
+    last_handles_key: Option<u64>,
     /// View-projection matrix as column-major f32 array.
     view_proj: [f32; 16],
     /// Current zoom level (for screen-space handle sizing).
@@ -489,6 +525,7 @@ impl Renderer {
             handle_vertex_buffer: None,
             handle_index_buffer: None,
             handle_num_indices: 0,
+            last_handles_key: None,
             view_proj,
             zoom: 1.0,
             viewport_width: 800.0,
@@ -573,10 +610,20 @@ impl Renderer {
             self.build_grid(device);
         }
 
-        // Always rebuild handle overlay (selection can change without scene changing)
-        {
+        // Rebuild handle overlay only when its inputs change. Inputs are:
+        // selection (object + vertex + hover + gradient hover + mode +
+        // marquee preview), zoom (handles are sized in screen pixels),
+        // scene state (any geometric/transform/visibility change — captured
+        // by `Scene::ui_revision()`), and which node is being text-edited
+        // (drives the amber bbox).
+        //
+        // Cheap u64 hash means an idle scene with idle selection skips
+        // hundreds-to-thousands of vertex writes per frame.
+        let handles_key = compute_handles_key(scene, selection, self.zoom, self.text_editing_node);
+        if self.last_handles_key != Some(handles_key) || self.handle_vertex_buffer.is_none() {
             profiling::scope!("build_handles");
             self.build_handles(device, scene, selection, self.zoom);
+            self.last_handles_key = Some(handles_key);
         }
 
         if !self.dirty {

@@ -57,6 +57,13 @@ pub struct Scene {
     parents: SecondaryMap<NodeId, NodeId>,
     /// Per-node revision counters for cache invalidation.
     revisions: SecondaryMap<NodeId, NodeRevision>,
+    /// Scene-wide UI revision. Bumps on *any* mutation, including those
+    /// that don't affect the renderer's geometry caches (visibility,
+    /// locked, label, structure). Drives UI-side caches (e.g. the
+    /// structure panel's flattened-tree buffer) that must reflect the
+    /// full state shown to the user, not just rendered geometry.
+    #[serde(default)]
+    ui_rev: u64,
     /// The root group node. Always exists.
     root: NodeId,
     /// The defs group (non-rendered). Child of root, always exists.
@@ -91,6 +98,7 @@ impl Scene {
             nodes,
             parents,
             revisions,
+            ui_rev: 0,
             root,
             defs,
         }
@@ -135,6 +143,14 @@ impl Scene {
     /// space) key on this value.
     pub fn subtree_revision(&self, id: NodeId) -> u64 {
         self.revisions.get(id).map_or(0, |r| r.subtree_rev)
+    }
+
+    /// Scene-wide UI revision. Bumps on every mutation routed through
+    /// `Scene` (typed setters, `edit()` guard drop, structural ops,
+    /// visibility/locked/label flips). Stable while idle. Cheap to
+    /// compare — it's a single `u64` on `Scene`.
+    pub fn ui_revision(&self) -> u64 {
+        self.ui_rev
     }
 
     // ── Typed setters ──────────────────────────────────────────────
@@ -242,6 +258,7 @@ impl Scene {
         match self.nodes.get_mut(id) {
             Some(n) => {
                 n.visible = visible;
+                self.ui_rev = self.ui_rev.wrapping_add(1);
                 true
             }
             None => false,
@@ -254,6 +271,7 @@ impl Scene {
         match self.nodes.get_mut(id) {
             Some(n) => {
                 n.locked = locked;
+                self.ui_rev = self.ui_rev.wrapping_add(1);
                 true
             }
             None => false,
@@ -266,6 +284,7 @@ impl Scene {
         match self.nodes.get_mut(id) {
             Some(n) => {
                 n.label = label;
+                self.ui_rev = self.ui_rev.wrapping_add(1);
                 true
             }
             None => false,
@@ -348,6 +367,10 @@ impl Scene {
             }
             cur = self.parents.get(c).copied();
         }
+        // Any structural / geometric / transform mutation also bumps the
+        // scene-wide UI rev — that's the catch-all signal for UI-side
+        // caches that don't care which specific node changed.
+        self.ui_rev = self.ui_rev.wrapping_add(1);
     }
 
     // ── Structural operations ──────────────────────────────────────
@@ -1050,5 +1073,52 @@ mod tests {
 
         assert_eq!(scene.geometry_revision(id), geom0);
         assert_eq!(scene.subtree_revision(id), sub0);
+    }
+
+    #[test]
+    fn ui_revision_bumps_on_every_mutation() {
+        let mut scene = Scene::new();
+        let id = scene
+            .insert(scene.root(), Node::path("p", make_test_path()))
+            .unwrap();
+
+        // Geometric / transform / structural edits all bump.
+        let r0 = scene.ui_revision();
+        scene.set_transform(id, Affine::translate(1.0, 2.0));
+        let r1 = scene.ui_revision();
+        assert!(r1 > r0, "transform should bump ui_rev");
+
+        scene.set_path_data(id, make_test_path());
+        let r2 = scene.ui_revision();
+        assert!(r2 > r1, "path data should bump ui_rev");
+
+        // The "no-bump" setters (visible/locked/label) bump ui_rev
+        // because the structure panel cache does care about them.
+        assert!(scene.set_visible(id, false));
+        let r3 = scene.ui_revision();
+        assert!(r3 > r2, "set_visible should bump ui_rev");
+
+        assert!(scene.set_locked(id, true));
+        let r4 = scene.ui_revision();
+        assert!(r4 > r3, "set_locked should bump ui_rev");
+
+        assert!(scene.set_label(id, "renamed".into()));
+        let r5 = scene.ui_revision();
+        assert!(r5 > r4, "set_label should bump ui_rev");
+
+        // Structural insert bumps.
+        let _id2 = scene
+            .insert(scene.root(), Node::path("q", make_test_path()))
+            .unwrap();
+        let r6 = scene.ui_revision();
+        assert!(r6 > r5, "insert should bump ui_rev");
+
+        // edit() guard bumps on drop.
+        {
+            let mut g = scene.edit(id).unwrap();
+            g.label = "again".into();
+        }
+        let r7 = scene.ui_revision();
+        assert!(r7 > r6, "edit guard should bump ui_rev on drop");
     }
 }

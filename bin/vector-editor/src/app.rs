@@ -21,6 +21,7 @@ use crate::context_menu::show_canvas_context_menu;
 use crate::demo::create_demo_content;
 use crate::editor_state::{CanvasContextMenu, CanvasContextTarget, EditorState};
 use crate::structure_panel::{StructureAction, apply_structure_action};
+use crate::trace_dialog;
 use crate::ui::run_ui;
 
 /// Classification of a file dropped onto the window.
@@ -815,6 +816,38 @@ impl ApplicationHandler for App {
                                 gpu.window.request_redraw();
                             }
                         }
+                        // ── Zoom keybindings (Inkscape convention) ──────
+                        //  1 → zoom-to-fit (entire visible scene content)
+                        //  3 → zoom-to-selection (combined bounds of
+                        //      currently selected nodes; no-op if empty)
+                        // Plain keys; suppressed while ctrl/alt is held
+                        // so they don't collide with future Ctrl+1/3
+                        // bindings.
+                        Key::Character(c)
+                            if !ctrl
+                                && !modifiers.alt
+                                && !self.state.pen_state.is_building()
+                                && !self.state.shape_draw.is_drawing()
+                                && !self.state.text_tool.is_editing()
+                                && (c.as_str() == "1" || c.as_str() == "3") =>
+                        {
+                            let bounds = if c.as_str() == "1" {
+                                vector_bool::scene_content_bounds(&self.state.scene)
+                            } else {
+                                let sel = &self.state.select_state.selected_nodes;
+                                if sel.is_empty() {
+                                    vector_geom::Bounds::EMPTY
+                                } else {
+                                    vector_bool::selection_visual_bounds(&self.state.scene, sel)
+                                }
+                            };
+                            if !bounds.is_empty() {
+                                self.state
+                                    .camera
+                                    .zoom_to_fit(bounds, self.state.canvas_rect);
+                                gpu.window.request_redraw();
+                            }
+                        }
                         // ── Boolean group keybindings (Inkscape-style) ──
                         //  Ctrl+ +  or  Ctrl+ =   → Union
                         //  Ctrl+ -               → Difference
@@ -880,6 +913,12 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
 
     let view = output.texture.create_view(&Default::default());
 
+    // Drain any landed trace-worker results into the live preview group
+    // and kick a new trace if params have changed and the debounce
+    // window has elapsed. Runs *before* egui begins so the dialog UI
+    // reflects the current preview / "Tracing…" state.
+    trace_dialog::poll(state, &mut gpu.renderer, &gpu.egui_ctx);
+
     // Run egui — use begin_pass/end_pass so the canvas area is NOT part of
     // any egui Ui, which lets is_pointer_over_egui() return false for it.
     let full_output = {
@@ -891,6 +930,21 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
 
         // Canvas context menu (right-click on vertex/segment in node mode).
         show_canvas_context_menu(&gpu.egui_ctx, state, &mut gpu.renderer);
+
+        // Live-preview trace dialog (non-modal; coexists with all other
+        // tools). Returns the action the user took this frame.
+        let trace_action = trace_dialog::show(state, &gpu.egui_ctx);
+        match trace_action {
+            trace_dialog::DialogAction::Apply => {
+                trace_dialog::apply(state, &mut gpu.renderer);
+                gpu.window.request_redraw();
+            }
+            trace_dialog::DialogAction::Cancel => {
+                trace_dialog::cancel(state, &mut gpu.renderer);
+                gpu.window.request_redraw();
+            }
+            trace_dialog::DialogAction::None => {}
+        }
 
         // Capture the canvas rect (area not covered by egui panels) before ending the pass.
         #[expect(deprecated)] // content_rect may not exist in this egui version yet
