@@ -44,6 +44,11 @@ fmt:
 # Full CI check (format + lint + test)
 ci: fmt-check lint test
 
+# Regenerate every derived icon asset (PNG sizes, .ico, .icns, raw RGBA)
+# from assets/icon.svg + assets/icon-small.svg. Commit the results.
+icons:
+    ./scripts/gen-icons.sh
+
 # Clean build artifacts
 clean:
     cargo clean

@@ -38,6 +38,16 @@ env_logger = { workspace = true }
 memory-stats = "1"
 profiling = { workspace = true }
 
+[build-dependencies]
+# Embeds icon.rc → icon.ico into the .exe so Explorer / taskbar pick up the
+# application icon. The build.rs only invokes it under cfg(target_os =
+# "windows"), so on every other target this is just a small extra crate to
+# compile once. Listed unconditionally (rather than under
+# [target.'cfg(windows)'.build-dependencies]) because that variant keys off
+# the *host* platform — it would break Linux→Windows cross-builds, where
+# the host isn't Windows but the build.rs target_os check is true.
+embed-resource = "3"
+
 [features]
 default = []
 # Enable Tracy profiling. Run the Tracy capture UI to connect. Adds

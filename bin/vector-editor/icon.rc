@@ -1,0 +1,7 @@
+// Windows resource script — embeds the application icon into the .exe so
+// Explorer/Taskbar show the right icon. Regenerate icon.ico with
+// `just icons` (or scripts/gen-icons.sh) when the source SVG changes.
+//
+// The first ICON entry by name (alphabetically) is what Windows treats as
+// the application icon. We pick a leading-zero name to be safe.
+1 ICON "../../assets/generated/icon.ico"

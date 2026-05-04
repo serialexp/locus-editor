@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Vector editor app icon — V as a vector path, with visible anchors -->
+  <rect width="256" height="256" rx="48" fill="#1a1f2e"/>
+
+  <!--
+    The V is a closed filled path with 6 vertices:
+      A (56,56)   top-left outer
+      B (96,56)   top-left inner
+      C (128,176) tip
+      D (160,56)  top-right inner (with curved descent on right edge)
+      E (200,56)  top-right outer
+      F (144,208) bottom-right of the tip
+      G (112,208) bottom-left of the tip (= same as C-area; closes path)
+    Right inner edge from D to F has a slight bezier swell to hint at "vector curve".
+  -->
+  <path d="M 56 56
+           L 96 56
+           L 128 176
+           C 138 138, 150 96, 160 56
+           L 200 56
+           L 144 208
+           L 112 208
+           Z"
+        fill="#5b9cf5"
+        stroke="#f5f7fa"
+        stroke-width="3"
+        stroke-linejoin="round"/>
+
+  <!-- Anchor squares at the 4 outer V corners + the tip -->
+  <g fill="#f5f7fa" stroke="#1a1f2e" stroke-width="2">
+    <rect x="48"  y="48"  width="16" height="16"/>  <!-- A: top-left outer -->
+    <rect x="192" y="48"  width="16" height="16"/>  <!-- E: top-right outer -->
+    <rect x="136" y="200" width="16" height="16"/>  <!-- F: bottom-right of tip -->
+    <rect x="104" y="200" width="16" height="16"/>  <!-- G: bottom-left of tip -->
+  </g>
+</svg>

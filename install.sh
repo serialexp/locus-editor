@@ -129,6 +129,29 @@ install_linux() {
     cp "$binary_path" "${bin_dir}/${APP_NAME}"
     chmod +x "${bin_dir}/${APP_NAME}"
 
+    # Install hicolor icons (best-effort — older tarballs may not ship them).
+    local icon_root="${tmp_dir}"
+    # The tarball stages icons at share/icons/hicolor/<N>x<N>/apps/<APP>.png
+    # somewhere under the extracted tree; locate the directory containing them.
+    local hicolor_src
+    hicolor_src=$(find "$icon_root" -type d -name hicolor -path "*/share/icons/hicolor" 2>/dev/null | head -1)
+    if [[ -n "$hicolor_src" ]]; then
+        info "Installing icons to ~/.local/share/icons/hicolor..."
+        local user_icon_root="${HOME}/.local/share/icons/hicolor"
+        for size_dir in "$hicolor_src"/*/apps; do
+            [[ -d "$size_dir" ]] || continue
+            local size_name
+            size_name=$(basename "$(dirname "$size_dir")")
+            mkdir -p "${user_icon_root}/${size_name}/apps"
+            cp "${size_dir}/${APP_NAME}.png" \
+               "${user_icon_root}/${size_name}/apps/${APP_NAME}.png" 2>/dev/null || true
+        done
+        # Refresh the icon cache so the icon shows up in launchers immediately.
+        if command -v gtk-update-icon-cache &> /dev/null; then
+            gtk-update-icon-cache -t -f "$user_icon_root" 2>/dev/null || true
+        fi
+    fi
+
     # Install desktop entry
     local desktop_dir="${HOME}/.local/share/applications"
     mkdir -p "$desktop_dir"

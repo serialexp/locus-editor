@@ -86,6 +86,16 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/${{ env.APP_NAME }} dist/
+
+          # Stage hicolor icons in the tarball under the standard
+          # XDG share/icons/ layout. install.sh copies these into the
+          # user's icon theme on Linux installs.
+          for size in 16 32 48 64 128 256 512; do
+            mkdir -p "dist/share/icons/hicolor/${size}x${size}/apps"
+            cp "assets/generated/png/icon-${size}.png" \
+               "dist/share/icons/hicolor/${size}x${size}/apps/${{ env.APP_NAME }}.png"
+          done
+
           cd dist && tar -czvf ../${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}-linux-x86_64${{ matrix.suffix }}.tar.gz *
 
       - name: Upload artifacts
@@ -133,6 +143,10 @@ jobs:
           # Copy binary
           cp target/${{ matrix.target }}/release/${{ env.APP_NAME }} "$APP_DIR/Contents/MacOS/"
 
+          # Copy app icon. CFBundleIconFile below references it by basename
+          # (no extension); the .icns suffix is implied.
+          cp assets/generated/icon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
+
           # Create Info.plist
           cat > "$APP_DIR/Contents/Info.plist" << EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -153,6 +167,8 @@ jobs:
               <string>APPL</string>
               <key>CFBundleExecutable</key>
               <string>vector-editor</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
               <key>LSMinimumSystemVersion</key>
               <string>10.13</string>
               <key>NSHighResolutionCapable</key>

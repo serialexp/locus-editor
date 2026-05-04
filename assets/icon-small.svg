@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    Small-size variant: simpler V silhouette, no anchors, no outline stroke
+    (relies on the dark rounded-rect background for contrast).
+    Geometry is widened slightly so the V doesn't look spindly at 16/32 px.
+  -->
+  <rect width="256" height="256" rx="48" fill="#1a1f2e"/>
+
+  <path d="M 48 56
+           L 96 56
+           L 128 172
+           C 140 132, 152 94, 160 56
+           L 208 56
+           L 148 208
+           L 108 208
+           Z"
+        fill="#5b9cf5"/>
+</svg>
