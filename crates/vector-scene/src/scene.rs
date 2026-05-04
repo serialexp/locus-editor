@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap};
 
 use crate::node::{GroupKind, Node, NodeData, RasterImage, TextData};
+use crate::paint::{Gradient, Paint, PaintRef};
 use crate::style::Style;
 use vector_geom::{Affine, Path};
 
@@ -195,6 +196,28 @@ impl Scene {
             return None;
         };
         let old = std::mem::replace(current, kind);
+        self.bump_geometry(id);
+        Some(old)
+    }
+
+    /// Replace the `Gradient` carried by a `NodeData::Paint(Paint::Gradient)`
+    /// node, returning the previous value. Bumps `geometry_rev` of self
+    /// (paths referencing this gradient also need their tessellation cache
+    /// invalidated, which they handle by also keying on this node's
+    /// `geometry_rev`) and `subtree_rev` of self + ancestors.
+    /// Returns `None` if the node doesn't exist or isn't a gradient paint.
+    ///
+    /// NOTE: paths referencing this gradient via `PaintRef::Ref` won't have
+    /// their own `geometry_rev` bumped — they don't need to re-tessellate;
+    /// only the gradient uniform on the GPU side needs to be re-uploaded.
+    /// The renderer already invalidates per-path caches via the gradient
+    /// node's revision.
+    pub fn set_gradient(&mut self, id: NodeId, gradient: Gradient) -> Option<Gradient> {
+        let node = self.nodes.get_mut(id)?;
+        let NodeData::Paint(Paint::Gradient(current)) = &mut node.data else {
+            return None;
+        };
+        let old = std::mem::replace(current, gradient);
         self.bump_geometry(id);
         Some(old)
     }
@@ -523,6 +546,26 @@ impl Scene {
         xform
     }
 
+    /// True iff `id` and every one of its ancestors has `visible == true`.
+    /// An invisible parent hides all of its descendants for rendering /
+    /// hit-testing purposes — this is the canonical check for "should
+    /// anything related to this node show on the canvas?".
+    pub fn is_visible_in_world(&self, id: NodeId) -> bool {
+        let mut current = id;
+        loop {
+            let Some(node) = self.nodes.get(current) else {
+                return false;
+            };
+            if !node.visible {
+                return false;
+            }
+            match self.parents.get(current).copied() {
+                Some(parent) => current = parent,
+                None => return true,
+            }
+        }
+    }
+
     /// Compute the accumulated world transform of a node's *parent chain*,
     /// excluding the node's own transform. Useful for converting a world-space
     /// delta into the local space where the node's transform operates.
@@ -532,6 +575,57 @@ impl Scene {
             None => return Affine::IDENTITY,
         };
         self.world_transform(parent_id)
+    }
+
+    /// Count how many style fields (fills + strokes across all path / text /
+    /// boolean-group nodes) reference `paint_node` via `PaintRef::Ref`.
+    /// Returns 0 if no node references it (or if the node doesn't exist).
+    ///
+    /// Used by the paint editor to decide whether editing a gradient
+    /// affects multiple shapes — a count > 1 surfaces a "Make unique"
+    /// affordance so the user can fork the gradient before editing.
+    ///
+    /// A single fill+stroke both pointing at the same gradient counts as
+    /// 2; that's deliberate. From the gradient's perspective, that's two
+    /// independent references; the user should be informed.
+    ///
+    // TODO(orphaned-defs): When a paint-type switch in the editor changes
+    // a style's `paint` from `PaintRef::Ref(g)` to anything else, the
+    // gradient/pattern node `g` may become unreferenced — but we don't
+    // currently delete it. A future GC pass should walk the defs subtree,
+    // call `gradient_ref_count` (and the equivalent for patterns) for
+    // each entry, and prune zero-ref nodes. This must be a periodic /
+    // explicit pass rather than ref-count-on-mutation: cyclic refs and
+    // multi-mutation transactions would otherwise drop a node that
+    // becomes referenced again two operations later.
+    pub fn gradient_ref_count(&self, paint_node: NodeId) -> usize {
+        let mut count = 0;
+        for (_, node) in self.nodes.iter() {
+            node.for_each_paint_ref(|paint| {
+                if matches!(paint, PaintRef::Ref(id) if *id == paint_node) {
+                    count += 1;
+                }
+            });
+        }
+        count
+    }
+
+    /// Deep-clone a `NodeData::Paint` node into the same parent (typically
+    /// `defs`) and return the new node's id. The returned id can then be
+    /// stored in a `PaintRef::Ref` to "fork" the paint — used by the
+    /// "Make unique" affordance in the paint editor.
+    ///
+    /// Returns `None` if `src` doesn't exist, isn't a `Paint` node, or has
+    /// no parent (i.e. is the root).
+    pub fn clone_paint_node(&mut self, src: NodeId) -> Option<NodeId> {
+        let node = self.nodes.get(src)?;
+        if !matches!(node.data, NodeData::Paint(_)) {
+            return None;
+        }
+        let parent = self.parent(src)?;
+        let mut clone = node.clone();
+        clone.children.clear(); // paint nodes shouldn't have children, but be defensive
+        self.insert(parent, clone)
     }
 
     /// Compute the bounding box of all visible content (paths and text),

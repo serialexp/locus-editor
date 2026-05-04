@@ -1,5 +1,5 @@
 use vector_geom::{Affine, Path};
-use vector_scene::{GroupKind, NodeId, NodeSnapshot, Scene, Style, TextData};
+use vector_scene::{Gradient, GroupKind, NodeId, NodeSnapshot, Scene, Style, TextData};
 
 /// A reversible editing command. Each variant knows how to apply
 /// itself and produce an undo command.
@@ -25,6 +25,10 @@ pub enum Command {
     SetStyle { id: NodeId, style: Style },
     /// Replace the text data of a text node.
     SetTextData { id: NodeId, text: TextData },
+    /// Replace the `Gradient` carried by a `NodeData::Paint(Paint::Gradient)`
+    /// node. Mirrors `SetPathData`: atomic value swap, undo is the inverse
+    /// `SetGradient` with the previous value.
+    SetGradient { id: NodeId, gradient: Gradient },
     /// Replace the transform of a node.
     SetTransform { id: NodeId, transform: Affine },
     /// Replace the `GroupKind` of a group node — used to convert between
@@ -86,6 +90,10 @@ impl Command {
             Command::SetTextData { id, text } => {
                 let old = scene.set_text_data(id, text)?;
                 Some(Command::SetTextData { id, text: old })
+            }
+            Command::SetGradient { id, gradient } => {
+                let old = scene.set_gradient(id, gradient)?;
+                Some(Command::SetGradient { id, gradient: old })
             }
             Command::SetTransform { id, transform } => {
                 let old = scene.set_transform(id, transform)?;

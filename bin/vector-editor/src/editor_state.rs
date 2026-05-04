@@ -12,7 +12,7 @@ use winit::window::Window;
 use vector_geom::{Affine, Path};
 use vector_ops::{Command, History};
 use vector_render::Renderer;
-use vector_scene::{NodeData, NodeId, RasterImage, Scene};
+use vector_scene::{Gradient, NodeData, NodeId, RasterImage, Scene};
 use vector_tools::{
     EdgeHit, PenAction, PenState, SelectState, ShapeDrawState, TextAction, TextToolState, ToolType,
     VertexRef,
@@ -74,6 +74,10 @@ pub(crate) struct EditorState {
     /// Snapshots of transforms captured at the start of an object drag,
     /// so we can record undo commands when the drag finishes.
     pub(crate) drag_transform_snapshots: Vec<(NodeId, Affine)>,
+    /// Snapshot of the gradient captured at the start of an on-canvas
+    /// gradient handle drag, so we can record an undo command when the
+    /// drag finishes. `(paint_node_id, gradient_before)`.
+    pub(crate) drag_gradient_snapshot: Option<(NodeId, Gradient)>,
     /// Active canvas context menu (right-click on vertex/segment).
     pub(crate) canvas_context_menu: Option<CanvasContextMenu>,
     /// Performance stats (FPS + RSS), updated once per rendered frame.
@@ -108,6 +112,7 @@ impl Default for EditorState {
             last_left_press: None,
             drag_path_snapshots: Vec::new(),
             drag_transform_snapshots: Vec::new(),
+            drag_gradient_snapshot: None,
             canvas_context_menu: None,
             perf: PerfStats::new(),
             show_perf_hud: true,
@@ -294,6 +299,41 @@ impl EditorState {
         } else if !cmds.is_empty() {
             self.history.record_undo(Command::Batch(cmds));
         }
+    }
+
+    /// Snapshot the gradient currently being dragged on-canvas, so we can
+    /// record an undo command when the drag finishes. The handle being
+    /// dragged determines which paint node to capture.
+    pub(crate) fn snapshot_gradient_for_drag(&mut self) {
+        self.drag_gradient_snapshot = None;
+        let Some(handle) = self.select_state.dragging_gradient_handle() else {
+            return;
+        };
+        if let Some(node) = self.scene.get(handle.paint)
+            && let NodeData::Paint(vector_scene::Paint::Gradient(ref g)) = node.data
+        {
+            self.drag_gradient_snapshot = Some((handle.paint, g.clone()));
+        }
+    }
+
+    /// Record an undo command for the gradient handle drag that just
+    /// finished. The undo restores the gradient captured at drag start.
+    /// We always record when a snapshot was taken: the only path that
+    /// reaches `record_gradient_drag_undo` is a completed handle drag,
+    /// and a no-op drag (e.g. mouse-down then mouse-up without movement)
+    /// is rare enough that an extra undo entry is acceptable.
+    pub(crate) fn record_gradient_drag_undo(&mut self) {
+        let Some((id, gradient)) = self.drag_gradient_snapshot.take() else {
+            return;
+        };
+        if !matches!(
+            self.scene.get(id).map(|n| &n.data),
+            Some(NodeData::Paint(vector_scene::Paint::Gradient(_)))
+        ) {
+            return;
+        }
+        self.history
+            .record_undo(Command::SetGradient { id, gradient });
     }
 
     /// Snapshot transforms of all selected objects for undo.

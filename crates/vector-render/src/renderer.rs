@@ -11,7 +11,10 @@ use vector_tess::{
     tessellate_path,
 };
 use vector_text::global_font_db;
-use vector_tools::{PointKind, SelectState, SelectionMode, VertexRef};
+use vector_tools::{
+    GradientHandlePoint, PointKind, SelectState, SelectionMode, VertexRef,
+    for_each_handle_of_gradient,
+};
 
 use crate::bool_cache::BoolPathCache;
 use crate::pipeline;
@@ -1639,15 +1642,25 @@ impl Renderer {
             let thickness = BBOX_THICKNESS_PX / zoom; // full thickness, world units
             let half_thickness = thickness * 0.5;
 
-            let root = scene.root();
             let bool_cache = &mut self.bool_path_cache;
-            scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
-                if !node.visible {
-                    return false;
+            // Iterate the selection directly rather than walking the entire
+            // scene from root: with thousands of selected paths, the old
+            // `walk_depth_first` from root was O(N) per frame, and the
+            // `is_node_selected` filter (Vec::contains over `selected_nodes`)
+            // made it O(N×S) — pathological for large traced rasters.
+            // Direct iteration is O(S × ancestor-depth).
+            let selected_for_bbox: Vec<NodeId> = selection
+                .selected_nodes
+                .iter()
+                .chain(selection.marquee_preview_nodes.iter())
+                .copied()
+                .collect();
+            for id in selected_for_bbox {
+                let Some(node) = scene.get(id) else { continue };
+                if !scene.is_visible_in_world(id) {
+                    continue;
                 }
-                if !selection.is_node_selected(id) {
-                    return true;
-                }
+                let world_transform = scene.world_transform(id);
 
                 // Compute the world-space bounding box for this node,
                 // including the visible stroke area.
@@ -1681,7 +1694,7 @@ impl Renderer {
                 };
 
                 if bounds.is_empty() {
-                    return true;
+                    continue;
                 }
 
                 let x0 = bounds.min.x as f32;
@@ -1739,8 +1752,7 @@ impl Renderer {
                     vert_half_height,
                     bbox_color,
                 );
-                true
-            });
+            }
 
             // ── Scale handles (8 squares on the combined selection bbox) ──
             // Compute the combined bounds of all selected nodes.
@@ -1933,15 +1945,20 @@ impl Renderer {
             }
 
             // First pass: draw handle lines (behind the handle squares).
-            let root = scene.root();
-            scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
-                if !node.visible {
-                    return false;
-                }
-                if !selection.is_node_selected(id) {
-                    return true;
+            // Iterate the selection directly to avoid an O(N×S) scene walk.
+            let node_handle_iter: Vec<NodeId> = selection
+                .selected_nodes
+                .iter()
+                .chain(selection.marquee_preview_nodes.iter())
+                .copied()
+                .collect();
+            for id in node_handle_iter.iter().copied() {
+                let Some(node) = scene.get(id) else { continue };
+                if !scene.is_visible_in_world(id) {
+                    continue;
                 }
                 if let NodeData::Path { ref path, .. } = node.data {
+                    let world_transform = scene.world_transform(id);
                     let xf = |p: Point| -> Point {
                         if world_transform.is_identity() {
                             p
@@ -2028,20 +2045,16 @@ impl Renderer {
                         }
                     }
                 }
-                true
-            });
+            }
 
             // Second pass: draw handle squares (on top of lines).
-            let root = scene.root();
-            scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
-                if !node.visible {
-                    return false;
-                }
-                // Only show handles for object-selected nodes.
-                if !selection.is_node_selected(id) {
-                    return true;
+            for id in node_handle_iter.iter().copied() {
+                let Some(node) = scene.get(id) else { continue };
+                if !scene.is_visible_in_world(id) {
+                    continue;
                 }
                 if let NodeData::Path { ref path, .. } = node.data {
+                    let world_transform = scene.world_transform(id);
                     // Helper: transform a point from local to world coordinates for handle display.
                     let xform = |p: Point| -> Point {
                         if world_transform.is_identity() {
@@ -2256,8 +2269,7 @@ impl Renderer {
                         }
                     }
                 }
-                true
-            });
+            }
 
             // Ghost vertex on edge hover — shows where a double-click would insert.
             if let Some(pt) = selection.edge_hover_point {
@@ -2273,6 +2285,191 @@ impl Renderer {
                 );
             }
         } // end Node mode vertex handles
+
+        // ── Gradient handles ────────────────────────────────────────
+        // For every selected path / boolean group / text node whose
+        // fill or stroke references a gradient, draw the gradient's
+        // editing handles on top of the canvas. This is mode-agnostic:
+        // gradient handles appear in both Object and Node mode so the
+        // user can grab them without first dropping into vertex-edit.
+        //
+        // World-space layout: gradient.kind coordinates are in
+        // gradient-local space and are mapped to world by
+        // `gradient.transform` (SVG userSpaceOnUse semantics — the
+        // path's own transform does NOT apply). The
+        // `for_each_handle_of_gradient` helper resolves this for us.
+        {
+            // Distinct from vertex-handle blue, so the two systems are
+            // visually unambiguous when they sit close together.
+            let gradient_axis_color: [f32; 4] = [1.0, 0.7, 0.3, 0.9]; // warm orange
+            let gradient_axis_thickness = 1.0 / zoom;
+            let gradient_axis_dash = 6.0 / zoom;
+            let gradient_axis_gap = 4.0 / zoom;
+            let endpoint_fill: [f32; 4] = [1.0, 0.85, 0.6, 1.0];
+            let endpoint_border: [f32; 4] = [0.6, 0.35, 0.0, 1.0];
+            let stop_fill: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+            let stop_border: [f32; 4] = [0.6, 0.35, 0.0, 1.0];
+            let hovered_fill_g: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
+            let hovered_border_g: [f32; 4] = [0.8, 0.45, 0.0, 1.0];
+            let selected_fill_g: [f32; 4] = [0.2, 0.6, 1.0, 1.0];
+            let selected_border_g: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+            // Track which gradient nodes we've already drawn the
+            // axis/circle for, so a gradient referenced by both fill
+            // and stroke (or by both fill and another shape's fill)
+            // doesn't double-draw the axis.
+            let mut drawn_axes: HashSet<NodeId> = HashSet::new();
+
+            // Gather gradient refs from selected nodes — we walk the
+            // scene directly here (rather than re-using a vector-tools
+            // helper) so we have access to both the gradient AND the
+            // selection state at the same time.
+            //
+            // Currently-dragged handle counts as "selected" visually so
+            // the user gets immediate feedback during a drag.
+            let active_handle = selection
+                .dragging_gradient_handle()
+                .or(selection.gradient_hovered);
+            // The hovered/dragged distinction matters only for colour:
+            // an active drag uses the brighter "selected" palette,
+            // hover-without-drag uses the warm hover palette.
+            let dragging = selection.is_dragging_gradient_handle();
+
+            for &owner in &selection.selected_nodes {
+                let Some(owner_node) = scene.get(owner) else {
+                    continue;
+                };
+
+                // Collect referenced gradient ids — dedups so a gradient
+                // shared by both fill and stroke isn't drawn twice.
+                let mut grad_ids: Vec<NodeId> = Vec::new();
+                owner_node.for_each_paint_ref(|paint| {
+                    if let PaintRef::Ref(id) = paint
+                        && !grad_ids.contains(id)
+                    {
+                        grad_ids.push(*id);
+                    }
+                });
+
+                for grad_id in grad_ids {
+                    let Some(grad_node) = scene.get(grad_id) else {
+                        continue;
+                    };
+                    let NodeData::Paint(Paint::Gradient(g)) = &grad_node.data else {
+                        continue;
+                    };
+
+                    // Draw the axis / radius circle once per gradient.
+                    if drawn_axes.insert(grad_id) {
+                        match g.kind {
+                            GradientKind::Linear { start, end } => {
+                                let ws = g.transform.apply(start);
+                                let we = g.transform.apply(end);
+                                push_dashed_line(
+                                    &mut verts,
+                                    &mut idxs,
+                                    ws,
+                                    we,
+                                    gradient_axis_thickness,
+                                    gradient_axis_dash,
+                                    gradient_axis_gap,
+                                    gradient_axis_color,
+                                );
+                            }
+                            GradientKind::Radial {
+                                center,
+                                radius,
+                                focal,
+                                focal_radius: _,
+                            } => {
+                                let wc = g.transform.apply(center);
+                                let we = g.transform.apply(Point::new(center.x + radius, center.y));
+                                // Radius axis line.
+                                push_dashed_line(
+                                    &mut verts,
+                                    &mut idxs,
+                                    wc,
+                                    we,
+                                    gradient_axis_thickness,
+                                    gradient_axis_dash,
+                                    gradient_axis_gap,
+                                    gradient_axis_color,
+                                );
+                                // Approximated radius circle (32 dashed
+                                // segments). The circle is in
+                                // *gradient-local* space, so we apply
+                                // the transform to each sample.
+                                const SEGMENTS: usize = 32;
+                                let mut prev =
+                                    g.transform.apply(Point::new(center.x + radius, center.y));
+                                for i in 1..=SEGMENTS {
+                                    let theta =
+                                        (i as f64) * std::f64::consts::TAU / (SEGMENTS as f64);
+                                    let p = Point::new(
+                                        center.x + radius * theta.cos(),
+                                        center.y + radius * theta.sin(),
+                                    );
+                                    let wp = g.transform.apply(p);
+                                    // Alternate dash / gap by parity.
+                                    if i % 2 == 1 {
+                                        push_line(
+                                            &mut verts,
+                                            &mut idxs,
+                                            prev,
+                                            wp,
+                                            gradient_axis_thickness,
+                                            gradient_axis_color,
+                                        );
+                                    }
+                                    prev = wp;
+                                }
+                                // Focal indicator (only when focal is
+                                // visibly displaced from centre). Draw
+                                // a thin line from centre to focal so
+                                // the relationship is legible.
+                                let dx = focal.x - center.x;
+                                let dy = focal.y - center.y;
+                                if dx.hypot(dy) > 1e-6 {
+                                    let wf = g.transform.apply(focal);
+                                    push_line(
+                                        &mut verts,
+                                        &mut idxs,
+                                        wc,
+                                        wf,
+                                        gradient_axis_thickness,
+                                        gradient_axis_color,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Now the per-handle pass: positions + state →
+                    // styled square / round handles.
+                    for_each_handle_of_gradient(grad_id, owner, g, |h, world| {
+                        let is_active = active_handle == Some(h);
+                        let (fill, border) = if is_active && dragging {
+                            (selected_fill_g, selected_border_g)
+                        } else if is_active {
+                            (hovered_fill_g, hovered_border_g)
+                        } else {
+                            match h.point {
+                                GradientHandlePoint::Stop(_) => (stop_fill, stop_border),
+                                _ => (endpoint_fill, endpoint_border),
+                            }
+                        };
+                        // Endpoints / centre / focal: standard square
+                        // handle. Stops: slightly smaller handle so
+                        // they read as secondary on the axis line.
+                        let size = match h.point {
+                            GradientHandlePoint::Stop(_) => handle_size * 0.75,
+                            _ => handle_size,
+                        };
+                        push_handle(&mut verts, &mut idxs, world, size, fill, border);
+                    });
+                }
+            }
+        }
 
         // Marquee rectangle (if active)
         if let Some((min, max)) = selection.marquee() {

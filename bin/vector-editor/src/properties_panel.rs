@@ -7,8 +7,9 @@ use vector_render::Renderer;
 use vector_scene::{BoolOp, GroupKind, NodeData, Scene};
 use vector_tools::SelectState;
 
+use crate::paint_picker;
 use crate::structure_panel::{StructureAction, StructureCommands};
-use crate::util::{color_to_egui, combined_bounds, egui_to_color, node_display};
+use crate::util::{combined_bounds, node_display};
 
 /// Show fill/stroke properties for the current selection.
 ///
@@ -58,6 +59,11 @@ pub(crate) fn show_properties(
         ui.add_space(2.0);
     }
 
+    // World-space bounding box of the current selection. Computed once
+    // and shared between the Transform section (W/H/scale fields) and
+    // the paint editor (for seeding gradient default geometry).
+    let bounds = combined_bounds(scene, &node_ids);
+
     // ── Transform / Geometry section ──
     {
         use vector_tools::SelectionMode;
@@ -72,7 +78,6 @@ pub(crate) fn show_properties(
             .show(ui, |ui| {
                 match selection.mode {
                     SelectionMode::Object => {
-                        let bounds = combined_bounds(scene, &node_ids);
                         // Position from the first selected node's transform.
                         let (orig_tx, orig_ty) = scene
                             .get(node_ids[0])
@@ -489,6 +494,16 @@ pub(crate) fn show_properties(
 
     let mut changed = false;
 
+    // Reuse the bounds computed at the top of the panel (used to seed
+    // gradient default geometry when switching paint type away from solid).
+    let bbox = bounds;
+
+    // Gradient edits mutate the scene directly via `scene.set_gradient`
+    // and push a `Command::SetGradient` (carrying the previous value)
+    // onto this list. We splice these into the SetStyle undo batch
+    // below so a frame's worth of paint changes undoes atomically.
+    let mut gradient_undos: Vec<Command> = Vec::new();
+
     // ── Fill section ──
     egui::CollapsingHeader::new(egui::RichText::new("Fill").strong())
         .default_open(true)
@@ -508,34 +523,31 @@ pub(crate) fn show_properties(
             }
 
             if let Some(ref mut fill) = style.fill {
-                egui::Grid::new("fill_grid")
-                    .num_columns(2)
-                    .spacing([4.0, 4.0])
-                    .show(ui, |ui| {
-                        if let vector_scene::PaintRef::Solid(ref mut color) = fill.paint {
-                            ui.label("Color");
-                            let mut egui_color = color_to_egui(*color);
-                            if ui.color_edit_button_srgba(&mut egui_color).changed() {
-                                *color = egui_to_color(egui_color);
-                                changed = true;
-                            }
-                            ui.end_row();
-                        }
+                if paint_section_editor(
+                    ui,
+                    scene,
+                    &mut fill.paint,
+                    bbox,
+                    "fill",
+                    &mut gradient_undos,
+                ) {
+                    changed = true;
+                }
 
-                        ui.label("Opacity");
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut fill.opacity)
-                                    .range(0.0..=1.0)
-                                    .speed(0.01)
-                                    .fixed_decimals(2),
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        ui.end_row();
-                    });
+                ui.horizontal(|ui| {
+                    ui.label("Opacity");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut fill.opacity)
+                                .range(0.0..=1.0)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
             }
         });
 
@@ -558,64 +570,62 @@ pub(crate) fn show_properties(
             }
 
             if let Some(ref mut stroke) = style.stroke {
-                egui::Grid::new("stroke_grid")
-                    .num_columns(2)
-                    .spacing([4.0, 4.0])
-                    .show(ui, |ui| {
-                        if let vector_scene::PaintRef::Solid(ref mut color) = stroke.paint {
-                            ui.label("Color");
-                            let mut egui_color = color_to_egui(*color);
-                            if ui.color_edit_button_srgba(&mut egui_color).changed() {
-                                *color = egui_to_color(egui_color);
-                                changed = true;
-                            }
-                            ui.end_row();
-                        }
+                if paint_section_editor(
+                    ui,
+                    scene,
+                    &mut stroke.paint,
+                    bbox,
+                    "stroke",
+                    &mut gradient_undos,
+                ) {
+                    changed = true;
+                }
 
-                        ui.label("Width");
-                        let mut width = stroke.style.width as f32;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut width)
-                                    .range(0.0..=50.0)
-                                    .speed(0.5)
-                                    .fixed_decimals(1),
-                            )
-                            .changed()
-                        {
-                            stroke.style.width = width as f64;
-                            changed = true;
-                        }
-                        ui.end_row();
+                ui.horizontal(|ui| {
+                    ui.label("Width");
+                    let mut width = stroke.style.width as f32;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut width)
+                                .range(0.0..=50.0)
+                                .speed(0.5)
+                                .fixed_decimals(1),
+                        )
+                        .changed()
+                    {
+                        stroke.style.width = width as f64;
+                        changed = true;
+                    }
+                });
 
-                        ui.label("Opacity");
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut stroke.opacity)
-                                    .range(0.0..=1.0)
-                                    .speed(0.01)
-                                    .fixed_decimals(2),
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        ui.end_row();
-                    });
+                ui.horizontal(|ui| {
+                    ui.label("Opacity");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut stroke.opacity)
+                                .range(0.0..=1.0)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
             }
         });
 
     // Apply changes to all selected path nodes.
-    if changed {
+    if changed || !gradient_undos.is_empty() {
         // Snapshot old styles for undo.
-        let mut undo_cmds = Vec::new();
+        let mut style_undos = Vec::new();
         for &node_id in &node_ids {
             if let Some(node) = scene.get(node_id) {
                 match &node.data {
                     NodeData::Path {
                         style: old_style, ..
                     } => {
-                        undo_cmds.push(Command::SetStyle {
+                        style_undos.push(Command::SetStyle {
                             id: node_id,
                             style: old_style.clone(),
                         });
@@ -628,7 +638,7 @@ pub(crate) fn show_properties(
                             },
                         ..
                     } => {
-                        undo_cmds.push(Command::SetGroupKind {
+                        style_undos.push(Command::SetGroupKind {
                             id: node_id,
                             kind: GroupKind::Boolean {
                                 op: *op,
@@ -642,18 +652,288 @@ pub(crate) fn show_properties(
         }
 
         // Apply new style.
-        for &node_id in &node_ids {
-            scene.set_style(node_id, style.clone());
+        if changed {
+            for &node_id in &node_ids {
+                scene.set_style(node_id, style.clone());
+            }
         }
 
-        // Record undo.
-        if undo_cmds.len() == 1 {
-            history.record_undo(undo_cmds.into_iter().next().unwrap());
-        } else if !undo_cmds.is_empty() {
-            history.record_undo(Command::Batch(undo_cmds));
+        // Build the combined undo. Operations were applied in this order:
+        //   1. gradient edits during UI (gradient_undos collected in order)
+        //   2. style edits at the end (style_undos collected in iteration order)
+        // To undo, we reverse the whole list.
+        let mut all_undos = gradient_undos;
+        all_undos.extend(style_undos);
+        all_undos.reverse();
+
+        if all_undos.len() == 1 {
+            history.record_undo(all_undos.into_iter().next().unwrap());
+        } else if !all_undos.is_empty() {
+            history.record_undo(Command::Batch(all_undos));
         }
 
         renderer.mark_dirty();
+    }
+}
+
+// ── Paint type switching + per-kind editors ───────────────────────────────
+
+/// Coarse paint kind, used to drive the type-selector combo. `Other` covers
+/// patterns and any future paint variants we don't yet edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintKind {
+    Solid,
+    Linear,
+    Radial,
+    Other,
+}
+
+impl PaintKind {
+    fn label(self) -> &'static str {
+        match self {
+            PaintKind::Solid => "Solid",
+            PaintKind::Linear => "Linear gradient",
+            PaintKind::Radial => "Radial gradient",
+            PaintKind::Other => "—",
+        }
+    }
+}
+
+fn paint_kind_of(paint: &vector_scene::PaintRef, scene: &Scene) -> PaintKind {
+    use vector_scene::{GradientKind, NodeData, Paint, PaintRef};
+    match paint {
+        PaintRef::Solid(_) => PaintKind::Solid,
+        PaintRef::Ref(id) => match scene.get(*id).map(|n| &n.data) {
+            Some(NodeData::Paint(Paint::Gradient(g))) => match g.kind {
+                GradientKind::Linear { .. } => PaintKind::Linear,
+                GradientKind::Radial { .. } => PaintKind::Radial,
+            },
+            _ => PaintKind::Other,
+        },
+    }
+}
+
+/// Render the paint editor for a single paint slot (fill OR stroke).
+///
+/// Lays out a `[Type ▾]` combo on the first line, then either:
+///   - a swatch button (Solid), or
+///   - a "Shared by N objects [Make unique]" banner + gradient editor
+///     stub (Linear / Radial).
+///
+/// Returns true if the *style* (the local `Style` value owned by the
+/// caller) was modified — that signals the caller to apply it via
+/// `scene.set_style` and record a SetStyle undo. Gradient mutations to
+/// nodes in defs are applied directly to `scene` and pushed onto
+/// `gradient_undos` for the caller to splice into the same undo batch.
+fn paint_section_editor(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    paint: &mut vector_scene::PaintRef,
+    bbox: vector_geom::Bounds,
+    id_source: &str,
+    gradient_undos: &mut Vec<Command>,
+) -> bool {
+    use vector_scene::{NodeData, Paint, PaintRef};
+
+    let mut changed = false;
+
+    // ── Type selector ──
+    let current_kind = paint_kind_of(paint, scene);
+    let mut next_kind = current_kind;
+    ui.horizontal(|ui| {
+        ui.label("Type");
+        egui::ComboBox::from_id_salt(("paint_kind", id_source))
+            .selected_text(current_kind.label())
+            .show_ui(ui, |ui| {
+                for k in [PaintKind::Solid, PaintKind::Linear, PaintKind::Radial] {
+                    ui.selectable_value(&mut next_kind, k, k.label());
+                }
+            });
+    });
+    if next_kind != current_kind
+        && next_kind != PaintKind::Other
+        && let Some(new_paint) = paint_with_kind(scene, paint, next_kind, bbox)
+    {
+        *paint = new_paint;
+        changed = true;
+    }
+
+    // ── Body ──
+    match paint {
+        PaintRef::Solid(c) => {
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                if paint_picker::solid_color_button(ui, c, scene, id_source) {
+                    changed = true;
+                }
+            });
+        }
+        PaintRef::Ref(grad_id) => {
+            let grad_id = *grad_id;
+
+            // Shared-gradient banner.
+            let count = scene.gradient_ref_count(grad_id);
+            if count > 1 {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Shared by {count} objects")).weak());
+                    if ui.button("Make unique").clicked()
+                        && let Some(new_id) = scene.clone_paint_node(grad_id)
+                    {
+                        *paint = PaintRef::Ref(new_id);
+                        changed = true;
+                    }
+                });
+            }
+
+            // Gradient body: clone, let the editor mutate, apply via
+            // `set_gradient`. We do this every frame the editor is drawn —
+            // changed=false short-circuits the apply pass, so the only
+            // overhead when nothing changes is a single Gradient clone.
+            if let Some(grad_node) = scene.get(grad_id)
+                && let NodeData::Paint(Paint::Gradient(g)) = &grad_node.data
+            {
+                let mut new_grad = g.clone();
+                if crate::gradient_editor::show_gradient_editor(ui, &mut new_grad, scene, id_source)
+                    && let Some(old) = scene.set_gradient(grad_id, new_grad)
+                {
+                    gradient_undos.push(Command::SetGradient {
+                        id: grad_id,
+                        gradient: old,
+                    });
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Build a new `PaintRef` of `kind`, drawing geometry defaults from `bbox`
+/// and a fallback colour from the existing paint. For gradient targets,
+/// inserts a fresh `NodeData::Paint(Paint::Gradient(_))` into the defs
+/// subtree and returns `PaintRef::Ref(new_id)`.
+///
+/// The defs node is *not* paired with a `Delete` undo — see comment in
+/// the plan: we rely on the SetStyle undo restoring the original
+/// `PaintRef`, leaving the gradient orphaned in defs (a known TODO for
+/// future GC). This keeps undo correct without depending on stable NodeIds
+/// across Insert/InsertSubtree round-trips.
+fn paint_with_kind(
+    scene: &mut Scene,
+    paint: &vector_scene::PaintRef,
+    kind: PaintKind,
+    bbox: vector_geom::Bounds,
+) -> Option<vector_scene::PaintRef> {
+    use vector_geom::{Affine, Color, Point};
+    use vector_scene::{
+        ColorStop, Gradient, GradientKind, InterpolationSpace, Node, NodeData, Paint, PaintRef,
+        SpreadMethod,
+    };
+
+    let current_color = match paint {
+        PaintRef::Solid(c) => *c,
+        PaintRef::Ref(id) => match scene.get(*id).map(|n| &n.data) {
+            Some(NodeData::Paint(Paint::Gradient(g))) if !g.stops.is_empty() => {
+                // Pick the most opaque stop so switch-to-solid lands on a
+                // useful colour rather than transparent end-stops.
+                let mut best = g.stops[0].color;
+                for s in &g.stops {
+                    if s.color.a > best.a {
+                        best = s.color;
+                    }
+                }
+                best
+            }
+            _ => Color::WHITE,
+        },
+    };
+
+    match kind {
+        PaintKind::Solid => Some(PaintRef::Solid(current_color)),
+        PaintKind::Linear => {
+            let (start, end) = if bbox.is_empty() {
+                (Point::new(0.0, 0.0), Point::new(100.0, 0.0))
+            } else {
+                (
+                    Point::new(bbox.min.x, bbox.min.y),
+                    Point::new(bbox.max.x, bbox.min.y),
+                )
+            };
+            let g = Gradient {
+                kind: GradientKind::Linear { start, end },
+                stops: vec![
+                    ColorStop {
+                        offset: 0.0,
+                        color: Color {
+                            a: 0.0,
+                            ..current_color
+                        },
+                    },
+                    ColorStop {
+                        offset: 1.0,
+                        color: current_color,
+                    },
+                ],
+                interpolation: InterpolationSpace::default(),
+                transform: Affine::IDENTITY,
+                spread: SpreadMethod::default(),
+            };
+            let defs = scene.defs();
+            let node = Node {
+                label: "linearGradient".into(),
+                transform: Affine::IDENTITY,
+                data: NodeData::Paint(Paint::Gradient(g)),
+                children: Vec::new(),
+                visible: true,
+                locked: false,
+            };
+            scene.insert(defs, node).map(PaintRef::Ref)
+        }
+        PaintKind::Radial => {
+            let (center, radius) = if bbox.is_empty() {
+                (Point::new(0.0, 0.0), 50.0)
+            } else {
+                let cx = (bbox.min.x + bbox.max.x) * 0.5;
+                let cy = (bbox.min.y + bbox.max.y) * 0.5;
+                let r = (bbox.width().min(bbox.height())) * 0.5;
+                (Point::new(cx, cy), r.max(1.0))
+            };
+            let g = Gradient {
+                kind: GradientKind::Radial {
+                    center,
+                    radius,
+                    focal: center,
+                    focal_radius: 0.0,
+                },
+                stops: vec![
+                    ColorStop {
+                        offset: 0.0,
+                        color: current_color,
+                    },
+                    ColorStop {
+                        offset: 1.0,
+                        color: Color {
+                            a: 0.0,
+                            ..current_color
+                        },
+                    },
+                ],
+                interpolation: InterpolationSpace::default(),
+                transform: Affine::IDENTITY,
+                spread: SpreadMethod::default(),
+            };
+            let defs = scene.defs();
+            let node = Node {
+                label: "radialGradient".into(),
+                transform: Affine::IDENTITY,
+                data: NodeData::Paint(Paint::Gradient(g)),
+                children: Vec::new(),
+                visible: true,
+                locked: false,
+            };
+            scene.insert(defs, node).map(PaintRef::Ref)
+        }
+        PaintKind::Other => None,
     }
 }
 

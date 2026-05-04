@@ -474,18 +474,26 @@ impl ApplicationHandler for App {
                                             }
 
                                             if !handled {
-                                                let shift =
-                                                    gpu.egui_ctx.input(|i| i.modifiers.shift);
+                                                let (shift, alt) = gpu.egui_ctx.input(|i| {
+                                                    (i.modifiers.shift, i.modifiers.alt)
+                                                });
                                                 self.state.select_state.on_press(
                                                     &self.state.scene,
                                                     canvas_f64,
                                                     shift,
+                                                    alt,
                                                     self.state.camera.zoom as f64,
                                                 );
                                                 // If on_press started a drag,
                                                 // snapshot for undo.
                                                 if self.state.select_state.is_dragging_vertices() {
                                                     self.state.snapshot_selected_vertex_paths();
+                                                } else if self
+                                                    .state
+                                                    .select_state
+                                                    .is_dragging_gradient_handle()
+                                                {
+                                                    self.state.snapshot_gradient_for_drag();
                                                 } else if self
                                                     .state
                                                     .select_state
@@ -533,6 +541,12 @@ impl ApplicationHandler for App {
                                         // command before ending the drag.
                                         if self.state.select_state.is_dragging_vertices() {
                                             self.state.record_vertex_drag_undo();
+                                        } else if self
+                                            .state
+                                            .select_state
+                                            .is_dragging_gradient_handle()
+                                        {
+                                            self.state.record_gradient_drag_undo();
                                         } else if self.state.select_state.is_dragging_objects()
                                             || self.state.select_state.is_rotating()
                                             || self.state.select_state.is_scaling()

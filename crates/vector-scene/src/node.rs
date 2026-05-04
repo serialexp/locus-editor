@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use vector_geom::{Affine, Bounds, Path, Point};
 
-use crate::paint::Paint;
+use crate::paint::{Paint, PaintRef};
 use crate::scene::NodeId;
 use crate::style::Style;
 
@@ -40,6 +40,35 @@ impl Node {
     #[inline]
     pub fn is_interactive(&self) -> bool {
         self.visible && !self.locked
+    }
+
+    /// Invoke `f` once for each `PaintRef` carried by this node's style —
+    /// fill first, then stroke. Returns immediately for node kinds that
+    /// don't carry a style (groups in Regular mode, paint defs, raster
+    /// images).
+    ///
+    /// Used by code that needs to enumerate paint references (palette
+    /// scanning, gradient ref counting, on-canvas handle rendering).
+    /// Centralising the fill/stroke walk here keeps the four kinds of
+    /// styled node — Path, Boolean group, Text — in one place.
+    pub fn for_each_paint_ref(&self, mut f: impl FnMut(&PaintRef)) {
+        let style = match &self.data {
+            NodeData::Path { style, .. } => Some(style),
+            NodeData::Group {
+                kind: GroupKind::Boolean { style, .. },
+                ..
+            } => Some(style),
+            NodeData::Text(t) => Some(&t.style),
+            _ => None,
+        };
+        if let Some(style) = style {
+            if let Some(f_) = &style.fill {
+                f(&f_.paint);
+            }
+            if let Some(s) = &style.stroke {
+                f(&s.paint);
+            }
+        }
     }
 }
 

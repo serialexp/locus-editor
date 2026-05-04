@@ -1,5 +1,7 @@
 use vector_geom::{Affine, Bounds, Point, Segment, VertexMode};
-use vector_scene::{GroupKind, NodeData, NodeId, Scene};
+use vector_scene::{
+    FillRule, Gradient, GradientKind, GroupKind, NodeData, NodeId, Paint, PaintRef, Scene,
+};
 
 /// Compute the world-space bounding box for a node's visual content,
 /// including the visible stroke area around the geometry.
@@ -18,6 +20,79 @@ fn node_bounds(scene: &Scene, id: NodeId, data: &NodeData, world: Affine) -> Bou
         return local.transform(world);
     }
     data.visual_bounds(world)
+}
+
+/// Fill-aware single-node hit test. `target` is in world coordinates.
+///
+/// For Path nodes with a fill: the click must lie inside the path's
+/// filled area (winding number under the path's fill rule). For Boolean
+/// groups: tests against the resolved boolean result path. For other
+/// node types — Text, Raster, plain Groups, paths without fill — we
+/// fall back to bbox containment so the node stays selectable. (A
+/// stroke-only path's interior should arguably miss; we keep it
+/// pickable for now to match prior behaviour. A future stroke-distance
+/// test could refine this.)
+fn node_hit_at_point(
+    scene: &Scene,
+    id: NodeId,
+    data: &NodeData,
+    world: Affine,
+    target: Point,
+) -> bool {
+    // Cheap pre-filter — if the world bbox doesn't contain the click,
+    // nothing inside this node could possibly hit. This also avoids the
+    // cost of a kurbo conversion for thousands of off-cursor candidates.
+    let bounds = node_bounds(scene, id, data, world);
+    if bounds.is_empty() || !bounds.contains_point(target) {
+        return false;
+    }
+
+    match data {
+        NodeData::Path { path, style } => {
+            let Some(fill) = style.fill.as_ref() else {
+                // No fill → bbox match is the best signal we have without
+                // an explicit stroke-distance test. Keeps stroke-only
+                // shapes pickable, matching prior behaviour.
+                return true;
+            };
+            let even_odd = matches!(fill.rule, FillRule::EvenOdd);
+            let local = if world.is_identity() {
+                target
+            } else {
+                let Some(inv) = world.inverse() else {
+                    // Degenerate transform — bbox is the best we can do.
+                    return true;
+                };
+                inv.apply(target)
+            };
+            path.contains_point(local, even_odd)
+        }
+        NodeData::Group {
+            kind: GroupKind::Boolean { .. },
+            ..
+        } => {
+            // Test against the resolved boolean path. We don't have access
+            // to the renderer's `bool_path_cache` from here, so this
+            // recomputes — fine on click (rare) but worth noting.
+            let computed = vector_bool::compute_boolean_group_path(scene, id);
+            let local = if world.is_identity() {
+                target
+            } else {
+                let Some(inv) = world.inverse() else {
+                    return true;
+                };
+                inv.apply(target)
+            };
+            // Boolean output is a single contour; nonzero rule is
+            // appropriate (and matches how it's tessellated for fill).
+            computed.contains_point(local, false)
+        }
+        // Text, Raster, plain Groups: bbox is the best we have. Plain
+        // groups would normally fall through to a child anyway because
+        // the walk recurses into them — so this branch is mostly the
+        // text/raster path.
+        _ => true,
+    }
 }
 
 /// Which specific point within a segment we're referring to.
@@ -546,6 +621,9 @@ enum DragMode {
     Idle,
     /// Dragging selected vertices. Stores last canvas position.
     MoveVertices { prev: [f64; 2] },
+    /// Dragging a gradient geometry handle (start / end / center / radius
+    /// edge / focal / stop). Stores the handle being moved.
+    MoveGradientHandle { handle: GradientHandleRef },
     /// Dragging entire objects by translating their transforms.
     MoveObjects { prev: [f64; 2] },
     /// Rotating selected objects around their combined center.
@@ -590,6 +668,48 @@ pub enum SelectionMode {
     Node,
 }
 
+/// Which point on a referenced gradient is being targeted by an on-canvas
+/// handle. All variants identify a single editable handle in the
+/// gradient's user space; the handle's world position is `gradient.transform
+/// * point`. (Per SVG `userSpaceOnUse` semantics — the path's own transform
+///   does not apply.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GradientHandlePoint {
+    /// Linear gradient — the `start` endpoint.
+    LinearStart,
+    /// Linear gradient — the `end` endpoint.
+    LinearEnd,
+    /// Radial gradient — the `center` point.
+    RadialCenter,
+    /// Radial gradient — a draggable point on the radius circle (used to
+    /// adjust the radius). Anchored at `center + (radius, 0)` in gradient
+    /// space.
+    RadialRadiusEdge,
+    /// Radial gradient — the focal point. Only displayed when the focal
+    /// differs from the center.
+    RadialFocal,
+    /// A draggable colour stop, positioned along the gradient's parametric
+    /// axis at `stops[index].offset`. Drag is constrained to the axis;
+    /// the offset is clamped to neighbouring stops so they cannot cross.
+    Stop(usize),
+}
+
+/// A specific gradient handle in a specific path's selection. We store
+/// `owner` (the path that caused this handle to render) alongside the
+/// `paint` (the gradient node in defs) so a single canvas-side handle drag
+/// has a 1:1 mapping back to the panel's selection — useful when a single
+/// gradient is shared by many shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GradientHandleRef {
+    /// The gradient node in the defs subtree.
+    pub paint: NodeId,
+    /// The path / boolean group / text node whose selection brought this
+    /// handle on screen.
+    pub owner: NodeId,
+    /// Which point on the gradient.
+    pub point: GradientHandlePoint,
+}
+
 /// State for the select tool — tracks object and vertex selection.
 ///
 /// Selection is two-level:
@@ -610,6 +730,10 @@ pub struct SelectState {
     /// Shown when the cursor is near an edge but not near an existing vertex,
     /// indicating where a double-click would insert a new point.
     pub edge_hover_point: Option<Point>,
+    /// Gradient handle currently under the cursor — when an Object-mode
+    /// selected path has a gradient fill or stroke. Vertex handles still
+    /// win the priority order in Node mode.
+    pub gradient_hovered: Option<GradientHandleRef>,
     /// Current drag mode.
     drag_mode: DragMode,
     /// Whether we're in object mode (bounding box) or node mode (vertex handles).
@@ -624,6 +748,7 @@ impl Default for SelectState {
             selected: Vec::new(),
             hovered: None,
             edge_hover_point: None,
+            gradient_hovered: None,
             drag_mode: DragMode::Idle,
             mode: SelectionMode::Object,
         }
@@ -764,14 +889,36 @@ impl SelectState {
 
     // ── Object-level hit testing ─────────────────────────────────────
 
-    /// Find the front-most visible path node whose bounding box contains
-    /// `canvas_pos`. Returns `None` if no path is hit.
+    /// Find the front-most visible node whose **visible filled area**
+    /// contains `canvas_pos`. Returns `None` if nothing is hit.
     ///
-    /// Walk order is depth-first (last child = front-most), so we keep
-    /// overwriting — the last match is the topmost drawn object.
+    /// Hit-testing is fill-aware: a path is only picked if the click lies
+    /// inside the actual filled region (computed by winding number, with
+    /// the path's own fill rule), not merely inside its bounding box. This
+    /// makes overlapping shapes whose bboxes overlap but whose fills don't
+    /// pickable in the obvious way — click on what you can see.
+    ///
+    /// Stroke-only paths and node types we don't have an exact fill test
+    /// for (Text, Raster, plain Groups) fall back to bbox containment so
+    /// they stay clickable.
+    ///
+    /// Walk order is depth-first (last child = front-most); the last
+    /// matching node wins, giving topmost-first semantics.
     pub fn object_hit_test(scene: &Scene, canvas_pos: [f64; 2]) -> Option<NodeId> {
+        Self::objects_at_point(scene, canvas_pos).into_iter().next()
+    }
+
+    /// All visible nodes whose visible filled area contains `canvas_pos`,
+    /// returned **front-to-back** (topmost first). The same fill-aware
+    /// rules as [`object_hit_test`] apply.
+    ///
+    /// Used by Alt-click cycling: callers iterate the list to find the
+    /// candidate after the currently-selected one.
+    pub fn objects_at_point(scene: &Scene, canvas_pos: [f64; 2]) -> Vec<NodeId> {
         let target = Point::new(canvas_pos[0], canvas_pos[1]);
-        let mut best: Option<NodeId> = None;
+        // Depth-first walk pushes nodes in back-to-front draw order; we
+        // reverse at the end to expose front-to-back to the caller.
+        let mut hits: Vec<NodeId> = Vec::new();
 
         let root = scene.root();
         scene.walk_depth_first(
@@ -784,35 +931,24 @@ impl SelectState {
                 if !node.visible {
                     return false;
                 }
-                if node.locked {
-                    // Don't pick this node, but DO control recursion the
-                    // same way the un-locked path does (so Boolean groups
-                    // remain non-recursable when locked).
-                    return !matches!(
-                        node.data,
-                        NodeData::Group {
-                            kind: GroupKind::Boolean { .. },
-                            ..
-                        }
-                    );
-                }
-                let bounds = node_bounds(scene, id, &node.data, world);
-                if !bounds.is_empty() && bounds.contains_point(target) {
-                    best = Some(id);
-                }
-                // Boolean groups behave as a single hittable shape — do
-                // not descend into their operand children for hit testing.
-                !matches!(
+                let is_boolean = matches!(
                     node.data,
                     NodeData::Group {
                         kind: GroupKind::Boolean { .. },
                         ..
                     }
-                )
+                );
+                if !node.locked && node_hit_at_point(scene, id, &node.data, world, target) {
+                    hits.push(id);
+                }
+                // Boolean groups behave as a single hittable shape — do
+                // not descend into their operand children for hit testing.
+                !is_boolean
             },
         );
 
-        best
+        hits.reverse();
+        hits
     }
 
     /// Find all visible nodes whose bounding boxes intersect the given rect.
@@ -976,6 +1112,20 @@ impl SelectState {
             changed = true;
         }
 
+        // Gradient handles: hovered in both Object and Node mode for any
+        // selected path that references a gradient via fill or stroke.
+        // Vertex hover wins in Node mode, so only check gradient hover
+        // when no vertex is hovered.
+        let new_grad_hover = if self.hovered.is_none() && !self.selected_nodes.is_empty() {
+            gradient_handle_hit_test(scene, canvas_pos, zoom, &self.selected_nodes)
+        } else {
+            None
+        };
+        if new_grad_hover != self.gradient_hovered {
+            self.gradient_hovered = new_grad_hover;
+            changed = true;
+        }
+
         changed
     }
 
@@ -1091,7 +1241,19 @@ impl SelectState {
     /// In **Object** mode:
     /// 1. Object hit → object select.
     /// 2. Empty space → clear all, start marquee.
-    pub fn on_press(&mut self, scene: &Scene, canvas_pos: [f64; 2], shift: bool, zoom: f64) {
+    ///
+    /// `alt`: when true and clicking on a stack of overlapping shapes,
+    /// pick the next shape *under* the currently-selected top one
+    /// (Inkscape's standard "alt-click cycle"). Without `alt` the
+    /// front-most fill-aware hit is picked, same as before.
+    pub fn on_press(
+        &mut self,
+        scene: &Scene,
+        canvas_pos: [f64; 2],
+        shift: bool,
+        alt: bool,
+        zoom: f64,
+    ) {
         if self.mode == SelectionMode::Node {
             // In node mode, try vertex hit first.
             let vertex_hit = if !self.selected_nodes.is_empty() {
@@ -1115,6 +1277,17 @@ impl SelectState {
                 return;
             }
 
+            // Vertex missed — see if we're on a gradient handle (allows
+            // gradient editing while node-mode is active without forcing
+            // a mode switch).
+            if !self.selected_nodes.is_empty()
+                && let Some(handle) =
+                    gradient_handle_hit_test(scene, canvas_pos, zoom, &self.selected_nodes)
+            {
+                self.drag_mode = DragMode::MoveGradientHandle { handle };
+                return;
+            }
+
             // Clicked in empty space while in node mode. Only drop back to
             // object mode if the click is outside every selected object's
             // visual bounds — clicks inside the bounding box stay in node
@@ -1129,6 +1302,18 @@ impl SelectState {
             }
 
             self.exit_node_mode();
+        }
+
+        // Object-mode entry path: gradient handles take precedence over
+        // marquee / object hit, so the user can grab a handle that sits
+        // outside the visible shape (e.g. a Linear gradient end placed
+        // far away from the path's bbox).
+        if !self.selected_nodes.is_empty()
+            && let Some(handle) =
+                gradient_handle_hit_test(scene, canvas_pos, zoom, &self.selected_nodes)
+        {
+            self.drag_mode = DragMode::MoveGradientHandle { handle };
+            return;
         }
 
         // Object mode: check scale handles, then rotation zone, then object hit.
@@ -1164,8 +1349,26 @@ impl SelectState {
             return;
         }
 
-        // Object mode: try object hit.
-        let object_hit = Self::object_hit_test(scene, canvas_pos);
+        // Object mode: try object hit. Alt-click cycles through stacked
+        // overlapping shapes — pick the candidate just *behind* the
+        // currently-selected top one. Without alt, take the front-most.
+        let candidates = Self::objects_at_point(scene, canvas_pos);
+        let object_hit = if alt {
+            // Find the index of the current top selection in the
+            // candidate stack and pick the next one. If the current top
+            // isn't in the stack (e.g. clicked elsewhere then alt-clicked
+            // here), fall back to the front-most. Wraps around the end.
+            let current_top = self.selected_nodes.last().copied();
+            match current_top
+                .and_then(|id| candidates.iter().position(|c| *c == id))
+                .map(|idx| (idx + 1) % candidates.len().max(1))
+            {
+                Some(next_idx) if !candidates.is_empty() => Some(candidates[next_idx]),
+                _ => candidates.first().copied(),
+            }
+        } else {
+            candidates.first().copied()
+        };
 
         if let Some(node_id) = object_hit {
             self.selected.clear();
@@ -1177,7 +1380,12 @@ impl SelectState {
                     self.selected_nodes.push(node_id);
                 }
             } else {
-                if !self.selected_nodes.contains(&node_id) {
+                // Alt-click always replaces the selection — that's how
+                // the cycle exposes one shape at a time. Without alt, we
+                // keep the legacy "clicking inside an existing
+                // multi-selection preserves the selection so a drag can
+                // start" behaviour.
+                if alt || !self.selected_nodes.contains(&node_id) {
                     self.selected_nodes.clear();
                     self.selected_nodes.push(node_id);
                 }
@@ -1205,6 +1413,9 @@ impl SelectState {
     pub fn on_drag(&mut self, scene: &mut Scene, canvas_pos: [f64; 2]) -> bool {
         match &mut self.drag_mode {
             DragMode::Idle => false,
+            DragMode::MoveGradientHandle { handle } => {
+                drag_gradient_handle(scene, *handle, canvas_pos)
+            }
             DragMode::MoveVertices { prev } => {
                 let dx = canvas_pos[0] - prev[0];
                 let dy = canvas_pos[1] - prev[1];
@@ -1402,6 +1613,20 @@ impl SelectState {
     /// Whether we're currently dragging vertices (not marquee).
     pub fn is_dragging_vertices(&self) -> bool {
         matches!(self.drag_mode, DragMode::MoveVertices { .. })
+    }
+
+    /// Whether we're currently dragging an on-canvas gradient handle.
+    pub fn is_dragging_gradient_handle(&self) -> bool {
+        matches!(self.drag_mode, DragMode::MoveGradientHandle { .. })
+    }
+
+    /// If currently dragging a gradient handle, return which one.
+    pub fn dragging_gradient_handle(&self) -> Option<GradientHandleRef> {
+        if let DragMode::MoveGradientHandle { handle } = self.drag_mode {
+            Some(handle)
+        } else {
+            None
+        }
     }
 
     /// Whether we're currently dragging whole objects.
@@ -1958,6 +2183,314 @@ fn marquee_rect(a: [f64; 2], b: [f64; 2]) -> ([f64; 2], [f64; 2]) {
     )
 }
 
+// ── Gradient handle helpers ─────────────────────────────────────────────
+//
+// Gradient handles live in the gradient's user space (SVG `userSpaceOnUse`
+// semantics — what the renderer assumes). The world position of a handle
+// is `gradient.transform * point_in_gradient_space`. The path's transform
+// does NOT apply.
+//
+// These helpers walk a set of selected paths, look at their fill and
+// stroke `PaintRef::Ref(_)`, resolve the gradient node, and produce
+// handle-by-handle world positions for hit-testing and rendering.
+
+/// Resolve a path/boolean-group/text node's fill+stroke gradients.
+///
+/// Returns the unique set of gradient `NodeId`s referenced by `node` —
+/// each at most once even if both fill and stroke point at the same
+/// gradient (the panel's banner already informs the user about that
+/// case; on canvas, drawing the same handle twice would just look like
+/// flickering).
+fn gradients_referenced_by(node: &vector_scene::Node) -> Vec<NodeId> {
+    let mut out: Vec<NodeId> = Vec::new();
+    node.for_each_paint_ref(|paint| {
+        if let PaintRef::Ref(id) = paint
+            && !out.contains(id)
+        {
+            out.push(*id);
+        }
+    });
+    out
+}
+
+/// Compute the world-space positions of every editable handle for
+/// `gradient`, identified by `(paint, owner, point)` keys, and call `f`
+/// for each.
+///
+/// For radial gradients, the focal handle is omitted when the focal
+/// coincides with the centre (the common case) — that handle would just
+/// land on top of the centre handle.
+pub fn for_each_handle_of_gradient(
+    paint: NodeId,
+    owner: NodeId,
+    gradient: &Gradient,
+    mut f: impl FnMut(GradientHandleRef, Point),
+) {
+    let xf = gradient.transform;
+    match gradient.kind {
+        GradientKind::Linear { start, end } => {
+            f(
+                GradientHandleRef {
+                    paint,
+                    owner,
+                    point: GradientHandlePoint::LinearStart,
+                },
+                xf.apply(start),
+            );
+            f(
+                GradientHandleRef {
+                    paint,
+                    owner,
+                    point: GradientHandlePoint::LinearEnd,
+                },
+                xf.apply(end),
+            );
+            // Stops along the start→end axis.
+            for (i, stop) in gradient.stops.iter().enumerate() {
+                let t = stop.offset as f64;
+                let local = Point::new(
+                    start.x + t * (end.x - start.x),
+                    start.y + t * (end.y - start.y),
+                );
+                f(
+                    GradientHandleRef {
+                        paint,
+                        owner,
+                        point: GradientHandlePoint::Stop(i),
+                    },
+                    xf.apply(local),
+                );
+            }
+        }
+        GradientKind::Radial {
+            center,
+            radius,
+            focal,
+            focal_radius: _,
+        } => {
+            f(
+                GradientHandleRef {
+                    paint,
+                    owner,
+                    point: GradientHandlePoint::RadialCenter,
+                },
+                xf.apply(center),
+            );
+            f(
+                GradientHandleRef {
+                    paint,
+                    owner,
+                    point: GradientHandlePoint::RadialRadiusEdge,
+                },
+                xf.apply(Point::new(center.x + radius, center.y)),
+            );
+            // Focal only when it differs meaningfully from the centre.
+            let dx = focal.x - center.x;
+            let dy = focal.y - center.y;
+            if dx.hypot(dy) > 1e-6 {
+                f(
+                    GradientHandleRef {
+                        paint,
+                        owner,
+                        point: GradientHandlePoint::RadialFocal,
+                    },
+                    xf.apply(focal),
+                );
+            }
+            // Stops along the centre→radius-edge axis.
+            for (i, stop) in gradient.stops.iter().enumerate() {
+                let t = stop.offset as f64;
+                let local = Point::new(center.x + t * radius, center.y);
+                f(
+                    GradientHandleRef {
+                        paint,
+                        owner,
+                        point: GradientHandlePoint::Stop(i),
+                    },
+                    xf.apply(local),
+                );
+            }
+        }
+    }
+}
+
+/// Walk the gradients referenced by every node in `selected_nodes` and
+/// invoke `f(handle_ref, world_position)` for each handle. Handles are
+/// emitted in *enumeration* order — the renderer relies on this to order
+/// painters' draw calls (stops on top of axis lines).
+pub fn for_each_gradient_handle(
+    scene: &Scene,
+    selected_nodes: &[NodeId],
+    mut f: impl FnMut(GradientHandleRef, Point),
+) {
+    for &owner in selected_nodes {
+        let Some(node) = scene.get(owner) else {
+            continue;
+        };
+        for grad_id in gradients_referenced_by(node) {
+            let Some(grad_node) = scene.get(grad_id) else {
+                continue;
+            };
+            let NodeData::Paint(Paint::Gradient(g)) = &grad_node.data else {
+                continue;
+            };
+            for_each_handle_of_gradient(grad_id, owner, g, &mut f);
+        }
+    }
+}
+
+/// Hit-test against gradient handles for the current selection. Returns
+/// the closest handle within `HIT_RADIUS_SCREEN_PX / zoom` canvas units,
+/// or `None` if nothing is in range.
+pub fn gradient_handle_hit_test(
+    scene: &Scene,
+    canvas_pos: [f64; 2],
+    zoom: f64,
+    selected_nodes: &[NodeId],
+) -> Option<GradientHandleRef> {
+    let r = HIT_RADIUS_SCREEN_PX / zoom;
+    let r2 = r * r;
+    let mut best: Option<(f64, GradientHandleRef)> = None;
+    for_each_gradient_handle(scene, selected_nodes, |handle, world| {
+        let dx = world.x - canvas_pos[0];
+        let dy = world.y - canvas_pos[1];
+        let d2 = dx * dx + dy * dy;
+        if d2 <= r2 {
+            match best {
+                Some((b, _)) if b <= d2 => {}
+                _ => best = Some((d2, handle)),
+            }
+        }
+    });
+    best.map(|(_, h)| h)
+}
+
+/// Apply a gradient handle drag — moving handle `handle.point` to
+/// `canvas_pos` (or, for stops, projecting onto the gradient axis to find
+/// the new t). Reads the current gradient via `scene`, builds a new
+/// `Gradient`, and writes it back via `Scene::set_gradient`.
+///
+/// Returns true if the gradient was modified.
+///
+/// Stops are clamped to the current neighbours' offsets so dragging one
+/// stop past another isn't possible (matches the panel editor's
+/// semantics — keeps the stops vector sorted with no need to re-find the
+/// "selected stop" after a swap).
+pub fn drag_gradient_handle(
+    scene: &mut Scene,
+    handle: GradientHandleRef,
+    canvas_pos: [f64; 2],
+) -> bool {
+    let Some(grad_node) = scene.get(handle.paint) else {
+        return false;
+    };
+    let NodeData::Paint(Paint::Gradient(g)) = &grad_node.data else {
+        return false;
+    };
+
+    // Convert the world-space cursor into gradient space.
+    let Some(inv) = g.transform.inverse() else {
+        return false;
+    };
+    let local_x = inv.a * canvas_pos[0] + inv.b * canvas_pos[1] + inv.tx;
+    let local_y = inv.c * canvas_pos[0] + inv.d * canvas_pos[1] + inv.ty;
+    let local = Point::new(local_x, local_y);
+
+    let mut new_g = g.clone();
+    let mut changed = false;
+
+    match handle.point {
+        GradientHandlePoint::LinearStart => {
+            if let GradientKind::Linear { start, .. } = &mut new_g.kind
+                && (local.x != start.x || local.y != start.y)
+            {
+                *start = local;
+                changed = true;
+            }
+        }
+        GradientHandlePoint::LinearEnd => {
+            if let GradientKind::Linear { end, .. } = &mut new_g.kind
+                && (local.x != end.x || local.y != end.y)
+            {
+                *end = local;
+                changed = true;
+            }
+        }
+        GradientHandlePoint::RadialCenter => {
+            if let GradientKind::Radial { center, focal, .. } = &mut new_g.kind {
+                let dx = local.x - center.x;
+                let dy = local.y - center.y;
+                if dx != 0.0 || dy != 0.0 {
+                    // Move centre, drag focal along with it (keep relative offset).
+                    *center = local;
+                    focal.x += dx;
+                    focal.y += dy;
+                    changed = true;
+                }
+            }
+        }
+        GradientHandlePoint::RadialRadiusEdge => {
+            if let GradientKind::Radial { center, radius, .. } = &mut new_g.kind {
+                let dx = local.x - center.x;
+                let dy = local.y - center.y;
+                let new_r = dx.hypot(dy).max(1e-3);
+                if (new_r - *radius).abs() > 1e-9 {
+                    *radius = new_r;
+                    changed = true;
+                }
+            }
+        }
+        GradientHandlePoint::RadialFocal => {
+            if let GradientKind::Radial { focal, .. } = &mut new_g.kind
+                && (local.x != focal.x || local.y != focal.y)
+            {
+                *focal = local;
+                changed = true;
+            }
+        }
+        GradientHandlePoint::Stop(i) => {
+            if i < new_g.stops.len() {
+                // Project the cursor onto the gradient axis to compute t.
+                let (axis_a, axis_b) = match new_g.kind {
+                    GradientKind::Linear { start, end } => (start, end),
+                    GradientKind::Radial { center, radius, .. } => {
+                        (center, Point::new(center.x + radius, center.y))
+                    }
+                };
+                let ax = axis_b.x - axis_a.x;
+                let ay = axis_b.y - axis_a.y;
+                let denom = ax * ax + ay * ay;
+                if denom > f64::EPSILON {
+                    let bx = local.x - axis_a.x;
+                    let by = local.y - axis_a.y;
+                    let raw_t = ((ax * bx + ay * by) / denom) as f32;
+                    // Clamp to [neighbour_below + ε, neighbour_above - ε].
+                    let lo = if i == 0 {
+                        0.0
+                    } else {
+                        new_g.stops[i - 1].offset + 1e-4
+                    };
+                    let hi = if i + 1 >= new_g.stops.len() {
+                        1.0
+                    } else {
+                        new_g.stops[i + 1].offset - 1e-4
+                    };
+                    let clamped = raw_t.clamp(lo, hi);
+                    if (clamped - new_g.stops[i].offset).abs() > f32::EPSILON {
+                        new_g.stops[i].offset = clamped;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        scene.set_gradient(handle.paint, new_g);
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2103,5 +2636,255 @@ mod tests {
             SelectState::insert_point_on_edge(&mut scene, &hit).is_none(),
             "open path has no closing edge to insert into"
         );
+    }
+
+    // ── Gradient handle tests ───────────────────────────────────────
+
+    use vector_geom::Color;
+    use vector_scene::style::Fill;
+    use vector_scene::{ColorStop, InterpolationSpace, SpreadMethod, Style};
+
+    /// Build a scene with one path filled by a linear gradient placed in
+    /// a defs node off the root. Returns `(path_id, gradient_id)`.
+    fn linear_gradient_fill_scene() -> (Scene, NodeId, NodeId) {
+        let mut scene = Scene::new();
+        let path_id = closed_square_node(&mut scene);
+
+        // Insert a gradient node directly off the root (we don't strictly
+        // need the SVG `defs` indirection for these tests).
+        let root = scene.root();
+        let gradient = Gradient {
+            kind: GradientKind::Linear {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(10.0, 0.0),
+            },
+            stops: vec![
+                ColorStop {
+                    offset: 0.0,
+                    color: Color::new(0.0, 0.0, 0.0, 1.0),
+                },
+                ColorStop {
+                    offset: 1.0,
+                    color: Color::new(1.0, 1.0, 1.0, 1.0),
+                },
+            ],
+            interpolation: InterpolationSpace::LinearRgb,
+            transform: Affine::IDENTITY,
+            spread: SpreadMethod::Pad,
+        };
+        let grad_id = scene
+            .insert(
+                root,
+                vector_scene::Node {
+                    label: "g".into(),
+                    transform: Affine::IDENTITY,
+                    data: NodeData::Paint(Paint::Gradient(gradient)),
+                    children: Vec::new(),
+                    visible: true,
+                    locked: false,
+                },
+            )
+            .unwrap();
+
+        // Re-target the path's fill to the gradient.
+        let style = Style {
+            fill: Some(Fill {
+                paint: PaintRef::Ref(grad_id),
+                opacity: 1.0,
+                rule: vector_scene::FillRule::NonZero,
+            }),
+            stroke: None,
+        };
+        scene.set_style(path_id, style).unwrap();
+
+        (scene, path_id, grad_id)
+    }
+
+    fn current_linear(scene: &Scene, grad_id: NodeId) -> (Point, Point) {
+        let node = scene.get(grad_id).unwrap();
+        let NodeData::Paint(Paint::Gradient(g)) = &node.data else {
+            panic!("not a gradient");
+        };
+        let GradientKind::Linear { start, end } = g.kind else {
+            panic!("not linear");
+        };
+        (start, end)
+    }
+
+    #[test]
+    fn linear_gradient_emits_endpoint_and_stop_handles() {
+        let (scene, path_id, grad_id) = linear_gradient_fill_scene();
+        let mut handles: Vec<(GradientHandleRef, Point)> = Vec::new();
+        for_each_gradient_handle(&scene, &[path_id], |h, p| handles.push((h, p)));
+
+        // Two endpoints + two stops.
+        assert_eq!(handles.len(), 4);
+        assert!(
+            handles
+                .iter()
+                .any(|(h, p)| matches!(h.point, GradientHandlePoint::LinearStart)
+                    && p == &Point::new(0.0, 0.0))
+        );
+        assert!(
+            handles
+                .iter()
+                .any(|(h, p)| matches!(h.point, GradientHandlePoint::LinearEnd)
+                    && p == &Point::new(10.0, 0.0))
+        );
+
+        // Stops at offsets 0.0 and 1.0 land on the endpoints.
+        let stop_positions: Vec<Point> = handles
+            .iter()
+            .filter(|(h, _)| matches!(h.point, GradientHandlePoint::Stop(_)))
+            .map(|(_, p)| *p)
+            .collect();
+        assert_eq!(stop_positions.len(), 2);
+        assert!(stop_positions.contains(&Point::new(0.0, 0.0)));
+        assert!(stop_positions.contains(&Point::new(10.0, 0.0)));
+
+        // Sanity: every emitted handle ties back to the source gradient.
+        for (h, _) in &handles {
+            assert_eq!(h.paint, grad_id);
+            assert_eq!(h.owner, path_id);
+        }
+    }
+
+    #[test]
+    fn drag_gradient_start_endpoint_updates_kind() {
+        let (mut scene, path_id, grad_id) = linear_gradient_fill_scene();
+        let handle = GradientHandleRef {
+            paint: grad_id,
+            owner: path_id,
+            point: GradientHandlePoint::LinearStart,
+        };
+        // Drag the start to (5, 5) in canvas / world coordinates. With an
+        // identity gradient transform this should land directly in the
+        // gradient's local space.
+        assert!(drag_gradient_handle(&mut scene, handle, [5.0, 5.0]));
+        let (start, end) = current_linear(&scene, grad_id);
+        assert!((start.x - 5.0).abs() < 1e-9 && (start.y - 5.0).abs() < 1e-9);
+        // End untouched.
+        assert!((end.x - 10.0).abs() < 1e-9 && end.y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn drag_gradient_end_endpoint_updates_kind() {
+        let (mut scene, path_id, grad_id) = linear_gradient_fill_scene();
+        let handle = GradientHandleRef {
+            paint: grad_id,
+            owner: path_id,
+            point: GradientHandlePoint::LinearEnd,
+        };
+        assert!(drag_gradient_handle(&mut scene, handle, [3.0, -2.0]));
+        let (start, end) = current_linear(&scene, grad_id);
+        // Start untouched.
+        assert!(start.x.abs() < 1e-9 && start.y.abs() < 1e-9);
+        assert!((end.x - 3.0).abs() < 1e-9 && (end.y + 2.0).abs() < 1e-9);
+    }
+
+    /// Insert an additional middle stop into the gradient at `grad_id`,
+    /// returning the new (3-stop) gradient. Stops in the helper start as
+    /// just `[0.0, 1.0]`; this lets a test introduce a middle stop to
+    /// drag without crossing a neighbour.
+    fn add_middle_stop(scene: &mut Scene, grad_id: NodeId, offset: f32) {
+        let mut g = match &scene.get(grad_id).unwrap().data {
+            NodeData::Paint(Paint::Gradient(g)) => g.clone(),
+            _ => unreachable!(),
+        };
+        g.stops.insert(
+            1,
+            ColorStop {
+                offset,
+                color: Color::new(0.5, 0.5, 0.5, 1.0),
+            },
+        );
+        scene.set_gradient(grad_id, g).unwrap();
+    }
+
+    #[test]
+    fn drag_gradient_stop_projects_onto_axis_and_updates_offset() {
+        // Start with stops at 0.0 and 1.0; we'll add a middle stop at 0.5
+        // so we have somewhere to drag without crossing a neighbour.
+        let (mut scene, path_id, grad_id) = linear_gradient_fill_scene();
+        add_middle_stop(&mut scene, grad_id, 0.5);
+        let handle = GradientHandleRef {
+            paint: grad_id,
+            owner: path_id,
+            point: GradientHandlePoint::Stop(1),
+        };
+
+        // Drag to (8, 4): along the start→end axis (which runs along
+        // y=0 from x=0 to x=10), the projected t is 0.8. The y component
+        // is dropped because it's perpendicular to the axis.
+        assert!(drag_gradient_handle(&mut scene, handle, [8.0, 4.0]));
+        let node = scene.get(grad_id).unwrap();
+        let NodeData::Paint(Paint::Gradient(g)) = &node.data else {
+            unreachable!();
+        };
+        assert!(
+            (g.stops[1].offset - 0.8).abs() < 1e-4,
+            "stop offset {} ≠ 0.8",
+            g.stops[1].offset
+        );
+        // Neighbours unchanged.
+        assert_eq!(g.stops[0].offset, 0.0);
+        assert_eq!(g.stops[2].offset, 1.0);
+    }
+
+    #[test]
+    fn dragging_stop_clamps_to_neighbours() {
+        // With three stops at 0.0, 0.5, 1.0, dragging the middle stop
+        // *past* a neighbour (e.g. far past x=10) must clamp it strictly
+        // less than the next stop's offset, not swap order.
+        let (mut scene, path_id, grad_id) = linear_gradient_fill_scene();
+        add_middle_stop(&mut scene, grad_id, 0.5);
+        let handle = GradientHandleRef {
+            paint: grad_id,
+            owner: path_id,
+            point: GradientHandlePoint::Stop(1),
+        };
+        // Try to drag well past the end (x=100) — should clamp under 1.0.
+        assert!(drag_gradient_handle(&mut scene, handle, [100.0, 0.0]));
+        let node = scene.get(grad_id).unwrap();
+        let NodeData::Paint(Paint::Gradient(g)) = &node.data else {
+            unreachable!();
+        };
+        assert!(
+            g.stops[1].offset < 1.0,
+            "stop offset {} should clamp below 1.0",
+            g.stops[1].offset
+        );
+        assert!(g.stops[1].offset > 0.0); // Still above the lower neighbour.
+        // Order preserved.
+        assert!(g.stops[0].offset < g.stops[1].offset);
+        assert!(g.stops[1].offset < g.stops[2].offset);
+    }
+
+    #[test]
+    fn gradient_hit_test_returns_closest_handle() {
+        // At zoom=10, HIT_RADIUS_SCREEN_PX (8 px) divided by zoom is 0.8
+        // canvas units. The handle endpoints sit at (0, 0) and (10, 0),
+        // so a click within ~0.8 of either endpoint should connect.
+        let (scene, path_id, grad_id) = linear_gradient_fill_scene();
+
+        // Click very close to the start endpoint at (0,0).
+        let hit =
+            gradient_handle_hit_test(&scene, [0.1, 0.0], 10.0, &[path_id]).expect("should hit");
+        assert_eq!(hit.paint, grad_id);
+        assert!(matches!(
+            hit.point,
+            GradientHandlePoint::LinearStart | GradientHandlePoint::Stop(0)
+        ));
+
+        // Click near the end.
+        let hit =
+            gradient_handle_hit_test(&scene, [9.9, 0.0], 10.0, &[path_id]).expect("should hit end");
+        assert!(matches!(
+            hit.point,
+            GradientHandlePoint::LinearEnd | GradientHandlePoint::Stop(1)
+        ));
+
+        // Click far away returns None.
+        assert!(gradient_handle_hit_test(&scene, [500.0, 500.0], 10.0, &[path_id]).is_none());
     }
 }

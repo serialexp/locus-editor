@@ -15,6 +15,38 @@ pub(crate) fn egui_to_color(c: egui::Color32) -> vector_geom::Color {
     vector_geom::Color::from_srgb8(c.r(), c.g(), c.b(), c.a())
 }
 
+/// Paint a transparency checkerboard into `rect`. Used as the backdrop
+/// for any colour swatch / gradient preview that may contain alpha so
+/// translucency reads correctly. `cell_size` controls how large each
+/// square is in screen pixels.
+pub(crate) fn paint_transparency_checkerboard(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    cell_size: f32,
+) {
+    let dark = egui::Color32::from_gray(120);
+    let light = egui::Color32::from_gray(180);
+    painter.rect_filled(rect, 2.0, light);
+    let cols = (rect.width() / cell_size).ceil() as i32;
+    let rows = (rect.height() / cell_size).ceil() as i32;
+    for r in 0..rows {
+        for col in 0..cols {
+            if (r + col) % 2 == 0 {
+                continue;
+            }
+            let x0 = rect.left() + col as f32 * cell_size;
+            let y0 = rect.top() + r as f32 * cell_size;
+            let x1 = (x0 + cell_size).min(rect.right());
+            let y1 = (y0 + cell_size).min(rect.bottom());
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                0.0,
+                dark,
+            );
+        }
+    }
+}
+
 /// Compute the combined world-space bounding box for a set of node IDs.
 pub(crate) fn combined_bounds(scene: &Scene, node_ids: &[NodeId]) -> vector_geom::Bounds {
     let mut combined = vector_geom::Bounds::EMPTY;
