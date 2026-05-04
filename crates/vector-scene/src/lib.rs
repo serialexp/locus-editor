@@ -3,7 +3,7 @@ pub mod paint;
 pub mod scene;
 pub mod style;
 
-pub use node::{BoolOp, GroupKind, Node, NodeData, TextData};
+pub use node::{BoolOp, GroupKind, Node, NodeData, RasterImage, TextData};
 pub use paint::{
     ColorStop, Gradient, GradientKind, InterpolationSpace, Paint, PaintRef, Pattern, SpreadMethod,
 };

@@ -3,6 +3,8 @@
 //! functions that build UI panels or respond to events.
 
 use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Instant;
 
 use winit::window::Window;
@@ -10,7 +12,7 @@ use winit::window::Window;
 use vector_geom::{Affine, Path};
 use vector_ops::{Command, History};
 use vector_render::Renderer;
-use vector_scene::{NodeData, NodeId, Scene};
+use vector_scene::{NodeData, NodeId, RasterImage, Scene};
 use vector_tools::{
     EdgeHit, PenAction, PenState, SelectState, ShapeDrawState, TextAction, TextToolState, ToolType,
     VertexRef,
@@ -119,6 +121,74 @@ impl EditorState {
     pub(crate) fn screen_to_canvas_snapped(&self, screen_x: f32, screen_y: f32) -> [f64; 2] {
         let c = self.camera.screen_to_canvas(screen_x, screen_y);
         self.snap.snap([c[0] as f64, c[1] as f64])
+    }
+
+    /// Decode `bytes` as a raster image (PNG/JPEG/GIF/BMP/WEBP/TIFF) and
+    /// insert it as a new `Raster` node centred on the current viewport.
+    /// The image's local box is `(0, 0)..(width, height)` in pixels (so 1 px
+    /// = 1 canvas unit at zoom 1.0); the node's transform places the centre
+    /// of that box on the centre of the visible canvas.
+    ///
+    /// On success the new node is selected and an undo command is recorded.
+    /// `label` is used for the structure-panel display name.
+    ///
+    /// Used by both drag-drop (`WindowEvent::DroppedFile` for raster files)
+    /// and the File → Insert Image… menu — the decode path is identical, so
+    /// it lives here.
+    pub(crate) fn insert_raster_from_bytes(
+        &mut self,
+        bytes: &[u8],
+        label: impl Into<String>,
+        renderer: &mut Renderer,
+    ) -> Result<NodeId, String> {
+        let decoded = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("guess image format: {e}"))?
+            .decode()
+            .map_err(|e| format!("decode image: {e}"))?
+            .to_rgba8();
+        let pixel_width = decoded.width();
+        let pixel_height = decoded.height();
+        if pixel_width == 0 || pixel_height == 0 {
+            return Err("image has zero width or height".into());
+        }
+
+        let image = Arc::new(RasterImage::new(
+            decoded.into_raw(),
+            pixel_width,
+            pixel_height,
+        ));
+
+        // Centre on the visible viewport. canvas_rect is screen-pixel
+        // (min_x, min_y, w, h); convert its centre to canvas coords.
+        let [cx, cy, cw, ch] = self.canvas_rect;
+        let centre = self.camera.screen_to_canvas(cx + cw * 0.5, cy + ch * 0.5);
+        let w = pixel_width as f64;
+        let h = pixel_height as f64;
+        let transform = Affine::translate(centre[0] as f64 - w * 0.5, centre[1] as f64 - h * 0.5);
+
+        let mut node = vector_scene::Node::raster(label, image, w, h);
+        node.transform = transform;
+
+        // Insert directly so we can grab the new NodeId, then record the
+        // matching undo (Delete). Mirrors the pen tool's PenAction::Finished
+        // pattern in `handle_pen_action` — same reason: `History::execute`
+        // doesn't return the inserted id.
+        let parent = self.scene.root();
+        let id = self
+            .scene
+            .insert(parent, node)
+            .ok_or_else(|| "scene insert failed".to_string())?;
+        self.history.record_undo(Command::Delete { id });
+
+        // Select the new node so it shows handles and is obvious in the UI.
+        self.select_state.selected_nodes.clear();
+        self.select_state.selected_nodes.push(id);
+        self.select_state.selected.clear();
+        self.select_state.hovered = None;
+
+        renderer.mark_dirty();
+        Ok(id)
     }
 
     /// Process a PenAction result — auto-select, switch tools, mark dirty.

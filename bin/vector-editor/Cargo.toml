@@ -32,6 +32,11 @@ egui-phosphor = { workspace = true }
 # File dialog
 rfd = { workspace = true }
 
+# Raster decoding (drag-drop / Insert Image flow). Same crate + features as
+# vector-trace so we share the decoder cache; we just don't go through the
+# tracer — we keep the pixels and build a Raster scene node directly.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+
 # Utilities
 log = { workspace = true }
 env_logger = { workspace = true }

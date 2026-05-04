@@ -35,6 +35,10 @@ pub(crate) enum StructureAction {
     Ungroup { group: NodeId },
     /// Delete a node.
     Delete { id: NodeId },
+    /// Toggle the `locked` flag on a node. Locked nodes are skipped by
+    /// hit-testing in select / pen / text tools (see `Node::is_interactive`)
+    /// but continue to render. Not undoable — same status as visibility.
+    SetLocked { id: NodeId, locked: bool },
     /// Wrap the selected nodes in a new Boolean group with the given op.
     /// The resulting group renders as a single computed shape over its
     /// descendants.
@@ -64,6 +68,7 @@ pub(crate) struct FlatRow {
     pub(crate) icon: &'static str,
     pub(crate) label: String,
     pub(crate) visible: bool,
+    pub(crate) locked: bool,
 }
 
 /// Walk the scene once and produce a flat list of rows to render. Collapsed
@@ -104,6 +109,7 @@ fn flatten_recurse(
     let collapsed = collapse.get(&node_id).copied().unwrap_or(false);
     let (icon, label) = node_display(node);
     let visible = node.visible;
+    let locked = node.locked;
     let child_ids = if is_group && has_children && !collapsed {
         node.children.clone()
     } else {
@@ -122,6 +128,7 @@ fn flatten_recurse(
         icon,
         label,
         visible,
+        locked,
     });
 
     for (i, child) in child_ids.into_iter().enumerate() {
@@ -137,6 +144,8 @@ fn flatten_recurse(
 /// Interaction rects:
 ///   - `chevron` (if group): toggles collapse
 ///   - `eye` (if not defs): toggles visibility
+///   - `lock` (if not defs): toggles `locked` — locked nodes are not
+///     interactive (selection / hit-tests skip them) but still render
 ///   - `label_area`: row click (select) + drag source
 ///   - top 4px band: drop target (only active during a drag)
 #[expect(clippy::too_many_arguments)]
@@ -154,7 +163,9 @@ pub(crate) fn render_virtual_row(
     profiling::scope!("render_virtual_row");
 
     let node_selected = selection.is_node_selected(row.node_id);
-    let text_color = if !row.visible || row.is_defs {
+    // Locked rows render with muted text for the same reason hidden ones do:
+    // a quick visual cue that the row isn't fully interactive.
+    let text_color = if !row.visible || row.is_defs || row.locked {
         ui.visuals().weak_text_color()
     } else if node_selected {
         egui::Color32::from_rgb(80, 160, 255)
@@ -180,6 +191,7 @@ pub(crate) fn render_virtual_row(
     const INDENT_STEP: f32 = 12.0;
     const CHEVRON_W: f32 = 14.0;
     const EYE_W: f32 = 16.0;
+    const LOCK_W: f32 = 16.0;
     const GLYPH_GAP: f32 = 4.0;
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
@@ -254,6 +266,50 @@ pub(crate) fn render_virtual_row(
     }
     cursor_x += EYE_W + GLYPH_GAP;
 
+    // Lock toggle (interactive) — defs can't be locked. Mirrors the eye
+    // column above; click flips `locked`, which gates select / pen / text
+    // tool hit-tests via `Node::is_interactive()`. A small key-glyph icon
+    // when locked, an open padlock when unlocked.
+    if !row.is_defs {
+        let lock_icon = if row.locked {
+            egui_phosphor::regular::LOCK
+        } else {
+            egui_phosphor::regular::LOCK_OPEN
+        };
+        // Locked → full-strength colour so it stands out as "this is on";
+        // unlocked → weak colour so the column reads as quiet space.
+        let lock_color = if row.locked {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let lock_rect = egui::Rect::from_min_size(
+            egui::pos2(cursor_x, row_rect.top()),
+            egui::vec2(LOCK_W, row_height),
+        );
+        let lock_resp = ui.interact(
+            lock_rect,
+            egui::Id::new(("lock", row.node_id)),
+            egui::Sense::click(),
+        );
+        ui.painter().text(
+            lock_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            lock_icon,
+            font_id.clone(),
+            lock_color,
+        );
+        if lock_resp.clicked()
+            && let Some(n) = scene.get(row.node_id)
+        {
+            let new_locked = !n.locked;
+            scene.set_locked(row.node_id, new_locked);
+            *scene_dirty = true;
+        }
+        let _ = lock_resp.on_hover_text(if row.locked { "Unlock" } else { "Lock" });
+    }
+    cursor_x += LOCK_W + GLYPH_GAP;
+
     // Icon + label, painted directly.
     let label_text = format!("{} {}", row.icon, row.label);
     ui.painter().text(
@@ -293,6 +349,7 @@ pub(crate) fn render_virtual_row(
             row.node_id,
             row.is_group,
             row.is_defs,
+            row.locked,
             selection,
             structure_cmds,
         );
@@ -330,10 +387,29 @@ pub(crate) fn node_context_menu(
     node_id: NodeId,
     is_group: bool,
     is_defs: bool,
+    locked: bool,
     selection: &SelectState,
     structure_cmds: &mut StructureCommands,
 ) {
     if !is_defs {
+        // Lock / Unlock at the top — discoverable mirror of the lock-icon
+        // column. Even with the column visible, having the entry here helps
+        // users who navigate the structure panel via right-click.
+        let (lock_label, lock_icon) = if locked {
+            ("Unlock", egui_phosphor::regular::LOCK_OPEN)
+        } else {
+            ("Lock", egui_phosphor::regular::LOCK)
+        };
+        if ui.button(format!("{lock_icon} {lock_label}")).clicked() {
+            structure_cmds.push(StructureAction::SetLocked {
+                id: node_id,
+                locked: !locked,
+            });
+            ui.close();
+        }
+
+        ui.separator();
+
         // "Add Group Inside" — only for groups
         if is_group
             && ui
@@ -550,6 +626,12 @@ pub(crate) fn apply_structure_action(action: StructureAction, state: &mut Editor
                 .history
                 .execute(Command::Delete { id }, &mut state.scene);
             state.select_state.selected_nodes.retain(|&n| n != id);
+        }
+        StructureAction::SetLocked { id, locked } => {
+            // Same handling as set_visible: a flag flip on the node, not an
+            // undoable command. If a future use case needs Lock/Unlock to
+            // participate in undo, that's a small Command variant addition.
+            state.scene.set_locked(id, locked);
         }
         StructureAction::MakeBooleanGroup { nodes, op } => {
             if nodes.is_empty() {

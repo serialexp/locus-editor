@@ -45,6 +45,7 @@ pub(crate) fn node_display(node: &vector_scene::Node) -> (&'static str, String) 
         NodeData::Path { .. } => egui_phosphor::regular::PATH,
         NodeData::Paint(_) => egui_phosphor::regular::PALETTE,
         NodeData::Text(_) => egui_phosphor::regular::TEXT_AA,
+        NodeData::Raster { .. } => egui_phosphor::regular::IMAGE,
     };
 
     let label = if node.label.is_empty() {
@@ -61,6 +62,7 @@ pub(crate) fn node_display(node: &vector_scene::Node) -> (&'static str, String) 
                     preview
                 }
             }
+            NodeData::Raster { .. } => "Image".to_string(),
         }
     } else {
         node.label.clone()

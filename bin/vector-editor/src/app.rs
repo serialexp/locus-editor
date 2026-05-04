@@ -34,7 +34,7 @@ impl DroppedKind {
     fn label(self) -> &'static str {
         match self {
             DroppedKind::Svg => "SVG",
-            DroppedKind::Raster => "traced raster",
+            DroppedKind::Raster => "raster image",
         }
     }
 }
@@ -237,17 +237,8 @@ impl ApplicationHandler for App {
                 };
                 if let Some(kind) = kind {
                     match std::fs::read(&path) {
-                        Ok(data) => {
-                            let result = match kind {
-                                DroppedKind::Svg => vector_svg::import_svg(&data)
-                                    .map_err(|e| format!("SVG import: {e}")),
-                                DroppedKind::Raster => vector_trace::trace_image_bytes(
-                                    &data,
-                                    vector_trace::TracePreset::default(),
-                                )
-                                .map_err(|e| format!("raster trace: {e}")),
-                            };
-                            match result {
+                        Ok(data) => match kind {
+                            DroppedKind::Svg => match vector_svg::import_svg(&data) {
                                 Ok(scene) => {
                                     self.state.scene = scene;
                                     self.state.history = History::new();
@@ -260,8 +251,38 @@ impl ApplicationHandler for App {
                                     log::info!("Loaded {}: {}", kind.label(), path.display());
                                 }
                                 Err(e) => log::error!("Failed to load {}: {e}", kind.label()),
+                            },
+                            DroppedKind::Raster => {
+                                // Insert (don't trace) — this is the "use as
+                                // tracing reference" path. File menu still
+                                // has an explicit "Trace raster image…"
+                                // entry for the one-shot conversion flow.
+                                let label = path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("Image")
+                                    .to_string();
+                                if let Some(gpu) = &mut self.gpu {
+                                    match self.state.insert_raster_from_bytes(
+                                        &data,
+                                        label,
+                                        &mut gpu.renderer,
+                                    ) {
+                                        Ok(_id) => {
+                                            gpu.window.request_redraw();
+                                            log::info!(
+                                                "Inserted {}: {}",
+                                                kind.label(),
+                                                path.display()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::error!("Failed to insert {}: {e}", kind.label())
+                                        }
+                                    }
+                                }
                             }
-                        }
+                        },
                         Err(e) => log::error!("Failed to read file: {e}"),
                     }
                 }
@@ -851,7 +872,7 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
         profiling::scope!("egui_pass");
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         gpu.egui_ctx.begin_pass(raw_input);
-        let (structure_cmds_inner, ui_scene_dirty_inner) =
+        let (structure_cmds_inner, ui_scene_dirty_inner, insert_image_requested_inner) =
             run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
 
         // Canvas context menu (right-click on vertex/segment in node mode).
@@ -867,9 +888,41 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
             gpu.egui_ctx.end_pass(),
             structure_cmds_inner,
             ui_scene_dirty_inner,
+            insert_image_requested_inner,
         )
     };
-    let (full_output, structure_cmds, ui_scene_dirty) = full_output;
+    let (full_output, structure_cmds, ui_scene_dirty, insert_image_requested) = full_output;
+
+    // File → Insert Image…: opens a file dialog and inserts the chosen image
+    // as a Raster scene node. Lives here (after run_ui returns) because the
+    // helper needs the full `&mut EditorState`, which is borrowed through
+    // disjoint field refs inside run_ui.
+    if insert_image_requested
+        && let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Raster images",
+                &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"],
+            )
+            .pick_file()
+    {
+        match std::fs::read(&path) {
+            Ok(data) => {
+                let label = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Image")
+                    .to_string();
+                match state.insert_raster_from_bytes(&data, label, &mut gpu.renderer) {
+                    Ok(_id) => {
+                        gpu.window.request_redraw();
+                        log::info!("Inserted raster image: {}", path.display());
+                    }
+                    Err(e) => log::error!("Failed to insert raster image: {e}"),
+                }
+            }
+            Err(e) => log::error!("Failed to read file: {e}"),
+        }
+    }
 
     // Mark dirty if the UI changed the scene (e.g. visibility toggle).
     if ui_scene_dirty {

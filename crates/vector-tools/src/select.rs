@@ -683,7 +683,9 @@ impl SelectState {
             let Some(node) = scene.get(node_id) else {
                 continue;
             };
-            if !node.visible {
+            // Locked nodes are non-interactive: no vertex iteration / edge
+            // hits / object hits land on them. They're still rendered.
+            if !node.is_interactive() {
                 continue;
             }
             let NodeData::Path { ref path, .. } = node.data else {
@@ -776,8 +778,23 @@ impl SelectState {
             root,
             vector_geom::Affine::IDENTITY,
             &mut |id, node, world| {
+                // Visibility hides the entire subtree; locking only blocks
+                // hits on this node — its children stay interactive (matches
+                // Inkscape's "lock object" semantics).
                 if !node.visible {
                     return false;
+                }
+                if node.locked {
+                    // Don't pick this node, but DO control recursion the
+                    // same way the un-locked path does (so Boolean groups
+                    // remain non-recursable when locked).
+                    return !matches!(
+                        node.data,
+                        NodeData::Group {
+                            kind: GroupKind::Boolean { .. },
+                            ..
+                        }
+                    );
                 }
                 let bounds = node_bounds(scene, id, &node.data, world);
                 if !bounds.is_empty() && bounds.contains_point(target) {
@@ -809,8 +826,23 @@ impl SelectState {
             root,
             vector_geom::Affine::IDENTITY,
             &mut |id, node, world| {
+                // Visibility hides the entire subtree; locking only blocks
+                // hits on this node — its children stay interactive (matches
+                // Inkscape's "lock object" semantics).
                 if !node.visible {
                     return false;
+                }
+                if node.locked {
+                    // Don't pick this node, but DO control recursion the
+                    // same way the un-locked path does (so Boolean groups
+                    // remain non-recursable when locked).
+                    return !matches!(
+                        node.data,
+                        NodeData::Group {
+                            kind: GroupKind::Boolean { .. },
+                            ..
+                        }
+                    );
                 }
                 let bounds = node_bounds(scene, id, &node.data, world);
                 if !bounds.is_empty() && bounds.intersects(query) {
@@ -1557,7 +1589,9 @@ impl SelectState {
             let Some(node) = scene.get(node_id) else {
                 continue;
             };
-            if !node.visible {
+            // Locked nodes are non-interactive: no vertex iteration / edge
+            // hits / object hits land on them. They're still rendered.
+            if !node.is_interactive() {
                 continue;
             }
             let NodeData::Path { ref path, .. } = node.data else {
@@ -1635,7 +1669,9 @@ impl SelectState {
             let Some(node) = scene.get(node_id) else {
                 continue;
             };
-            if !node.visible {
+            // Locked nodes are non-interactive: no vertex iteration / edge
+            // hits / object hits land on them. They're still rendered.
+            if !node.is_interactive() {
                 continue;
             }
             let NodeData::Path { ref path, .. } = node.data else {

@@ -1,9 +1,10 @@
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap};
 
-use crate::node::{GroupKind, Node, NodeData, TextData};
+use crate::node::{GroupKind, Node, NodeData, RasterImage, TextData};
 use crate::style::Style;
 use vector_geom::{Affine, Path};
 
@@ -333,6 +334,21 @@ impl Scene {
     /// its ancestors (the subtree gained a new descendant).
     pub fn insert(&mut self, parent: NodeId, node: Node) -> Option<NodeId> {
         self.insert_at(parent, node, None)
+    }
+
+    /// Convenience: build and insert a raster image node as a child of
+    /// `parent`. Returns the new `NodeId`. The local-space box runs from
+    /// `(0, 0)` to `(width, height)`; place the box on the canvas by
+    /// editing the new node's transform afterwards.
+    pub fn add_raster(
+        &mut self,
+        parent: NodeId,
+        label: impl Into<String>,
+        image: Arc<RasterImage>,
+        width: f64,
+        height: f64,
+    ) -> Option<NodeId> {
+        self.insert(parent, Node::raster(label, image, width, height))
     }
 
     /// Insert a new node as a child of `parent` at a specific index.

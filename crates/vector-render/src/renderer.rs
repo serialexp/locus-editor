@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use vector_geom::{Affine, Color, Point, Segment};
@@ -14,7 +15,29 @@ use vector_tools::{PointKind, SelectState, SelectionMode, VertexRef};
 
 use crate::bool_cache::BoolPathCache;
 use crate::pipeline;
+use crate::raster_cache::{GpuRasterDraw, RasterCache};
 use crate::tess_cache::{TessCache, TessCacheStats};
+
+/// One ordered scene-content draw operation. Built up during `prepare()`
+/// in scene order, consumed by `render()` to issue draw calls in that
+/// same order — preserving z-order across the two pipelines (vector
+/// geometry vs. raster images).
+///
+/// `prepare()` coalesces consecutive vector contributions (paths, text,
+/// boolean groups) into a single `VectorBatch` and only breaks the batch
+/// when a raster node is encountered. So a scene with a raster sandwiched
+/// between two paths produces three ops; a scene with only paths produces
+/// exactly one.
+#[derive(Debug, Clone)]
+enum DrawOp {
+    /// Issue a single `draw_indexed(index_range, …)` against the vector
+    /// pipeline, drawing every vector contribution between the previous
+    /// and next pipeline switch.
+    VectorBatch { index_range: Range<u32> },
+    /// Issue a 6-vertex `draw(0..6, 0..1)` against the raster pipeline,
+    /// pulling the texture + per-draw uniform from the raster cache.
+    Raster { node_id: NodeId },
+}
 
 /// Size of an anchor point handle in pixels (half-width).
 const HANDLE_SIZE: f32 = 4.0;
@@ -283,6 +306,27 @@ pub struct Renderer {
     transforms_buffer: wgpu::Buffer,
     /// Current capacity (number of `GpuTransform` slots) of `transforms_buffer`.
     transforms_capacity: u32,
+    // ── Raster pipeline ──────────────────────────────────────────────
+    /// Pipeline for rendering `NodeData::Raster` nodes (textured quads).
+    raster_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for the raster pipeline's group 1 (per-raster
+    /// texture + sampler + draw uniform). Stored so the cache can build
+    /// per-entry bind groups against it.
+    raster_per_draw_layout: wgpu::BindGroupLayout,
+    /// Group 0 bind group for the raster pipeline (just view-proj, sourced
+    /// from the same `globals_buffer` as the vector pipeline).
+    raster_globals_bind_group: wgpu::BindGroup,
+    /// Sampler shared by every raster (filtering, clamp). One per
+    /// renderer, not per-cache-entry — wgpu allows reusing the same
+    /// `Sampler` across many bind groups.
+    raster_sampler: wgpu::Sampler,
+    /// Per-raster-node texture cache.
+    raster_cache: RasterCache,
+    /// Ordered list of draw operations for the scene-content pass.
+    /// Rebuilt every time `prepare()` walks the scene; each entry is
+    /// either a contiguous range of indices to draw against the vector
+    /// pipeline, or a `Raster` reference to draw a textured quad.
+    draw_ops: Vec<DrawOp>,
 }
 
 /// Post-tessellation geometry stats for the scene (excluding grid / handle
@@ -320,6 +364,22 @@ impl Renderer {
         let bind_group_layout = pipeline::create_bind_group_layout(device);
         let pipeline =
             pipeline::create_pipeline(device, surface_format, &shader, &bind_group_layout);
+
+        // Raster pipeline (image nodes). Compiled from a separate WGSL
+        // file; shares only the `globals_buffer` with the vector pipeline.
+        let raster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("raster shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("raster.wgsl").into()),
+        });
+        let raster_globals_layout = pipeline::create_raster_globals_layout(device);
+        let raster_per_draw_layout = pipeline::create_raster_per_draw_layout(device);
+        let raster_pipeline = pipeline::create_raster_pipeline(
+            device,
+            surface_format,
+            &raster_shader,
+            &raster_globals_layout,
+            &raster_per_draw_layout,
+        );
 
         // Create the globals uniform buffer with an initial ortho matrix
         let view_proj = camera_matrix(800.0, 600.0, [0.0, 0.0], 1.0);
@@ -382,6 +442,29 @@ impl Renderer {
             &transforms_buffer,
         );
 
+        // Raster pipeline's globals bind group: just view-proj, sourced
+        // from the same `globals_buffer` so updating that one buffer in
+        // `prepare()` affects both pipelines without a duplicate write.
+        let raster_globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raster globals bind group"),
+            layout: &raster_globals_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals_buffer.as_entire_binding(),
+            }],
+        });
+
+        // Raster sampler: linear filtering with clamped edges (rasters are
+        // standalone images, not tiled like patterns).
+        let raster_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("raster sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         Self {
             pipeline,
             bind_group_layout,
@@ -419,6 +502,12 @@ impl Renderer {
             tess_cache: TessCache::new(),
             transforms_buffer,
             transforms_capacity: 1,
+            raster_pipeline,
+            raster_per_draw_layout,
+            raster_globals_bind_group,
+            raster_sampler,
+            raster_cache: RasterCache::new(),
+            draw_ops: Vec::new(),
         }
     }
 
@@ -972,15 +1061,38 @@ impl Renderer {
 
         let root = scene.root();
         let mut path_count: u32 = 0;
-        // Split the borrow of `self` so the closure can hold `&mut` on both
-        // the tess cache and the bool-path cache independently of `scene`.
+        // Split the borrow of `self` so the closure can hold `&mut` on the
+        // tess cache, the bool-path cache, and the raster cache independently
+        // of `scene`. We also capture the per-draw layout + sampler by
+        // reference for raster uploads inside the walk.
         let bool_cache = &mut self.bool_path_cache;
         let tess_cache = &mut self.tess_cache;
+        let raster_cache = &mut self.raster_cache;
+        let raster_per_draw_layout = &self.raster_per_draw_layout;
+        let raster_sampler = &self.raster_sampler;
         tess_cache.reset_stats();
+
+        // Build the ordered draw-op list as we walk. `batch_start` marks
+        // the start of the currently-open vector batch (an index range of
+        // `all_indices`); when we hit a raster node we close that batch
+        // (if any), emit a Raster op, and reopen lazily when the next
+        // vector contribution arrives.
+        let mut draw_ops: Vec<DrawOp> = Vec::new();
+        let mut batch_start: Option<u32> = None;
+        let mut alive_rasters: HashSet<NodeId> = HashSet::new();
         scene.walk_depth_first(root, Affine::IDENTITY, &mut |id, node, world_transform| {
             if !node.visible {
                 return false;
             }
+            // Lazy-open a vector batch on the first vector contribution
+            // since the last raster (or scene start). `open_batch_here`
+            // captures the current `all_indices` length; the batch is
+            // closed when a raster is encountered or the walk ends.
+            let mut open_batch_here = || {
+                if batch_start.is_none() {
+                    batch_start = Some(all_indices.len() as u32);
+                }
+            };
             match node.data {
                 NodeData::Group {
                     kind: vector_scene::GroupKind::Boolean { ref style, .. },
@@ -991,6 +1103,7 @@ impl Renderer {
                     // into children (they're operands, not drawables).
                     let computed = bool_cache.get_or_compute(scene, id);
                     if !computed.subpaths.is_empty() {
+                        open_batch_here();
                         path_count += 1;
                         let fill = style.fill.as_ref().map(|f| FillParams {
                             paint: resolve_paint(&f.paint),
@@ -1014,6 +1127,7 @@ impl Renderer {
                     ref path,
                     ref style,
                 } => {
+                    open_batch_here();
                     path_count += 1;
                     let rev = scene.geometry_revision(id);
                     let fill = style.fill.as_ref().map(|f| FillParams {
@@ -1034,6 +1148,7 @@ impl Renderer {
                     );
                 }
                 NodeData::Text(ref text) => {
+                    open_batch_here();
                     path_count += 1;
                     let rev = scene.geometry_revision(id);
                     let fill = text.style.fill.as_ref().map(|f| FillParams {
@@ -1058,10 +1173,60 @@ impl Renderer {
                         &mut all_indices,
                     );
                 }
+                NodeData::Raster {
+                    ref image,
+                    width,
+                    height,
+                } => {
+                    // Close any open vector batch — we need to switch
+                    // pipelines before emitting this raster.
+                    if let Some(start) = batch_start.take() {
+                        let end = all_indices.len() as u32;
+                        if end > start {
+                            draw_ops.push(DrawOp::VectorBatch {
+                                index_range: start..end,
+                            });
+                        }
+                    }
+                    // Ensure the GPU texture exists (re-uploaded only if
+                    // the source `Arc<RasterImage>` has been swapped).
+                    raster_cache.upload_if_needed(
+                        device,
+                        queue,
+                        raster_per_draw_layout,
+                        raster_sampler,
+                        id,
+                        image,
+                    );
+                    // Update per-draw uniform with the current world
+                    // transform and box size. Cheap (48 bytes per raster).
+                    let draw = GpuRasterDraw::new(&world_transform, width, height);
+                    raster_cache.write_uniform(queue, id, &draw);
+
+                    draw_ops.push(DrawOp::Raster { node_id: id });
+                    alive_rasters.insert(id);
+                    // Rasters have no children to render (children would
+                    // not draw on top of the image — that's a vector
+                    // pipeline concern). Skip recursion.
+                    return false;
+                }
                 _ => {}
             }
             true
         });
+
+        // Close the final vector batch (if any) after the walk.
+        if let Some(start) = batch_start.take() {
+            let end = all_indices.len() as u32;
+            if end > start {
+                draw_ops.push(DrawOp::VectorBatch {
+                    index_range: start..end,
+                });
+            }
+        }
+        // Free GPU memory for raster nodes that have been deleted.
+        raster_cache.evict_missing(&alive_rasters);
+        self.draw_ops = draw_ops;
 
         self.num_indices = all_indices.len() as u32;
         self.num_vertices = all_vertices.len() as u32;
@@ -2223,6 +2388,16 @@ impl Renderer {
     }
 
     /// Record draw commands into a render pass.
+    ///
+    /// Render order:
+    ///
+    /// 1. **Grid** — vector pipeline, drawn behind everything else.
+    /// 2. **Scene content** — iterates `draw_ops` in scene order, switching
+    ///    between the vector and raster pipelines as needed. This is what
+    ///    preserves z-order: a raster sandwiched between two paths renders
+    ///    under one and on top of the other.
+    /// 3. **Handle overlay** — vector pipeline, drawn on top of everything
+    ///    so vertex handles / selection boxes are always visible.
     pub fn render(&self, pass: &mut wgpu::RenderPass<'static>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
@@ -2236,13 +2411,68 @@ impl Renderer {
             pass.draw_indexed(0..self.grid_num_indices, 0, 0..1);
         }
 
-        // Draw scene geometry
-        if self.num_indices > 0
-            && let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer)
-        {
+        // Draw scene content. We track which pipeline is currently bound
+        // (`PipelineMode::Vector` after the grid draw) and only re-bind
+        // when switching kinds — wgpu draw calls are cheap relative to
+        // pipeline state changes, but consecutive ops of the same kind
+        // are common (e.g. many paths in a row) so this still matters.
+        #[derive(PartialEq)]
+        enum PipelineMode {
+            Vector,
+            Raster,
+        }
+        let mut mode = PipelineMode::Vector;
+
+        // We may or may not have vector buffers (a scene of only rasters
+        // produces zero vector indices and skips the buffer creation).
+        // Bind them up front if they exist, but the per-op `VectorBatch`
+        // arm gates on them anyway so we don't draw stale geometry.
+        let vector_buffers = match (&self.vertex_buffer, &self.index_buffer) {
+            (Some(vb), Some(ib)) => Some((vb, ib)),
+            _ => None,
+        };
+        if let Some((vb, ib)) = vector_buffers {
             pass.set_vertex_buffer(0, vb.slice(..));
             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.num_indices, 0, 0..1);
+        }
+
+        for op in &self.draw_ops {
+            match op {
+                DrawOp::VectorBatch { index_range } => {
+                    let Some((vb, ib)) = vector_buffers else {
+                        // No vector buffers this frame — should never
+                        // happen if a `VectorBatch` was emitted, but
+                        // defensively skip rather than panic.
+                        continue;
+                    };
+                    if mode != PipelineMode::Vector {
+                        pass.set_pipeline(&self.pipeline);
+                        pass.set_bind_group(0, &self.bind_group, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        mode = PipelineMode::Vector;
+                    }
+                    pass.draw_indexed(index_range.clone(), 0, 0..1);
+                }
+                DrawOp::Raster { node_id } => {
+                    if mode != PipelineMode::Raster {
+                        pass.set_pipeline(&self.raster_pipeline);
+                        pass.set_bind_group(0, &self.raster_globals_bind_group, &[]);
+                        mode = PipelineMode::Raster;
+                    }
+                    if let Some(entry) = self.raster_cache.get(*node_id) {
+                        pass.set_bind_group(1, &entry.bind_group, &[]);
+                        // Six vertices, two triangles, one instance.
+                        pass.draw(0..6, 0..1);
+                    }
+                }
+            }
+        }
+
+        // Restore vector pipeline + bind group for the handle overlay.
+        if mode != PipelineMode::Vector {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
         }
 
         // Draw handle overlay on top

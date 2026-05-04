@@ -462,6 +462,11 @@ impl TextToolState {
         let Some(node) = scene.get(node_id) else {
             return false;
         };
+        // Locked / hidden nodes are not interactive — text tool can't pick
+        // them up to edit. Same gate as the select tool's hit tests.
+        if !node.is_interactive() {
+            return false;
+        }
         let world = scene.world_transform(node_id);
         let bounds = node.data.visual_bounds(world);
         if bounds.is_empty() {
@@ -481,7 +486,7 @@ impl TextToolState {
         // Iterate children in reverse (top-most first).
         for &child_id in root_node.children.iter().rev() {
             let child = scene.get(child_id)?;
-            if !child.visible {
+            if !child.is_interactive() {
                 continue;
             }
             if matches!(&child.data, NodeData::Text(_))

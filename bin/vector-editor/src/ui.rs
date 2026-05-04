@@ -18,13 +18,17 @@ use crate::structure_panel::{
 /// so the canvas area is NOT part of any egui Ui. This lets
 /// `is_pointer_over_egui()` return false for the canvas.
 ///
-/// Returns (structure_commands, scene_dirty) from the structure panel.
+/// Returns `(structure_commands, scene_dirty, insert_image_requested)`.
+/// `insert_image_requested` is handled by the caller (which has access to
+/// the full `&mut EditorState`, needed by `insert_raster_from_bytes`); we
+/// can't run the file dialog inline because state is already destructured
+/// into disjoint borrows by the time we reach the menu code.
 #[expect(deprecated)] // Panel::show is deprecated in 0.34 but needed for top-level panels
 pub(crate) fn run_ui(
     ctx: &egui::Context,
     state: &mut EditorState,
     renderer: &mut Renderer,
-) -> (StructureCommands, bool) {
+) -> (StructureCommands, bool, bool) {
     let scene = &mut state.scene;
     let history = &mut state.history;
     let active_tool = &mut state.active_tool;
@@ -44,6 +48,7 @@ pub(crate) fn run_ui(
     let mut open_requested = false;
     let mut save_requested = false;
     let mut trace_requested = false;
+    let mut insert_image_requested = false;
     let mut undo_requested = false;
     let mut redo_requested = false;
 
@@ -59,6 +64,10 @@ pub(crate) fn run_ui(
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Insert image...").clicked() {
+                    insert_image_requested = true;
+                    ui.close();
+                }
                 if ui.button("Trace raster image...").clicked() {
                     trace_requested = true;
                     ui.close();
@@ -513,5 +522,5 @@ pub(crate) fn run_ui(
         });
     }
 
-    (structure_cmds, scene_dirty)
+    (structure_cmds, scene_dirty, insert_image_requested)
 }

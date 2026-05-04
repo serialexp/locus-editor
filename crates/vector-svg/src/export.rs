@@ -189,6 +189,12 @@ fn write_node(
         NodeData::Paint(_) => {
             // Paint definitions are emitted from the defs group handler; skip here.
         }
+        NodeData::Raster { .. } => {
+            // TODO: emit `<image href="data:image/png;base64,..."/>` —
+            // requires re-encoding RGBA8 → PNG. Out of scope for the
+            // initial Raster-node feature; the renderer displays it but
+            // the SVG export currently drops raster nodes silently.
+        }
         NodeData::Text(text) => {
             let _ = write!(buf, r#"{pad}<text"#);
             if !node.label.is_empty() {

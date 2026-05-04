@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
-use vector_geom::{Affine, Bounds, Path};
+use vector_geom::{Affine, Bounds, Path, Point};
 
 use crate::paint::Paint;
 use crate::scene::NodeId;
@@ -25,6 +27,20 @@ pub struct Node {
 
     /// Whether this node is locked (not selectable/editable).
     pub locked: bool,
+}
+
+impl Node {
+    /// True iff this node should respond to user input — visible and not
+    /// locked. Hit-testing, marquee selection, and edit tools should gate
+    /// on this rather than checking `visible` alone.
+    ///
+    /// Note: `locked` is a *behavioural* flag (not pickable, not editable),
+    /// not a *rendering* flag. Locked nodes still draw normally; they're
+    /// just inert under the cursor.
+    #[inline]
+    pub fn is_interactive(&self) -> bool {
+        self.visible && !self.locked
+    }
 }
 
 /// The kind of a group — either a plain container, or a non-destructive
@@ -89,6 +105,27 @@ pub enum NodeData {
     /// Editable text. The rendered glyph outlines are computed on demand
     /// (by vector-text) and cached — not stored here.
     Text(TextData),
+
+    /// A raster image displayed inside a local-space rectangle from
+    /// `(0, 0)` to `(width, height)`. The Node's `transform` places the
+    /// box in world space, so positioning, scaling and rotating an image
+    /// works the same way as for any other node.
+    ///
+    /// `width` and `height` are decoupled from the source pixel dimensions:
+    /// resampling to a different display size is just a transform / size
+    /// change, no re-decode. By default we initialise them to the source
+    /// pixel dimensions (one document unit per source pixel).
+    ///
+    /// Pixels are held as `Arc<RasterImage>` so undo snapshots and clones
+    /// are cheap — the buffer is shared until somebody actually edits it.
+    /// The renderer also keys its texture-upload cache on the `Arc`'s
+    /// pointer, so swapping the image (replacing the `Arc`) invalidates
+    /// the cache automatically.
+    Raster {
+        image: Arc<RasterImage>,
+        width: f64,
+        height: f64,
+    },
 }
 
 impl NodeData {
@@ -126,7 +163,51 @@ impl NodeData {
                 let expanded = local.expand(expansion);
                 expanded.transform(world)
             }
+            NodeData::Raster { width, height, .. } => {
+                // The image's local box is (0,0)..(w,h). Transform that to
+                // world space; under non-axis-aligned transforms the AABB
+                // of the four corners is the right answer.
+                let local = Bounds::new(Point::new(0.0, 0.0), Point::new(*width, *height));
+                local.transform(world)
+            }
             _ => Bounds::EMPTY,
+        }
+    }
+}
+
+/// Decoded raster image data. Pixels are RGBA8, row-major, treated as sRGB.
+///
+/// We deliberately store decoded pixels rather than the encoded source
+/// (PNG/JPG/etc.):
+/// * The renderer wants RGBA8 anyway — keeping the encoded blob would mean
+///   decoding on every GPU upload.
+/// * SVG export can re-encode to PNG when needed; we don't preserve the
+///   user's original byte stream.
+///
+/// Use `Arc<RasterImage>` from a `NodeData::Raster` so that node clones
+/// (undo snapshots) share the underlying buffer instead of duplicating it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RasterImage {
+    /// Raw RGBA8 pixels, row-major, length must equal
+    /// `pixel_width * pixel_height * 4`.
+    pub pixels: Vec<u8>,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+impl RasterImage {
+    /// Build a new `RasterImage`. Panics in debug builds if the buffer
+    /// length doesn't match `pixel_width * pixel_height * 4`.
+    pub fn new(pixels: Vec<u8>, pixel_width: u32, pixel_height: u32) -> Self {
+        debug_assert_eq!(
+            pixels.len(),
+            (pixel_width as usize) * (pixel_height as usize) * 4,
+            "RasterImage pixel buffer length must match width*height*4"
+        );
+        Self {
+            pixels,
+            pixel_width,
+            pixel_height,
         }
     }
 }
@@ -177,6 +258,29 @@ impl Node {
             data: NodeData::Path {
                 path,
                 style: Style::default(),
+            },
+            children: Vec::new(),
+            visible: true,
+            locked: false,
+        }
+    }
+
+    /// Create a new raster image node. The local-space box runs from
+    /// `(0, 0)` to `(width, height)`; use the node's `transform` to place
+    /// it on the canvas.
+    pub fn raster(
+        label: impl Into<String>,
+        image: Arc<RasterImage>,
+        width: f64,
+        height: f64,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            transform: Affine::IDENTITY,
+            data: NodeData::Raster {
+                image,
+                width,
+                height,
             },
             children: Vec::new(),
             visible: true,
@@ -353,5 +457,77 @@ mod tests {
         // Sanity check: should be strictly tighter than the naive 20×20.
         assert!(b.width() < 19.0, "width {} should be < 19.0", b.width());
         assert!(b.height() < 19.0, "height {} should be < 19.0", b.height());
+    }
+
+    fn dummy_raster(w: u32, h: u32) -> Arc<RasterImage> {
+        // 1×1 transparent placeholder, scaled by claiming larger logical
+        // dimensions. We use w*h*4 zero bytes to keep the constructor happy.
+        Arc::new(RasterImage::new(
+            vec![0u8; (w as usize) * (h as usize) * 4],
+            w,
+            h,
+        ))
+    }
+
+    #[test]
+    fn visual_bounds_raster_matches_box() {
+        let node = NodeData::Raster {
+            image: dummy_raster(2, 2),
+            width: 200.0,
+            height: 100.0,
+        };
+        let b = node.visual_bounds(Affine::IDENTITY);
+        assert_eq!(b.min, Point::new(0.0, 0.0));
+        assert_eq!(b.max, Point::new(200.0, 100.0));
+    }
+
+    #[test]
+    fn visual_bounds_raster_scales_with_transform() {
+        // 100×50 image scaled 3× and translated. The bounds should reflect
+        // the world-space corners of the local box.
+        let node = NodeData::Raster {
+            image: dummy_raster(2, 2),
+            width: 100.0,
+            height: 50.0,
+        };
+        let xform = Affine {
+            a: 3.0,
+            b: 0.0,
+            c: 0.0,
+            d: 3.0,
+            tx: 10.0,
+            ty: 20.0,
+        };
+        let b = node.visual_bounds(xform);
+        assert_eq!(b.min, Point::new(10.0, 20.0));
+        assert_eq!(b.max, Point::new(310.0, 170.0));
+    }
+
+    #[test]
+    fn is_interactive_requires_visible_and_unlocked() {
+        let img = dummy_raster(2, 2);
+        let mut node = Node::raster("r", img, 10.0, 10.0);
+        assert!(node.is_interactive());
+
+        node.locked = true;
+        assert!(!node.is_interactive(), "locked nodes are not interactive");
+        node.locked = false;
+        node.visible = false;
+        assert!(!node.is_interactive(), "hidden nodes are not interactive");
+
+        node.locked = true;
+        node.visible = false;
+        assert!(
+            !node.is_interactive(),
+            "hidden+locked is also not interactive"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn raster_image_new_panics_on_wrong_buffer_size() {
+        // 4×4 = 16 pixels = 64 bytes; passing 60 bytes must trip the debug
+        // assert. (Release builds skip the check by design.)
+        let _ = RasterImage::new(vec![0u8; 60], 4, 4);
     }
 }
