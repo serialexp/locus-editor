@@ -49,6 +49,7 @@ fn compute_handles_key(
     selection: &SelectState,
     zoom: f32,
     text_editing_node: Option<NodeId>,
+    snap_indicator: Option<([f64; 2], u8)>,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -66,6 +67,14 @@ fn compute_handles_key(
         1u8.hash(&mut h);
         p.x.to_bits().hash(&mut h);
         p.y.to_bits().hash(&mut h);
+    } else {
+        0u8.hash(&mut h);
+    }
+    if let Some((p, kind)) = snap_indicator {
+        1u8.hash(&mut h);
+        p[0].to_bits().hash(&mut h);
+        p[1].to_bits().hash(&mut h);
+        kind.hash(&mut h);
     } else {
         0u8.hash(&mut h);
     }
@@ -330,6 +339,10 @@ pub struct Renderer {
     pub text_cursor: Option<TextCursorInfo>,
     /// Node currently being text-edited (for drawing a distinct bounding box).
     pub text_editing_node: Option<NodeId>,
+    /// Optional snap indicator — when `Some`, a small marker is drawn at
+    /// the canvas-space point to show the user the cursor was snapped.
+    /// `kind` is 0 = vertex, 1 = edge, 2 = grid, used to colour the marker.
+    pub snap_indicator: Option<([f64; 2], u8)>,
     /// Per-boolean-group computed-path cache, keyed on each group's
     /// `Scene::subtree_revision`. Avoids re-running `i_overlay` polygon
     /// booleans every frame while a boolean group is visible but idle.
@@ -538,6 +551,7 @@ impl Renderer {
             checker_screen_px: 24.0,
             text_cursor: None,
             text_editing_node: None,
+            snap_indicator: None,
             bool_path_cache: BoolPathCache::new(),
             tess_cache: TessCache::new(),
             transforms_buffer,
@@ -619,7 +633,13 @@ impl Renderer {
         //
         // Cheap u64 hash means an idle scene with idle selection skips
         // hundreds-to-thousands of vertex writes per frame.
-        let handles_key = compute_handles_key(scene, selection, self.zoom, self.text_editing_node);
+        let handles_key = compute_handles_key(
+            scene,
+            selection,
+            self.zoom,
+            self.text_editing_node,
+            self.snap_indicator,
+        );
         if self.last_handles_key != Some(handles_key) || self.handle_vertex_buffer.is_none() {
             profiling::scope!("build_handles");
             self.build_handles(device, scene, selection, self.zoom);
@@ -2579,6 +2599,30 @@ impl Renderer {
                 (y1 - y0) * 0.5,
                 border,
             );
+        }
+
+        // ── Snap indicator ──────────────────────────────────────────
+        // Drawn as a small rotated square (diamond) at the snap target.
+        // Colour-coded by snap kind so the user can tell vertex from
+        // edge from grid at a glance.
+        if let Some((pos, kind)) = self.snap_indicator {
+            let cx = pos[0] as f32;
+            let cy = pos[1] as f32;
+            // Roughly the same on-screen footprint as a vertex handle.
+            let r = 6.0 / self.zoom;
+            let thickness = 1.5 / self.zoom;
+            let color: [f32; 4] = match kind {
+                0 => [1.0, 0.2, 0.7, 0.95],  // vertex — magenta
+                1 => [0.2, 0.9, 0.7, 0.95],  // edge — teal
+                _ => [1.0, 0.85, 0.3, 0.85], // grid — warm yellow
+            };
+            // The renderer's `push_quad` only emits axis-aligned rects,
+            // so we draw a plus (`+`) rather than a 45° diamond — still
+            // distinct from the existing handle squares and the origin
+            // crosshair (which uses two arms at half this length and a
+            // different colour).
+            push_quad(&mut verts, &mut idxs, cx, cy, r, thickness, color);
+            push_quad(&mut verts, &mut idxs, cx, cy, thickness, r, color);
         }
 
         // ── Text editing cursor (caret) ─────────────────────────────

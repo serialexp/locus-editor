@@ -19,6 +19,13 @@ pub struct ShapeDrawState {
 }
 
 impl ShapeDrawState {
+    /// The id of the live-preview node, if a shape is currently being
+    /// drawn. Used by snap to exclude the in-progress shape from snap
+    /// targets so its own corners don't pull the cursor.
+    pub fn preview_node(&self) -> Option<NodeId> {
+        self.preview_node
+    }
+
     /// Handle mouse press — record anchor and insert a zero-size preview node.
     pub fn on_press(&mut self, scene: &mut Scene, canvas_pos: [f64; 2], tool: ToolType) {
         // Remove stale preview if any

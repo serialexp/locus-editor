@@ -186,6 +186,9 @@ pub(crate) fn run_ui(
                 }
             });
             ui.menu_button("View", |ui| {
+                ui.checkbox(&mut snap.vertex_enabled, "Snap to vertices");
+                ui.checkbox(&mut snap.edge_enabled, "Snap to edges");
+                ui.separator();
                 ui.checkbox(&mut snap.grid_enabled, "Snap to grid");
                 ui.horizontal(|ui| {
                     ui.label("Grid size:");

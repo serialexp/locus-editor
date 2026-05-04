@@ -21,7 +21,7 @@ use vector_trace::TraceParams;
 
 use crate::camera::Camera;
 use crate::hud::PerfStats;
-use crate::snap::SnapSettings;
+use crate::snap::{SnapHit, SnapSettings};
 use crate::trace_dialog::TraceDialogState;
 
 /// What kind of canvas element was right-clicked, driving the context menu.
@@ -111,6 +111,10 @@ pub(crate) struct EditorState {
     /// the editor state so per-frame re-flattening is avoided when
     /// nothing the structure panel cares about has changed.
     pub(crate) cached_flatten: Option<crate::structure_panel::FlattenCache>,
+    /// Most recent geometry-snap target, set by `screen_to_canvas_snapped`.
+    /// Cleared when the cursor moves without snapping. Consumed by the
+    /// renderer to draw an on-canvas indicator at the snap point.
+    pub(crate) last_snap: Option<SnapHit>,
 }
 
 impl Default for EditorState {
@@ -143,15 +147,65 @@ impl Default for EditorState {
             structure_collapse: HashMap::new(),
             structure_collapse_rev: 0,
             cached_flatten: None,
+            last_snap: None,
         }
     }
 }
 
 impl EditorState {
+    /// Nodes that should be excluded as snap targets given the current
+    /// tool / interaction state. Pen and shape tools exclude their
+    /// in-progress node so its own vertices don't snap to themselves.
+    /// Select-tool drags exclude the nodes whose vertices/transforms
+    /// are currently moving.
+    pub(crate) fn snap_exclude(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        if let Some(id) = self.pen_state.building_node() {
+            out.push(id);
+        }
+        if let Some(id) = self.shape_draw.preview_node() {
+            out.push(id);
+        }
+        // Select tool: while dragging vertices or moving objects, exclude
+        // the affected nodes so geometry snap finds *other* shapes.
+        if self.select_state.is_dragging_vertices()
+            || self.select_state.is_dragging_objects()
+            || self.select_state.is_scaling()
+            || self.select_state.is_rotating()
+        {
+            for &id in &self.select_state.selected_nodes {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
     /// Convert screen coordinates to canvas coordinates, applying snap if enabled.
-    pub(crate) fn screen_to_canvas_snapped(&self, screen_x: f32, screen_y: f32) -> [f64; 2] {
+    ///
+    /// `exclude` lists nodes whose own geometry should not be snap targets —
+    /// typically the node currently being dragged or the partial node being
+    /// extended by the pen tool. Pass `&[]` when no exclusion is appropriate
+    /// (e.g. a fresh shape draw).
+    ///
+    /// Side-effect: stores the resolved snap indicator (or `None`) on
+    /// `self.last_snap`, so the renderer can draw a marker at the target.
+    pub(crate) fn screen_to_canvas_snapped(
+        &mut self,
+        screen_x: f32,
+        screen_y: f32,
+        exclude: &[NodeId],
+    ) -> [f64; 2] {
         let c = self.camera.screen_to_canvas(screen_x, screen_y);
-        self.snap.snap([c[0] as f64, c[1] as f64])
+        let (snapped, hit) = self.snap.resolve(
+            [c[0] as f64, c[1] as f64],
+            &self.scene,
+            self.camera.zoom as f64,
+            exclude,
+        );
+        self.last_snap = hit;
+        snapped
     }
 
     /// Decode `bytes` as a raster image (PNG/JPEG/GIF/BMP/WEBP/TIFF) and

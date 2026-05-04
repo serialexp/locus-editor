@@ -46,7 +46,7 @@
 - [x] Quad→Cubic upgrade in ensure_cubic_handles — degree elevation when switching vertex mode from Corner
 - [x] Canvas context menus — right-click on vertex (mode toggle + delete) or segment (Line/Quad/Cubic conversion + insert vertex)
 - [x] Segment type conversion — convert_segment_to_line/quad/cubic with undo support
-- [ ] Snap to points/vertices — snap to existing geometry, not just grid
+- [x] Snap to points/vertices — `SnapSettings::resolve` walks the scene for the closest anchor/control point, falls back to nearest-point-on-segment, then grid. Vertex > edge > grid precedence; same 8 px screen-space radius as click hit-testing. View menu has independent toggles for vertex / edge / grid; vertex+edge default on. Pen, shape, and select-tool drags pass an exclude list (in-progress / dragged nodes) so a vertex doesn't snap to itself. Renderer draws a `+` indicator at the snap target — magenta for vertex, teal for edge, warm yellow for grid.
 
 ### Editor features users expect
 - [ ] Align & distribute panel — align selection left/center/right/top/middle/bottom, distribute with equal spacing. Uses existing `combined_bounds`.

@@ -330,8 +330,10 @@ impl ApplicationHandler for App {
                                     self.state.cursor_pos.map(|c| (now, c));
 
                                 if let Some(cursor) = self.state.cursor_pos {
-                                    let canvas_f64 =
-                                        self.state.screen_to_canvas_snapped(cursor[0], cursor[1]);
+                                    let exclude = self.state.snap_exclude();
+                                    let canvas_f64 = self
+                                        .state
+                                        .screen_to_canvas_snapped(cursor[0], cursor[1], &exclude);
                                     match self.state.active_tool {
                                         ToolType::Select => {
                                             let mut handled = false;
@@ -558,9 +560,10 @@ impl ApplicationHandler for App {
                                     }
                                     ToolType::Pen => {
                                         if let Some(cursor) = self.state.cursor_pos {
-                                            let canvas_f64 = self
-                                                .state
-                                                .screen_to_canvas_snapped(cursor[0], cursor[1]);
+                                            let exclude = self.state.snap_exclude();
+                                            let canvas_f64 = self.state.screen_to_canvas_snapped(
+                                                cursor[0], cursor[1], &exclude,
+                                            );
                                             self.state.pen_state.on_release(
                                                 &mut self.state.scene,
                                                 canvas_f64,
@@ -646,6 +649,11 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let new_pos = [position.x as f32, position.y as f32];
 
+                // Clear any stale snap indicator from the previous mouse
+                // event; the snap-using paths below repopulate it if a
+                // snap fires this frame.
+                let prev_snap = self.state.last_snap.take();
+
                 if self.state.is_panning {
                     if let Some(prev) = self.state.cursor_pos {
                         let dx = new_pos[0] - prev[0];
@@ -655,7 +663,10 @@ impl ApplicationHandler for App {
                         gpu.window.request_redraw();
                     }
                 } else if self.state.is_left_down && !gpu.egui_ctx.egui_wants_pointer_input() {
-                    let canvas_f64 = self.state.screen_to_canvas_snapped(new_pos[0], new_pos[1]);
+                    let exclude = self.state.snap_exclude();
+                    let canvas_f64 = self
+                        .state
+                        .screen_to_canvas_snapped(new_pos[0], new_pos[1], &exclude);
                     let changed = match self.state.active_tool {
                         ToolType::Select => self
                             .state
@@ -682,7 +693,10 @@ impl ApplicationHandler for App {
                     && self.state.pen_state.is_building()
                 {
                     // Pen hover preview: show tentative segment to cursor.
-                    let canvas_f64 = self.state.screen_to_canvas_snapped(new_pos[0], new_pos[1]);
+                    let exclude = self.state.snap_exclude();
+                    let canvas_f64 = self
+                        .state
+                        .screen_to_canvas_snapped(new_pos[0], new_pos[1], &exclude);
                     if self
                         .state
                         .pen_state
@@ -695,9 +709,21 @@ impl ApplicationHandler for App {
 
                 self.state.cursor_pos = Some(new_pos);
                 self.state.update_cursor(&gpu.window, &gpu.egui_ctx);
+
+                // If the snap indicator visibility / position changed
+                // this frame but no geometry redraw was already queued,
+                // request one so the marker draws or clears.
+                let prev_pos = prev_snap.map(|h| h.pos);
+                let now_pos = self.state.last_snap.map(|h| h.pos);
+                if prev_pos != now_pos {
+                    gpu.window.request_redraw();
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 self.state.cursor_pos = None;
+                if self.state.last_snap.take().is_some() {
+                    gpu.window.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } if !gpu.egui_ctx.egui_wants_pointer_input() => {
                 let scroll_y = match delta {
@@ -1080,6 +1106,18 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
         None
     };
     gpu.renderer.text_editing_node = state.text_tool.editing_node();
+
+    // Snap indicator: encode the most recent snap target (if any) for
+    // the renderer's handle layer to draw a small marker at the snap
+    // point. Kind: 0 = vertex, 1 = edge, 2 = grid.
+    gpu.renderer.snap_indicator = state.last_snap.map(|hit| {
+        let kind = match hit.kind {
+            crate::snap::SnapKind::Vertex => 0u8,
+            crate::snap::SnapKind::Edge => 1u8,
+            crate::snap::SnapKind::Grid => 2u8,
+        };
+        (hit.pos, kind)
+    });
 
     {
         profiling::scope!("renderer.prepare");
