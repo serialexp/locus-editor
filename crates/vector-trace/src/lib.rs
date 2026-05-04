@@ -19,9 +19,12 @@ use vector_svg::ImportError;
 
 pub use vtracer::{ColorMode, Hierarchical};
 
+mod params;
+pub use params::{CurveMode, HierarchicalMode, TraceColorMode, TraceParams};
+
 /// Quality/style preset for the tracer. Mirrors vtracer's presets, plus a
 /// `Custom` escape hatch for callers that want full control.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TracePreset {
     /// Bi-level (black & white) tracing. Best for line art, logos, scans.
     Bw,
@@ -30,27 +33,24 @@ pub enum TracePreset {
     Poster,
     /// Photo tracing — more layers, larger speckle filter.
     Photo,
-    /// Caller-supplied vtracer config.
-    Custom(Box<vtracer::Config>),
-}
-
-impl TracePreset {
-    fn into_config(self) -> vtracer::Config {
-        match self {
-            TracePreset::Bw => vtracer::Config::from_preset(vtracer::Preset::Bw),
-            TracePreset::Poster => vtracer::Config::from_preset(vtracer::Preset::Poster),
-            TracePreset::Photo => vtracer::Config::from_preset(vtracer::Preset::Photo),
-            TracePreset::Custom(cfg) => *cfg,
-        }
-    }
 }
 
 /// Trace a raster image (bytes of a PNG/JPEG/GIF/BMP/WEBP/TIFF) into a
-/// fresh [`Scene`].
+/// fresh [`Scene`] using a named preset.
+///
+/// Convenience wrapper over [`trace_image_with_params`] for callers that
+/// just want one of the canned presets.
 ///
 /// The returned scene contains one `Path` node per traced region, stacked
 /// in the order vtracer produces them, with solid-color fills.
 pub fn trace_image_bytes(bytes: &[u8], preset: TracePreset) -> Result<Scene, TraceError> {
+    trace_image_with_params(bytes, &TraceParams::from_preset(preset))
+}
+
+/// Trace a raster image into a fresh [`Scene`] using fully-specified
+/// parameters. This is the entry point the editor's trace dialog uses,
+/// so every slider in the UI maps to one [`TraceParams`] field.
+pub fn trace_image_with_params(bytes: &[u8], params: &TraceParams) -> Result<Scene, TraceError> {
     // Decode into RGBA8 with the modern `image` crate — we don't rely on
     // vtracer's transitive `image` dep, which is pinned to an old major.
     let decoded = image::ImageReader::new(Cursor::new(bytes))
@@ -75,7 +75,7 @@ pub fn trace_image_bytes(bytes: &[u8], preset: TracePreset) -> Result<Scene, Tra
     };
 
     let svg_file =
-        vtracer::convert(color_image, preset.into_config()).map_err(TraceError::Vtracer)?;
+        vtracer::convert(color_image, params.to_vtracer_config()).map_err(TraceError::Vtracer)?;
 
     // `SvgFile: Display` produces a complete, self-contained SVG document.
     let svg_text = svg_file.to_string();
@@ -142,6 +142,32 @@ mod tests {
             path_count >= 1,
             "expected at least one traced path, got {path_count}"
         );
+    }
+
+    #[test]
+    fn trace_with_custom_params_produces_paths() {
+        // Same 16×16 image, but trace with custom params (binary mode +
+        // higher speckle filter).
+        let mut img = image::RgbaImage::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                let p = if x < 8 {
+                    image::Rgba([0, 0, 0, 255])
+                } else {
+                    image::Rgba([255, 255, 255, 255])
+                };
+                img.put_pixel(x, y, p);
+            }
+        }
+        let mut png_bytes = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+
+        let mut params = TraceParams::from_preset(TracePreset::Bw);
+        params.filter_speckle = 2; // a 16×16 image has small clusters
+        let scene = trace_image_with_params(&png_bytes, &params)
+            .expect("custom-params tracing should succeed");
+        assert!(scene.root() != scene.defs(), "scene should be populated");
     }
 
     #[test]

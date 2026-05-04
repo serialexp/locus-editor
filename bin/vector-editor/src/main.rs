@@ -9,6 +9,7 @@ mod paint_picker;
 mod properties_panel;
 mod snap;
 mod structure_panel;
+mod trace_dialog;
 mod ui;
 mod util;
 

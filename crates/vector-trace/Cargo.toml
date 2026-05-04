@@ -10,6 +10,13 @@ authors.workspace = true
 vector-scene = { path = "../vector-scene" }
 vector-svg = { path = "../vector-svg" }
 vtracer = "0.6"
+# `vtracer::Config::mode` is typed as `visioncortex::PathSimplifyMode`,
+# which vtracer doesn't re-export. We need the type to construct
+# `vtracer::Config` from our own `TraceParams`, so depend on it directly.
+# Pinned to vtracer 0.6.5's transitive version to keep the type identity
+# consistent — `vtracer::Config { mode: visioncortex::PathSimplifyMode }`
+# only compiles if both crates resolve to the same `visioncortex` build.
+visioncortex = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
 log = { workspace = true }
 thiserror = { workspace = true }
