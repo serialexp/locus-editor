@@ -732,13 +732,65 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if !gpu.egui_ctx.egui_wants_pointer_input() => {
-                let scroll_y = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
-                };
+                // Split on the *kind* of scroll source winit reports —
+                // unambiguous and doesn't require device detection:
+                //
+                // - LineDelta = traditional mouse wheel (discrete clicks).
+                //   Keep the historical "wheel zooms" behavior; Shift turns
+                //   it into horizontal pan, matching most graphics editors.
+                // - PixelDelta = precision touchpad / Magic Mouse two-finger
+                //   scroll. Pan the canvas — that's what users expect from a
+                //   two-finger gesture. Ctrl/Cmd promotes it to a zoom (the
+                //   browser convention everyone is now trained on).
+                let modifiers = gpu.egui_ctx.input(|i| i.modifiers);
+                let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
-                if let Some(cursor) = self.state.cursor_pos {
-                    let factor = 1.0 + scroll_y * 0.1;
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                        if modifiers.shift {
+                            // Shift+wheel pans horizontally. Use the y axis
+                            // since most mice only report vertical wheel
+                            // movement; fall back to x if both are present.
+                            let dx = if x != 0.0 { x } else { y } * 40.0;
+                            self.state.camera.pan[0] += dx;
+                            gpu.window.request_redraw();
+                        } else if let Some(cursor) = self.state.cursor_pos {
+                            let factor = 1.0 + y * 0.1;
+                            self.state.camera.zoom_at(factor, cursor[0], cursor[1]);
+                            gpu.window.request_redraw();
+                        }
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        if ctrl {
+                            // Ctrl/Cmd + two-finger scroll = zoom centred on
+                            // the cursor. The /40 divisor matches the old
+                            // PixelDelta-as-zoom calibration so the gesture
+                            // doesn't suddenly feel 40× more sensitive.
+                            if let Some(cursor) = self.state.cursor_pos {
+                                let factor = 1.0 + (pos.y as f32 / 40.0) * 0.1;
+                                self.state.camera.zoom_at(factor, cursor[0], cursor[1]);
+                                gpu.window.request_redraw();
+                            }
+                        } else {
+                            // Two-finger pan. Natural direction: the canvas
+                            // moves with the fingers (matches the existing
+                            // middle-drag pan and macOS natural-scroll feel).
+                            self.state.camera.pan[0] += pos.x as f32;
+                            self.state.camera.pan[1] += pos.y as f32;
+                            gpu.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            // Trackpad pinch-to-zoom (macOS, Windows precision touchpads).
+            // `delta` is a fractional change in scale per frame — typical
+            // values are in the ±0.01 range for a slow pinch. Centre the
+            // zoom on the cursor so the point under the fingers stays put.
+            WindowEvent::PinchGesture { delta, .. } if !gpu.egui_ctx.egui_wants_pointer_input() => {
+                if let Some(cursor) = self.state.cursor_pos
+                    && delta.is_finite()
+                {
+                    let factor = 1.0 + delta as f32;
                     self.state.camera.zoom_at(factor, cursor[0], cursor[1]);
                     gpu.window.request_redraw();
                 }
