@@ -245,6 +245,10 @@ impl ApplicationHandler for App {
                                     self.state.history = History::new();
                                     self.state.select_state = SelectState::default();
                                     self.state.pending_zoom_to_fit = true;
+                                    // Drag-drop is just another way to open a
+                                    // file — keep the recent list in sync.
+                                    self.state.recent_files.add(&path);
+                                    self.state.recent_files.save();
                                     if let Some(gpu) = &mut self.gpu {
                                         gpu.renderer.mark_dirty();
                                         gpu.window.request_redraw();

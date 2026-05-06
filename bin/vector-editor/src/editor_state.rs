@@ -21,6 +21,7 @@ use vector_trace::TraceParams;
 
 use crate::camera::Camera;
 use crate::hud::PerfStats;
+use crate::recent_files::RecentFiles;
 use crate::snap::{SnapHit, SnapSettings};
 use crate::trace_dialog::TraceDialogState;
 
@@ -115,6 +116,10 @@ pub(crate) struct EditorState {
     /// Cleared when the cursor moves without snapping. Consumed by the
     /// renderer to draw an on-canvas indicator at the snap point.
     pub(crate) last_snap: Option<SnapHit>,
+    /// Recently-opened files, persisted across sessions in the platform
+    /// per-app config dir. Loaded once on startup; resaved whenever a file
+    /// is opened (via menu or drag-drop) or the list is cleared.
+    pub(crate) recent_files: RecentFiles,
 }
 
 impl Default for EditorState {
@@ -148,6 +153,7 @@ impl Default for EditorState {
             structure_collapse_rev: 0,
             cached_flatten: None,
             last_snap: None,
+            recent_files: RecentFiles::load(),
         }
     }
 }

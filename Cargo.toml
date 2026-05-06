@@ -30,6 +30,12 @@ nalgebra = "0.33"
 # raster image nodes — the pixel buffer is held behind an Arc so undo
 # snapshots can share it cheaply).
 serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1"
+
+# Cross-platform per-app config dir (~/.config/vector-editor on Linux,
+# ~/Library/Application Support/vector-editor on macOS,
+# %APPDATA%/vector-editor on Windows). Used for the recent-files list.
+directories = "6"
 
 # SVG
 usvg = "0.47"

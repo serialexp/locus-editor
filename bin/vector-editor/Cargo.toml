@@ -32,6 +32,11 @@ egui-phosphor = { workspace = true }
 # File dialog
 rfd = { workspace = true }
 
+# Persisted UI state (currently just the recent-files list).
+serde = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+
 # Raster decoding (drag-drop / Insert Image flow). Same crate + features as
 # vector-trace so we share the decoder cache; we just don't go through the
 # tracer — we keep the pixels and build a Raster scene node directly.

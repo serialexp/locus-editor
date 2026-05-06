@@ -3,16 +3,53 @@
 //!   `begin_pass`/`end_pass` with `Panel::show` on the Context directly,
 //!   so `is_pointer_over_egui()` returns false over the canvas.
 
+use std::path::{Path, PathBuf};
+
 use vector_ops::{Command, History};
 use vector_render::Renderer;
+use vector_scene::Scene;
 use vector_tools::{PenAction, SelectState, TextAction, ToolType};
 
 use crate::editor_state::EditorState;
 use crate::hud::format_count;
 use crate::properties_panel::show_properties;
+use crate::recent_files::RecentFiles;
 use crate::structure_panel::{
     ReorderCommand, StructureAction, StructureCommands, flatten_tree, render_virtual_row,
 };
+
+/// Load an SVG from disk into the scene, replacing the existing scene and
+/// resetting history / selection. On success, records the path in the
+/// recent-files list and persists. Errors are logged.
+///
+/// Shared between the "Open SVG…" file dialog and the "Open Recent"
+/// submenu so both paths behave identically.
+fn load_svg_from_path(
+    path: &Path,
+    scene: &mut Scene,
+    history: &mut History,
+    selection: &mut SelectState,
+    pending_zoom_to_fit: &mut bool,
+    recent_files: &mut RecentFiles,
+    renderer: &mut Renderer,
+) {
+    match std::fs::read(path) {
+        Ok(data) => match vector_svg::import_svg(&data) {
+            Ok(new_scene) => {
+                *scene = new_scene;
+                *history = History::new();
+                *selection = SelectState::default();
+                *pending_zoom_to_fit = true;
+                renderer.mark_dirty();
+                recent_files.add(path);
+                recent_files.save();
+                log::info!("Opened SVG: {}", path.display());
+            }
+            Err(e) => log::error!("Failed to import SVG: {e}"),
+        },
+        Err(e) => log::error!("Failed to read file: {e}"),
+    }
+}
 
 /// UI layout — uses begin_pass/end_pass with Panel::show on the Context directly,
 /// so the canvas area is NOT part of any egui Ui. This lets
@@ -45,6 +82,7 @@ pub(crate) fn run_ui(
     let cached_flatten = &mut state.cached_flatten;
     let trace_dialog = &mut state.trace_dialog;
     let last_trace_params = &mut state.last_trace_params;
+    let recent_files = &mut state.recent_files;
     let mut dump_requested = false;
     let mut reorder_cmd: ReorderCommand = None;
     let mut structure_cmds: StructureCommands = Vec::new();
@@ -55,6 +93,10 @@ pub(crate) fn run_ui(
     let mut insert_image_requested = false;
     let mut undo_requested = false;
     let mut redo_requested = false;
+    // Set by clicks in the "Open Recent" submenu; the actual load runs
+    // after the egui pass (same flag-then-defer pattern as `open_requested`).
+    let mut recent_open_path: Option<PathBuf> = None;
+    let mut clear_recent_requested = false;
 
     let menu_resp = egui::Panel::top("menu_bar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
@@ -63,6 +105,41 @@ pub(crate) fn run_ui(
                     open_requested = true;
                     ui.close();
                 }
+                // Snapshot to a Vec because the menu closure also writes to
+                // the `recent_open_path` / `clear_recent_requested` flags
+                // that, post-pass, drive `recent_files.add` / `.clear`. The
+                // list is at most 10 entries — cloning is trivially cheap.
+                let recent_snapshot: Vec<PathBuf> = recent_files.paths().to_vec();
+                ui.add_enabled_ui(!recent_snapshot.is_empty(), |ui| {
+                    ui.menu_button("Open Recent", |ui| {
+                        for path in &recent_snapshot {
+                            // `try_exists` is one stat per visible entry per
+                            // frame the submenu is open — well within budget.
+                            let exists = path.try_exists().unwrap_or(false);
+                            let label = path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("(invalid)")
+                                .to_string();
+                            let tooltip = path.display().to_string();
+                            let resp = ui.add_enabled(exists, egui::Button::new(label));
+                            if exists {
+                                let resp = resp.on_hover_text(&tooltip);
+                                if resp.clicked() {
+                                    recent_open_path = Some(path.clone());
+                                    ui.close();
+                                }
+                            } else {
+                                resp.on_disabled_hover_text(format!("Missing: {tooltip}"));
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Clear Recent").clicked() {
+                            clear_recent_requested = true;
+                            ui.close();
+                        }
+                    });
+                });
                 if ui.button("Save SVG...").clicked() {
                     save_requested = true;
                     ui.close();
@@ -465,7 +542,18 @@ pub(crate) fn run_ui(
 
     // ── File dialogs (blocking — runs after egui pass) ──
 
-    if open_requested {
+    // Both "Open SVG…" and "Open Recent" funnel through `load_svg_from_path`.
+    // The pen-finishing prelude is shared — closing a half-built pen path
+    // before swapping the scene out from under it.
+    let pending_load: Option<PathBuf> = if open_requested {
+        rfd::FileDialog::new()
+            .add_filter("SVG files", &["svg"])
+            .pick_file()
+    } else {
+        recent_open_path.take()
+    };
+
+    if let Some(path) = pending_load {
         // Finish any in-progress pen path before loading.
         if pen_state.is_building() {
             let action = pen_state.finish(scene, false);
@@ -483,25 +571,20 @@ pub(crate) fn run_ui(
             }
         }
 
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("SVG files", &["svg"])
-            .pick_file()
-        {
-            match std::fs::read(&path) {
-                Ok(data) => match vector_svg::import_svg(&data) {
-                    Ok(new_scene) => {
-                        *scene = new_scene;
-                        *history = History::new(); // clear undo/redo for old scene
-                        *selection = SelectState::default();
-                        *pending_zoom_to_fit = true;
-                        renderer.mark_dirty();
-                        log::info!("Opened SVG: {}", path.display());
-                    }
-                    Err(e) => log::error!("Failed to import SVG: {e}"),
-                },
-                Err(e) => log::error!("Failed to read file: {e}"),
-            }
-        }
+        load_svg_from_path(
+            &path,
+            scene,
+            history,
+            selection,
+            pending_zoom_to_fit,
+            recent_files,
+            renderer,
+        );
+    }
+
+    if clear_recent_requested {
+        recent_files.clear();
+        recent_files.save();
     }
 
     if save_requested

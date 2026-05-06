@@ -7,6 +7,7 @@ mod gradient_editor;
 mod hud;
 mod paint_picker;
 mod properties_panel;
+mod recent_files;
 mod snap;
 mod structure_panel;
 mod trace_dialog;
