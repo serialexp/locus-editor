@@ -17,6 +17,7 @@ vector-ops = { path = "../../crates/vector-ops" }
 vector-bool = { path = "../../crates/vector-bool" }
 vector-tools = { path = "../../crates/vector-tools" }
 vector-trace = { path = "../../crates/vector-trace" }
+vector-llm = { path = "../../crates/vector-llm" }
 
 # Rendering + windowing
 wgpu = { workspace = true }

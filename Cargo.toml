@@ -10,6 +10,7 @@ members = [
     "crates/vector-bool",
     "crates/vector-tools",
     "crates/vector-trace",
+    "crates/vector-llm",
     "bin/vector-editor",
 ]
 resolver = "2"
@@ -69,6 +70,25 @@ slotmap = { version = "1.0", features = ["serde"] }
 
 # File dialog
 rfd = "0.15"
+
+# HTTP client for the LLM crate. Blocking + rustls keeps us off async-runtime
+# territory (matches the worker-thread pattern the trace dialog uses) and off
+# OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+# Cross-platform secret store for the LLM API key. Each platform's native
+# backend: macOS Keychain, Windows Credential Manager, Linux Secret Service
+# (dbus). `crypto-rust` keeps us off OpenSSL on Linux for the secret-service
+# session encryption.
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+    # Statically link libdbus on Linux so users (and burst CI) don't need
+    # libdbus-1-dev installed at build time.
+    "vendored",
+] }
 
 # Profiling. No-op by default; the `tracy` feature on `vector-editor` flips
 # the backend on across all crates that declare this dep.

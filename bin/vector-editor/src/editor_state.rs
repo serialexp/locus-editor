@@ -21,6 +21,7 @@ use vector_trace::TraceParams;
 
 use crate::camera::Camera;
 use crate::hud::PerfStats;
+use crate::llm_dialog::LlmDialogState;
 use crate::recent_files::RecentFiles;
 use crate::snap::{SnapHit, SnapSettings};
 use crate::trace_dialog::TraceDialogState;
@@ -120,6 +121,12 @@ pub(crate) struct EditorState {
     /// per-app config dir. Loaded once on startup; resaved whenever a file
     /// is opened (via menu or drag-drop) or the list is cleared.
     pub(crate) recent_files: RecentFiles,
+    /// Active LLM-driven SVG generation dialog (None when closed).
+    /// Like `trace_dialog`, hosts a live preview group and re-renders
+    /// the preview each time the user sends another chat turn. The
+    /// "Generate SVG from prompt…" menu item is greyed out while this
+    /// is `Some` so two dialogs can't fight over the same preview slot.
+    pub(crate) llm_dialog: Option<LlmDialogState>,
 }
 
 impl Default for EditorState {
@@ -154,6 +161,7 @@ impl Default for EditorState {
             cached_flatten: None,
             last_snap: None,
             recent_files: RecentFiles::load(),
+            llm_dialog: None,
         }
     }
 }

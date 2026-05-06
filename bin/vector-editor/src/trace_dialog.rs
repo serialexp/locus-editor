@@ -35,23 +35,14 @@ use vector_trace::{
 };
 
 use crate::editor_state::EditorState;
+use crate::preview_group;
+pub(crate) use crate::preview_group::DialogAction;
 
 /// Debounce window: param changes only kick a new trace once this much
 /// time has elapsed since the last change. Tuned by feel — 250 ms is
 /// long enough to coalesce a slider drag, short enough that the preview
 /// doesn't feel stale.
 const DEBOUNCE_MS: u64 = 250;
-
-/// What [`show`] tells the caller to do next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DialogAction {
-    /// Keep the dialog open and the preview group live.
-    None,
-    /// Commit the preview group as a single undoable insert and close.
-    Apply,
-    /// Discard the preview group (no undo entry) and close.
-    Cancel,
-}
 
 /// Result coming back from a worker thread.
 enum TraceJobResult {
@@ -480,58 +471,28 @@ pub(crate) fn cancel(state: &mut EditorState, renderer: &mut Renderer) {
 fn apply_trace_result(state: &mut EditorState, renderer: &mut Renderer, result: TraceJobResult) {
     match result {
         TraceJobResult::Ok(traced) => {
-            // Resolve the existing preview group (if any) up front so
-            // the borrow on `state.trace_dialog` is released before we
-            // start mutating `state.scene` below.
-            let existing_preview = state
+            // Take the preview-group slot out of the dialog so we don't
+            // hold an aliasing borrow while mutating `state.scene`.
+            let mut group_slot = state
                 .trace_dialog
-                .as_ref()
-                .and_then(|d| d.preview_group)
-                .filter(|id| state.scene.get(*id).is_some());
-
-            match existing_preview {
-                Some(group_id) => {
-                    // Empty the preview group's existing children. We
-                    // remove them rather than swapping the group so the
-                    // group's own NodeId stays stable across re-traces
-                    // (preserves tessellation cache keys, selection,
-                    // etc.).
-                    let children: Vec<NodeId> = state
-                        .scene
-                        .get(group_id)
-                        .map(|n| n.children.clone())
-                        .unwrap_or_default();
-                    for child in children {
-                        state.scene.remove(child);
-                    }
-                    // Merge into the existing group.
-                    vector_scene::merge_as_group(
-                        &mut state.scene,
-                        group_id,
-                        &traced,
-                        "trace contents",
-                    );
-                    // `merge_as_group` always wraps content in a new
-                    // group; flatten that nesting away so the structure
-                    // panel doesn't show a redundant level.
-                    lift_single_child(&mut state.scene, group_id);
-                }
-                None => {
-                    // First successful trace — create the preview group.
-                    let parent = state.scene.root();
-                    let group_id = vector_scene::merge_as_group(
-                        &mut state.scene,
-                        parent,
-                        &traced,
-                        "Traced image",
-                    )
-                    .expect("merge into root must succeed");
-                    if let Some(dialog) = state.trace_dialog.as_mut() {
-                        dialog.preview_group = Some(group_id);
-                    }
-                }
-            }
+                .as_mut()
+                .and_then(|d| d.preview_group.take());
+            // First-call labels the new group "Traced image"; subsequent
+            // calls use a transient inner label that gets flattened away.
+            let label = if group_slot.is_some() {
+                "trace contents"
+            } else {
+                "Traced image"
+            };
+            preview_group::replace_children(
+                &mut state.scene,
+                &traced,
+                &mut group_slot,
+                renderer,
+                label,
+            );
             if let Some(dialog) = state.trace_dialog.as_mut() {
+                dialog.preview_group = group_slot;
                 dialog.last_error = None;
             }
         }
@@ -539,32 +500,9 @@ fn apply_trace_result(state: &mut EditorState, renderer: &mut Renderer, result: 
             if let Some(dialog) = state.trace_dialog.as_mut() {
                 dialog.last_error = Some(msg);
             }
+            renderer.mark_dirty();
         }
     }
-    renderer.mark_dirty();
-}
-
-/// `merge_as_group` always wraps content in a new group. When we're
-/// merging into an *existing* preview group, that produces an extra
-/// nested layer — flatten it by moving the inner group's children up
-/// and removing the inner group. Idempotent if the parent has zero
-/// children or more than one.
-fn lift_single_child(scene: &mut Scene, parent: NodeId) {
-    let Some(parent_node) = scene.get(parent) else {
-        return;
-    };
-    if parent_node.children.len() != 1 {
-        return;
-    }
-    let inner = parent_node.children[0];
-    let inner_children: Vec<NodeId> = match scene.get(inner) {
-        Some(n) => n.children.clone(),
-        None => return,
-    };
-    for (i, child) in inner_children.iter().enumerate() {
-        scene.reparent(*child, parent, i);
-    }
-    scene.remove(inner);
 }
 
 fn format_trace_error(e: &TraceError) -> String {

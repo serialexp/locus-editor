@@ -20,6 +20,8 @@ use vector_tools::{SelectState, TextAction, ToolType};
 use crate::context_menu::show_canvas_context_menu;
 use crate::demo::create_demo_content;
 use crate::editor_state::{CanvasContextMenu, CanvasContextTarget, EditorState};
+use crate::llm_dialog;
+use crate::preview_group::DialogAction;
 use crate::structure_panel::{StructureAction, apply_structure_action};
 use crate::trace_dialog;
 use crate::ui::run_ui;
@@ -949,14 +951,22 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     // reflects the current preview / "Tracing…" state.
     trace_dialog::poll(state, &mut gpu.renderer, &gpu.egui_ctx);
 
+    // Same shape for the LLM dialog: drain any landed chat completion
+    // result into the preview group before drawing.
+    llm_dialog::poll(state, &mut gpu.renderer, &gpu.egui_ctx);
+
     // Run egui — use begin_pass/end_pass so the canvas area is NOT part of
     // any egui Ui, which lets is_pointer_over_egui() return false for it.
     let full_output = {
         profiling::scope!("egui_pass");
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         gpu.egui_ctx.begin_pass(raw_input);
-        let (structure_cmds_inner, ui_scene_dirty_inner, insert_image_requested_inner) =
-            run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
+        let (
+            structure_cmds_inner,
+            ui_scene_dirty_inner,
+            insert_image_requested_inner,
+            llm_open_requested_inner,
+        ) = run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
 
         // Canvas context menu (right-click on vertex/segment in node mode).
         show_canvas_context_menu(&gpu.egui_ctx, state, &mut gpu.renderer);
@@ -965,15 +975,30 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
         // tools). Returns the action the user took this frame.
         let trace_action = trace_dialog::show(state, &gpu.egui_ctx);
         match trace_action {
-            trace_dialog::DialogAction::Apply => {
+            DialogAction::Apply => {
                 trace_dialog::apply(state, &mut gpu.renderer);
                 gpu.window.request_redraw();
             }
-            trace_dialog::DialogAction::Cancel => {
+            DialogAction::Cancel => {
                 trace_dialog::cancel(state, &mut gpu.renderer);
                 gpu.window.request_redraw();
             }
-            trace_dialog::DialogAction::None => {}
+            DialogAction::None => {}
+        }
+
+        // Live-preview LLM-generation dialog. Same shape as the trace
+        // dialog: returns Apply / Cancel / None and we route accordingly.
+        let llm_action = llm_dialog::show(state, &gpu.egui_ctx, &mut gpu.renderer);
+        match llm_action {
+            DialogAction::Apply => {
+                llm_dialog::apply(state, &mut gpu.renderer);
+                gpu.window.request_redraw();
+            }
+            DialogAction::Cancel => {
+                llm_dialog::cancel(state, &mut gpu.renderer);
+                gpu.window.request_redraw();
+            }
+            DialogAction::None => {}
         }
 
         // Capture the canvas rect (area not covered by egui panels) before ending the pass.
@@ -987,9 +1012,19 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
             structure_cmds_inner,
             ui_scene_dirty_inner,
             insert_image_requested_inner,
+            llm_open_requested_inner,
         )
     };
-    let (full_output, structure_cmds, ui_scene_dirty, insert_image_requested) = full_output;
+    let (full_output, structure_cmds, ui_scene_dirty, insert_image_requested, llm_open_requested) =
+        full_output;
+
+    // File → Generate SVG from prompt…: opens the LLM dialog. The
+    // dialog itself loads the API key from the keychain on construction
+    // (so it can show a paste-key fallback if the keychain is missing).
+    if llm_open_requested && state.llm_dialog.is_none() {
+        llm_dialog::open(state);
+        gpu.window.request_redraw();
+    }
 
     // File → Insert Image…: opens a file dialog and inserts the chosen image
     // as a Raster scene node. Lives here (after run_ui returns) because the

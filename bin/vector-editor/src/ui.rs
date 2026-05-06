@@ -55,17 +55,18 @@ fn load_svg_from_path(
 /// so the canvas area is NOT part of any egui Ui. This lets
 /// `is_pointer_over_egui()` return false for the canvas.
 ///
-/// Returns `(structure_commands, scene_dirty, insert_image_requested)`.
-/// `insert_image_requested` is handled by the caller (which has access to
-/// the full `&mut EditorState`, needed by `insert_raster_from_bytes`); we
-/// can't run the file dialog inline because state is already destructured
-/// into disjoint borrows by the time we reach the menu code.
+/// Returns `(structure_commands, scene_dirty, insert_image_requested,
+/// llm_open_requested)`.
+/// `insert_image_requested` and `llm_open_requested` are handled by the
+/// caller (which has access to the full `&mut EditorState`); we can't
+/// open them inline because state is already destructured into disjoint
+/// borrows by the time we reach the menu code.
 #[expect(deprecated)] // Panel::show is deprecated in 0.34 but needed for top-level panels
 pub(crate) fn run_ui(
     ctx: &egui::Context,
     state: &mut EditorState,
     renderer: &mut Renderer,
-) -> (StructureCommands, bool, bool) {
+) -> (StructureCommands, bool, bool, bool) {
     let scene = &mut state.scene;
     let history = &mut state.history;
     let active_tool = &mut state.active_tool;
@@ -83,6 +84,7 @@ pub(crate) fn run_ui(
     let trace_dialog = &mut state.trace_dialog;
     let last_trace_params = &mut state.last_trace_params;
     let recent_files = &mut state.recent_files;
+    let llm_dialog_open = state.llm_dialog.is_some();
     let mut dump_requested = false;
     let mut reorder_cmd: ReorderCommand = None;
     let mut structure_cmds: StructureCommands = Vec::new();
@@ -91,6 +93,7 @@ pub(crate) fn run_ui(
     let mut save_requested = false;
     let mut trace_requested = false;
     let mut insert_image_requested = false;
+    let mut llm_open_requested = false;
     let mut undo_requested = false;
     let mut redo_requested = false;
     // Set by clicks in the "Open Recent" submenu; the actual load runs
@@ -160,6 +163,19 @@ pub(crate) fn run_ui(
                     .clicked()
                 {
                     trace_requested = true;
+                    ui.close();
+                }
+                // Greyed out while an LLM dialog is already open —
+                // single-instance for the same reason as the trace
+                // dialog (one preview group at a time).
+                if ui
+                    .add_enabled(
+                        !llm_dialog_open,
+                        egui::Button::new("Generate SVG from prompt..."),
+                    )
+                    .clicked()
+                {
+                    llm_open_requested = true;
                     ui.close();
                 }
             });
@@ -635,5 +651,10 @@ pub(crate) fn run_ui(
         });
     }
 
-    (structure_cmds, scene_dirty, insert_image_requested)
+    (
+        structure_cmds,
+        scene_dirty,
+        insert_image_requested,
+        llm_open_requested,
+    )
 }
