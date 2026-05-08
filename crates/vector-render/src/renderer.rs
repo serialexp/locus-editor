@@ -2546,7 +2546,14 @@ impl Renderer {
             let y1 = max[1] as f32;
             let fill: [f32; 4] = [0.3, 0.5, 1.0, 0.15]; // translucent blue
             let border: [f32; 4] = [0.3, 0.5, 1.0, 0.8]; // blue border
-            let t = 1.0; // border thickness
+
+            // Border is a constant 1 px on screen regardless of zoom — same
+            // trick as the per-node selection bbox above. Without the `/ zoom`
+            // divisor the border grew linearly with zoom and turned into a
+            // fat coloured slab at high magnification.
+            const MARQUEE_THICKNESS_PX: f32 = 1.0;
+            let t = MARQUEE_THICKNESS_PX / zoom;
+            let half_t = t * 0.5;
 
             // Fill
             push_quad(
@@ -2559,14 +2566,24 @@ impl Renderer {
                 fill,
             );
 
+            // Corner-cover strategy: top/bottom bars stretch past the bounds
+            // by half a thickness on each end so they own the corner squares;
+            // left/right bars are shortened by half a thickness on each end
+            // and sit *between* the horizontals. No overlap (was visibly
+            // darker at the corners because alpha is 0.8, not 1.0) and no
+            // notch (the verticals previously stopped at y0/y1 while the
+            // horizontals visually extended half a thickness past them).
+            let horiz_half_width = (x1 - x0) * 0.5 + half_t;
+            let vert_half_height = ((y1 - y0) * 0.5 - half_t).max(0.0);
+
             // Top edge
             push_quad(
                 &mut verts,
                 &mut idxs,
                 (x0 + x1) * 0.5,
                 y0,
-                (x1 - x0) * 0.5,
-                t * 0.5,
+                horiz_half_width,
+                half_t,
                 border,
             );
             // Bottom edge
@@ -2575,8 +2592,8 @@ impl Renderer {
                 &mut idxs,
                 (x0 + x1) * 0.5,
                 y1,
-                (x1 - x0) * 0.5,
-                t * 0.5,
+                horiz_half_width,
+                half_t,
                 border,
             );
             // Left edge
@@ -2585,8 +2602,8 @@ impl Renderer {
                 &mut idxs,
                 x0,
                 (y0 + y1) * 0.5,
-                t * 0.5,
-                (y1 - y0) * 0.5,
+                half_t,
+                vert_half_height,
                 border,
             );
             // Right edge
@@ -2595,8 +2612,8 @@ impl Renderer {
                 &mut idxs,
                 x1,
                 (y0 + y1) * 0.5,
-                t * 0.5,
-                (y1 - y0) * 0.5,
+                half_t,
+                vert_half_height,
                 border,
             );
         }
