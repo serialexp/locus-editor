@@ -670,9 +670,28 @@ impl ApplicationHandler for App {
                     }
                 } else if self.state.is_left_down && !gpu.egui_ctx.egui_wants_pointer_input() {
                     let exclude = self.state.snap_exclude();
-                    let canvas_f64 = self
-                        .state
-                        .screen_to_canvas_snapped(new_pos[0], new_pos[1], &exclude);
+                    // Snap during drags only fires when the operation
+                    // actually consumes a snapped *position*. For Select
+                    // that excludes marquee + rotate (the user's pointer
+                    // doesn't define a target point — it's a bbox corner
+                    // or a rotation angle), so showing a snap marker
+                    // there is just noise. For Pen / Rectangle / Ellipse
+                    // / Text drags every drag is positional, so always
+                    // snap.
+                    let snap_during_drag = match self.state.active_tool {
+                        ToolType::Select => self.state.select_state.wants_position_snap(),
+                        ToolType::Pen
+                        | ToolType::Rectangle
+                        | ToolType::Ellipse
+                        | ToolType::Text => true,
+                    };
+                    let canvas_f64 = if snap_during_drag {
+                        self.state
+                            .screen_to_canvas_snapped(new_pos[0], new_pos[1], &exclude)
+                    } else {
+                        let c = self.state.camera.screen_to_canvas(new_pos[0], new_pos[1]);
+                        [c[0] as f64, c[1] as f64]
+                    };
                     let changed = match self.state.active_tool {
                         ToolType::Select => self
                             .state
@@ -711,6 +730,27 @@ impl ApplicationHandler for App {
                         gpu.renderer.mark_dirty();
                         gpu.window.request_redraw();
                     }
+                } else if !self.state.is_left_down
+                    && !gpu.egui_ctx.egui_wants_pointer_input()
+                    && matches!(
+                        self.state.active_tool,
+                        ToolType::Pen | ToolType::Rectangle | ToolType::Ellipse | ToolType::Text
+                    )
+                {
+                    // Hover-snap preview for placement tools: a click here
+                    // would commit a point at the snap target, so show the
+                    // marker now rather than waiting for the click. Select
+                    // is intentionally excluded — it only snaps while
+                    // dragging an existing selection (handled above), so a
+                    // hover indicator would be misleading. Pen is included
+                    // for the idle case (first vertex of a new path); the
+                    // building case is handled in the previous arm because
+                    // it also has to run `pen_state.on_move`. Side-effect:
+                    // populates `self.last_snap` for the redraw block below.
+                    let exclude = self.state.snap_exclude();
+                    let _ = self
+                        .state
+                        .screen_to_canvas_snapped(new_pos[0], new_pos[1], &exclude);
                 }
 
                 self.state.cursor_pos = Some(new_pos);

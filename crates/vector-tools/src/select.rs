@@ -1649,6 +1649,21 @@ impl SelectState {
         !matches!(self.drag_mode, DragMode::Idle)
     }
 
+    /// Whether the current drag mode places a point that should snap to
+    /// other geometry — i.e. the dragged position is committed somewhere
+    /// (moved object's anchor, scale-handle target, vertex, gradient stop).
+    /// Marquee selection and rotation don't use a positional snap target,
+    /// so showing a snap marker during them would be visual noise.
+    pub fn wants_position_snap(&self) -> bool {
+        matches!(
+            self.drag_mode,
+            DragMode::MoveVertices { .. }
+                | DragMode::MoveObjects { .. }
+                | DragMode::ScaleObjects { .. }
+                | DragMode::MoveGradientHandle { .. }
+        )
+    }
+
     /// Get the current marquee rectangle in canvas coordinates, if active.
     pub fn marquee(&self) -> Option<([f64; 2], [f64; 2])> {
         match &self.drag_mode {
