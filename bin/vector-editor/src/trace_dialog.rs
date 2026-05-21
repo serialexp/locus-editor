@@ -229,16 +229,29 @@ pub(crate) fn show(state: &mut EditorState, ctx: &egui::Context) -> DialogAction
         .show(ctx, |ui| {
             // Preset row.
             ui.horizontal(|ui| {
+                info_icon(
+                    ui,
+                    "Starting points. B&W: sharp 2-colour line art. \
+                     Poster: a few flat colour regions. \
+                     Photo: smoothest curves, fewest corners — best for shapes that are \
+                     really circles/ellipses/blobs.",
+                );
                 ui.label("Load defaults:");
-                if ui.button("B&W").clicked() {
-                    dialog.params = TraceParams::from_preset(TracePreset::Bw);
-                }
-                if ui.button("Poster").clicked() {
-                    dialog.params = TraceParams::from_preset(TracePreset::Poster);
-                }
-                if ui.button("Photo").clicked() {
-                    dialog.params = TraceParams::from_preset(TracePreset::Photo);
-                }
+                ui.button("B&W")
+                    .on_hover_text("Sharp two-tone line art. Low corner threshold, hard edges.")
+                    .clicked()
+                    .then(|| dialog.params = TraceParams::from_preset(TracePreset::Bw));
+                ui.button("Poster")
+                    .on_hover_text("Flat colour regions, moderate smoothing.")
+                    .clicked()
+                    .then(|| dialog.params = TraceParams::from_preset(TracePreset::Poster));
+                ui.button("Photo")
+                    .on_hover_text(
+                        "Maximum smoothing (corner threshold 180°). Use this when shapes should \
+                         be all curves and no corners.",
+                    )
+                    .clicked()
+                    .then(|| dialog.params = TraceParams::from_preset(TracePreset::Photo));
             });
 
             ui.separator();
@@ -248,7 +261,15 @@ pub(crate) fn show(state: &mut EditorState, ctx: &egui::Context) -> DialogAction
                 .num_columns(2)
                 .spacing([10.0, 6.0])
                 .show(ui, |ui| {
-                    ui.label("Color mode");
+                    ui.horizontal(|ui| {
+                        info_icon(
+                            ui,
+                            "Color: trace each colour layer separately. \
+                             Binary: threshold to black/white only — much simpler output, \
+                             ignores colour entirely.",
+                        );
+                        ui.label("Color mode");
+                    });
                     egui::ComboBox::from_id_salt("color_mode")
                         .selected_text(match dialog.params.color_mode {
                             TraceColorMode::Color => "Color",
@@ -268,7 +289,15 @@ pub(crate) fn show(state: &mut EditorState, ctx: &egui::Context) -> DialogAction
                         });
                     ui.end_row();
 
-                    ui.label("Layers");
+                    ui.horizontal(|ui| {
+                        info_icon(
+                            ui,
+                            "Stacked: each colour layer is a full opaque shape, layered on top \
+                             of the others. Cutout: each layer is just the part not covered by \
+                             a deeper layer (smaller files, but shapes are hole-punched).",
+                        );
+                        ui.label("Layers");
+                    });
                     egui::ComboBox::from_id_salt("hierarchical")
                         .selected_text(match dialog.params.hierarchical {
                             HierarchicalMode::Stacked => "Stacked",
@@ -288,7 +317,15 @@ pub(crate) fn show(state: &mut EditorState, ctx: &egui::Context) -> DialogAction
                         });
                     ui.end_row();
 
-                    ui.label("Curves");
+                    ui.horizontal(|ui| {
+                        info_icon(
+                            ui,
+                            "Pixel art: each pixel edge becomes a path edge (no smoothing). \
+                             Polygon: straight-line segments only. \
+                             Smooth: cubic Bézier curves — fewest vertices for organic shapes.",
+                        );
+                        ui.label("Curves");
+                    });
                     egui::ComboBox::from_id_salt("curve_mode")
                         .selected_text(match dialog.params.curve_mode {
                             CurveMode::PixelArt => "Pixel art (no smoothing)",
@@ -319,52 +356,72 @@ pub(crate) fn show(state: &mut EditorState, ctx: &egui::Context) -> DialogAction
 
             // Numeric knobs.
             let is_color = dialog.params.color_mode == TraceColorMode::Color;
-            ui.add(
-                egui::Slider::new(&mut dialog.params.filter_speckle, 0..=128)
-                    .text("Filter speckle")
-                    .clamping(egui::SliderClamping::Always),
-            )
-            .on_hover_text(
-                "Drop clusters smaller than this many pixels on a side. Higher = less noise.",
+            slider_row(
+                ui,
+                true,
+                &mut dialog.params.filter_speckle,
+                0..=128,
+                "Filter speckle",
+                "Drop clusters smaller than this many pixels on a side. Higher = less noise, \
+                 fewer stray paths around shape edges. Bump up if you see speckle along contours.",
             );
-            ui.add_enabled(
+            slider_row(
+                ui,
                 is_color,
-                egui::Slider::new(&mut dialog.params.color_precision, 1..=8)
-                    .text("Color precision (bits)")
-                    .clamping(egui::SliderClamping::Always),
-            )
-            .on_hover_text("Bits per channel after quantisation. Lower = fewer colours.");
-            ui.add_enabled(
+                &mut dialog.params.color_precision,
+                1..=8,
+                "Color precision (bits)",
+                "Bits per channel after quantisation. Lower = fewer distinct colours, fewer layers.",
+            );
+            slider_row(
+                ui,
                 is_color,
-                egui::Slider::new(&mut dialog.params.layer_difference, 0..=128)
-                    .text("Layer difference")
-                    .clamping(egui::SliderClamping::Always),
-            )
-            .on_hover_text("Threshold for merging adjacent colour layers.");
-            ui.add(
-                egui::Slider::new(&mut dialog.params.corner_threshold, 0..=180)
-                    .text("Corner threshold (°)")
-                    .clamping(egui::SliderClamping::Always),
-            )
-            .on_hover_text("Angle below this is treated as a smooth curve, above as a corner.");
-            ui.add(
-                egui::Slider::new(&mut dialog.params.length_threshold, 0.0..=10.0)
-                    .text("Length threshold")
-                    .clamping(egui::SliderClamping::Always),
-            )
-            .on_hover_text("Minimum segment length (pixels) before splice/curve fitting.");
-            ui.add(
-                egui::Slider::new(&mut dialog.params.splice_threshold, 0..=180)
-                    .text("Splice threshold (°)")
-                    .clamping(egui::SliderClamping::Always),
-            )
-            .on_hover_text("Max angle between segments to splice into a single curve.");
-            ui.add(
-                egui::Slider::new(&mut dialog.params.path_precision, 0..=8)
-                    .text("Path precision (decimals)")
-                    .clamping(egui::SliderClamping::Always),
-            )
-            .on_hover_text("Decimal places retained in the path data. Lower = smaller output.");
+                &mut dialog.params.layer_difference,
+                0..=128,
+                "Layer difference",
+                "Threshold for merging adjacent colour layers. Higher = more aggressive merging, \
+                 fewer layers in the output.",
+            );
+            slider_row(
+                ui,
+                true,
+                &mut dialog.params.corner_threshold,
+                0..=180,
+                "Corner threshold (°)",
+                "Angles below this become hard corners; above, smooth curves. \
+                 LOW values (≤60°) produce many corners — every pixel staircase becomes a vertex. \
+                 HIGH values (160–180°) treat almost everything as smooth — best for circles, \
+                 ellipses, and other organic shapes. This is the biggest knob for reducing vertex count.",
+            );
+            slider_row(
+                ui,
+                true,
+                &mut dialog.params.length_threshold,
+                0.0..=10.0,
+                "Length threshold",
+                "Minimum segment length (pixels) before splice/curve fitting kicks in. \
+                 Higher = shorter wobbles get absorbed into longer curves, simpler paths. \
+                 Push toward 8–10 for chunky shapes with few intended corners.",
+            );
+            slider_row(
+                ui,
+                true,
+                &mut dialog.params.splice_threshold,
+                0..=180,
+                "Splice threshold (°)",
+                "Max tangent-angle change between segments that can be spliced into a single curve. \
+                 LOWER = more aggressive splicing, fewer separate curve pieces. Try 20–30° if \
+                 you're seeing too many short curve segments where one long one would do.",
+            );
+            slider_row(
+                ui,
+                true,
+                &mut dialog.params.path_precision,
+                0..=8,
+                "Path precision (decimals)",
+                "Decimal places retained in coordinates. Lower = smaller files, slightly less \
+                 accurate. Affects file size, not vertex count.",
+            );
 
             ui.separator();
 
@@ -460,6 +517,47 @@ pub(crate) fn cancel(state: &mut EditorState, renderer: &mut Renderer) {
         state.scene.remove(group_id);
     }
     renderer.mark_dirty();
+}
+
+/// Draw a small ⓘ marker that shows `tooltip` on hover. Used to advertise
+/// the per-control help text on the trace dialog so users notice that
+/// hover-help exists — without it the tooltips are effectively hidden.
+///
+/// Rendered as weakly-coloured text so it reads as "extra info available"
+/// rather than as a button. The marker itself is the hover target, but
+/// the tooltip is also still attached to the control next to it so
+/// hovering anywhere on the row works.
+fn info_icon(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+    let color = ui.style().visuals.weak_text_color();
+    ui.add(egui::Label::new(
+        egui::RichText::new("ⓘ").color(color).small(),
+    ))
+    .on_hover_text(tooltip)
+}
+
+/// Slider row with a leading ⓘ marker, the slider itself, and the tooltip
+/// attached to both. Returns the slider's response so callers can react
+/// to drags if needed (currently unused — params_changed_at is set
+/// elsewhere by comparing snapshots).
+fn slider_row<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    label: &str,
+    tooltip: &str,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        info_icon(ui, tooltip);
+        ui.add_enabled(
+            enabled,
+            egui::Slider::new(value, range)
+                .text(label)
+                .clamping(egui::SliderClamping::Always),
+        )
+        .on_hover_text(tooltip)
+    })
+    .inner
 }
 
 // ── Internals ────────────────────────────────────────────────────────
