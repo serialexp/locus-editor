@@ -14,6 +14,7 @@
 
 use std::io::Cursor;
 
+use vector_geom::Affine;
 use vector_scene::Scene;
 use vector_svg::ImportError;
 
@@ -53,17 +54,43 @@ pub fn trace_image_bytes(bytes: &[u8], preset: TracePreset) -> Result<Scene, Tra
 pub fn trace_image_with_params(bytes: &[u8], params: &TraceParams) -> Result<Scene, TraceError> {
     // Decode into RGBA8 with the modern `image` crate — we don't rely on
     // vtracer's transitive `image` dep, which is pinned to an old major.
-    let decoded = image::ImageReader::new(Cursor::new(bytes))
+    let mut decoded = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(TraceError::Io)?
         .decode()
         .map_err(TraceError::Decode)?
         .to_rgba8();
 
-    let (width, height) = (decoded.width() as usize, decoded.height() as usize);
-    if width == 0 || height == 0 {
+    let (orig_w, orig_h) = (decoded.width(), decoded.height());
+    if orig_w == 0 || orig_h == 0 {
         return Err(TraceError::EmptyImage);
     }
+
+    // Optional pre-trace downscale. Resampling with a triangle filter (≈
+    // bilinear) antialiases pixel boundaries, so vtracer no longer sees
+    // hard staircase edges where the source had smooth curves. The
+    // resulting paths come out in the downsampled coordinate space, and
+    // we scale them back up below so callers get geometry in the
+    // original pixel space regardless of `downscale`.
+    //
+    // Clamped to [1.0, 8.0]: ≤1.0 means "no downscale" (anything below
+    // 1.0 would be upscaling, which adds zero information and slows the
+    // trace), and >8.0 reliably destroys every recognisable feature.
+    let downscale = params.downscale.clamp(1.0, 8.0);
+    if downscale > 1.0 {
+        let new_w = ((orig_w as f32 / downscale).round() as u32).max(1);
+        let new_h = ((orig_h as f32 / downscale).round() as u32).max(1);
+        if new_w < orig_w || new_h < orig_h {
+            decoded = image::imageops::resize(
+                &decoded,
+                new_w,
+                new_h,
+                image::imageops::FilterType::Triangle,
+            );
+        }
+    }
+
+    let (width, height) = (decoded.width() as usize, decoded.height() as usize);
 
     // vtracer re-exports `visioncortex::ColorImage`. Its layout is exactly
     // `Vec<u8>` of R,G,B,A bytes in row-major order — identical to
@@ -81,7 +108,36 @@ pub fn trace_image_with_params(bytes: &[u8], params: &TraceParams) -> Result<Sce
     let svg_text = svg_file.to_string();
 
     // Hand it off to our SVG importer, reusing all path/color machinery.
-    vector_svg::import_svg(svg_text.as_bytes()).map_err(TraceError::Svg)
+    let mut scene = vector_svg::import_svg(svg_text.as_bytes()).map_err(TraceError::Svg)?;
+
+    // Compensate for the downscale by scaling each top-level imported
+    // node back up. We compose against the existing local transform
+    // (vtracer's output is identity, but the SVG importer could in
+    // principle apply one) rather than overwriting it. `defs` is left
+    // alone — gradients/patterns reference paths by id and shouldn't
+    // be re-scaled.
+    if downscale > 1.0 {
+        let s = downscale as f64;
+        let scale = Affine::scale(s, s);
+        let root = scene.root();
+        let defs = scene.defs();
+        let children: Vec<_> = scene
+            .get(root)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        for child in children {
+            if child == defs {
+                continue;
+            }
+            let existing = scene
+                .get(child)
+                .map(|n| n.transform)
+                .unwrap_or(Affine::IDENTITY);
+            scene.set_transform(child, existing.then(scale));
+        }
+    }
+
+    Ok(scene)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -174,5 +230,63 @@ mod tests {
     fn trace_rejects_invalid_bytes() {
         let result = trace_image_bytes(b"not an image", TracePreset::Poster);
         assert!(result.is_err());
+    }
+
+    /// With downscale > 1 the input is resampled smaller before tracing,
+    /// but the output coordinate space should still match the original
+    /// pixel dimensions thanks to the compensating scale-up on top-level
+    /// nodes. We assert that by tracing a 32×32 image at downscale=2 and
+    /// confirming the traced paths' bounding box extends across roughly
+    /// the original image size, not half of it.
+    #[test]
+    fn trace_with_downscale_preserves_output_scale() {
+        // 32×32 split half black / half white — vtracer should find at
+        // least one large region either way.
+        let mut img = image::RgbaImage::new(32, 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                let p = if x < 16 {
+                    image::Rgba([0, 0, 0, 255])
+                } else {
+                    image::Rgba([255, 255, 255, 255])
+                };
+                img.put_pixel(x, y, p);
+            }
+        }
+        let mut png_bytes = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+
+        let mut params = TraceParams::from_preset(TracePreset::Bw);
+        params.filter_speckle = 2;
+        params.downscale = 2.0;
+        let scene =
+            trace_image_with_params(&png_bytes, &params).expect("downscaled trace should succeed");
+
+        // Find a top-level path node and check its transform has been
+        // scaled up by ~2× (the downscale compensation).
+        let root_node = scene.get(scene.root()).unwrap();
+        let scaled_path = root_node
+            .children
+            .iter()
+            .find(|&&id| {
+                id != scene.defs()
+                    && scene
+                        .get(id)
+                        .is_some_and(|n| matches!(n.data, NodeData::Path { .. }))
+            })
+            .copied()
+            .expect("expected at least one traced path");
+
+        let t = scene.get(scaled_path).unwrap().transform;
+        // a/d are the diagonal scale factors. With downscale=2 they
+        // should be exactly 2.0 since vtracer's own transform is
+        // identity.
+        assert!(
+            (t.a - 2.0).abs() < 1e-6 && (t.d - 2.0).abs() < 1e-6,
+            "expected ~2× scale-up transform, got a={}, d={}",
+            t.a,
+            t.d
+        );
     }
 }

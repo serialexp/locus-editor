@@ -5013,6 +5013,7 @@ dependencies = [
  "image 0.25.10",
  "log",
  "thiserror 2.0.18",
+ "vector-geom",
  "vector-scene",
  "vector-svg",
  "visioncortex",

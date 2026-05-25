@@ -237,21 +237,30 @@ pub(crate) fn show(state: &mut EditorState, ctx: &egui::Context) -> DialogAction
                      really circles/ellipses/blobs.",
                 );
                 ui.label("Load defaults:");
-                ui.button("B&W")
+                if ui
+                    .button("B&W")
                     .on_hover_text("Sharp two-tone line art. Low corner threshold, hard edges.")
                     .clicked()
-                    .then(|| dialog.params = TraceParams::from_preset(TracePreset::Bw));
-                ui.button("Poster")
+                {
+                    dialog.params = TraceParams::from_preset(TracePreset::Bw);
+                }
+                if ui
+                    .button("Poster")
                     .on_hover_text("Flat colour regions, moderate smoothing.")
                     .clicked()
-                    .then(|| dialog.params = TraceParams::from_preset(TracePreset::Poster));
-                ui.button("Photo")
+                {
+                    dialog.params = TraceParams::from_preset(TracePreset::Poster);
+                }
+                if ui
+                    .button("Photo")
                     .on_hover_text(
                         "Maximum smoothing (corner threshold 180°). Use this when shapes should \
                          be all curves and no corners.",
                     )
                     .clicked()
-                    .then(|| dialog.params = TraceParams::from_preset(TracePreset::Photo));
+                {
+                    dialog.params = TraceParams::from_preset(TracePreset::Photo);
+                }
             });
 
             ui.separator();
@@ -356,6 +365,18 @@ pub(crate) fn show(state: &mut EditorState, ctx: &egui::Context) -> DialogAction
 
             // Numeric knobs.
             let is_color = dialog.params.color_mode == TraceColorMode::Color;
+            slider_row(
+                ui,
+                true,
+                &mut dialog.params.downscale,
+                1.0..=8.0,
+                "Downscale input",
+                "Resample the image to 1/N its size before tracing (and scale the result back \
+                 up). The resampling step antialiases pixel boundaries so shapes that should be \
+                 smooth curves stop getting traced as the literal pixel staircase. \
+                 Try 2× first for noisy bitmaps; 3–4× for very small or very pixelated sources. \
+                 Goes too far above ~4× and fine features disappear entirely.",
+            );
             slider_row(
                 ui,
                 true,
@@ -530,7 +551,7 @@ pub(crate) fn cancel(state: &mut EditorState, renderer: &mut Renderer) {
 fn info_icon(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
     let color = ui.style().visuals.weak_text_color();
     ui.add(egui::Label::new(
-        egui::RichText::new("ⓘ").color(color).small(),
+        egui::RichText::new(egui_phosphor::regular::INFO).color(color),
     ))
     .on_hover_text(tooltip)
 }

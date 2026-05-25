@@ -7,6 +7,7 @@ rust-version.workspace = true
 authors.workspace = true
 
 [dependencies]
+vector-geom = { path = "../vector-geom" }
 vector-scene = { path = "../vector-scene" }
 vector-svg = { path = "../vector-svg" }
 vtracer = "0.6"

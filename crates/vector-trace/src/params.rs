@@ -122,6 +122,15 @@ pub struct TraceParams {
     /// Decimal places retained in path output coordinates. Range: 0..=8.
     /// Lower = smaller SVG, higher = more precise.
     pub path_precision: u32,
+    /// Input downscale factor before tracing. 1.0 = no downscale.
+    /// Higher values trace a smaller (resampled) copy of the image,
+    /// which smooths away pixel-edge artefacts — useful when shapes
+    /// that should be smooth curves are getting traced as the literal
+    /// staircase of pixel boundaries. The resulting paths are then
+    /// scaled back up so they live in the original pixel coordinate
+    /// space. Range: 1.0..=8.0 (clamped). Anything > ~4× tends to
+    /// destroy fine features.
+    pub downscale: f32,
 }
 
 impl Default for TraceParams {
@@ -148,6 +157,7 @@ impl TraceParams {
                 length_threshold: 4.0,
                 splice_threshold: 45,
                 path_precision: 2,
+                downscale: 1.0,
             },
             TracePreset::Poster => Self {
                 color_mode: TraceColorMode::Color,
@@ -160,6 +170,7 @@ impl TraceParams {
                 length_threshold: 4.0,
                 splice_threshold: 45,
                 path_precision: 2,
+                downscale: 1.0,
             },
             TracePreset::Photo => Self {
                 color_mode: TraceColorMode::Color,
@@ -172,6 +183,7 @@ impl TraceParams {
                 length_threshold: 4.0,
                 splice_threshold: 45,
                 path_precision: 2,
+                downscale: 1.0,
             },
         }
     }
