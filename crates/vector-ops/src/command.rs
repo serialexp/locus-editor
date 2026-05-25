@@ -1,4 +1,4 @@
-use vector_geom::{Affine, Path};
+use vector_geom::{Affine, Bounds, Path};
 use vector_scene::{Gradient, GroupKind, NodeId, NodeSnapshot, Scene, Style, TextData};
 
 /// A reversible editing command. Each variant knows how to apply
@@ -40,6 +40,28 @@ pub enum Command {
         id: NodeId,
         new_parent: NodeId,
         index: usize,
+    },
+    /// Replace the document viewBox (page rectangle). Undo restores the
+    /// previous viewBox. Used by "Fit Page to Content" and any future
+    /// document-properties UI that lets the user resize/reposition the page.
+    SetViewBox { bounds: Bounds },
+    /// Dissolve a group, moving its children to the group's parent while
+    /// folding the group's transform into each child so they stay put.
+    /// The inverse is `Regroup`, which captures enough state to restore
+    /// the original group (with its original NodeId-bearing children) on
+    /// undo. Lives as a dedicated command rather than a `Batch` because
+    /// the auto-derived batch undo can't refer to the deleted group's
+    /// NodeId after it's removed from the scene's SlotMap.
+    Ungroup { group: NodeId },
+    /// Inverse of `Ungroup`: re-create the group from `snapshot` at
+    /// `(parent, index)`, then move each listed child back into it at
+    /// its original index with its original transform.
+    Regroup {
+        snapshot: Box<NodeSnapshot>,
+        parent: NodeId,
+        index: usize,
+        /// `(child_id, original_transform, original_index_in_group)`.
+        children: Vec<(NodeId, Affine, usize)>,
     },
     /// Batch of commands applied atomically.
     Batch(Vec<Command>),
@@ -120,6 +142,86 @@ impl Command {
                 } else {
                     None
                 }
+            }
+            Command::SetViewBox { bounds } => {
+                let old = scene.view_box();
+                if old == bounds {
+                    return None;
+                }
+                scene.set_view_box(bounds);
+                Some(Command::SetViewBox { bounds: old })
+            }
+            Command::Ungroup { group } => {
+                // Capture everything we need to rebuild the group on undo,
+                // *before* mutating anything.
+                let group_node = scene.get(group)?;
+                if !matches!(group_node.data, vector_scene::NodeData::Group { .. }) {
+                    return None;
+                }
+                let group_transform = group_node.transform;
+                let parent = scene.parent(group)?;
+                let group_index = scene.child_index(group).unwrap_or(0);
+                let child_ids: Vec<NodeId> = group_node.children.clone();
+
+                // Original (id, transform, index-in-group) so Regroup
+                // can put each child back exactly where it was.
+                let mut original_children: Vec<(NodeId, Affine, usize)> =
+                    Vec::with_capacity(child_ids.len());
+                for (i, &cid) in child_ids.iter().enumerate() {
+                    if let Some(cn) = scene.get(cid) {
+                        original_children.push((cid, cn.transform, i));
+                    }
+                }
+
+                // Fold the group's transform into each child so visible
+                // position is preserved across the ungroup.
+                if !group_transform.is_identity() {
+                    for &(cid, orig_t, _) in &original_children {
+                        let composed = group_transform.then(orig_t);
+                        if composed != orig_t {
+                            scene.set_transform(cid, composed);
+                        }
+                    }
+                }
+
+                // Move children out to the group's parent at sequential
+                // indices starting from the group's slot.
+                for (i, &cid) in child_ids.iter().enumerate() {
+                    scene.reparent(cid, parent, group_index + i);
+                }
+
+                // Capture the now-empty group as a snapshot, then remove
+                // it. Snapshot has zero children at this point.
+                let snapshot = scene.snapshot_subtree(group)?;
+                scene.remove(group);
+
+                Some(Command::Regroup {
+                    snapshot: Box::new(snapshot),
+                    parent,
+                    index: group_index,
+                    children: original_children,
+                })
+            }
+            Command::Regroup {
+                snapshot,
+                parent,
+                index,
+                children,
+            } => {
+                // Re-create the empty group at its original slot. The
+                // resurrected group gets a fresh NodeId — that's fine
+                // because Regroup's redo (Ungroup) will look it up by
+                // the *new* id.
+                let new_group_id = scene.insert_subtree(parent, index, *snapshot)?;
+                // Reparent each original child back into the new group at
+                // its recorded index, restoring its original transform.
+                for (cid, orig_t, orig_idx) in children {
+                    scene.reparent(cid, new_group_id, orig_idx);
+                    scene.set_transform(cid, orig_t);
+                }
+                Some(Command::Ungroup {
+                    group: new_group_id,
+                })
             }
             Command::Batch(cmds) => {
                 let mut undos: Vec<Command> = Vec::new();
@@ -210,6 +312,63 @@ mod tests {
         // The re-inserted node should be at index 1.
         let reinserted = root_node.children[1];
         assert_eq!(scene.get(reinserted).unwrap().label, "a");
+    }
+
+    #[test]
+    fn ungroup_then_undo_restores_group_and_transforms() {
+        let mut scene = Scene::new();
+        let root = scene.root();
+
+        // Group at translate(10, 20) with two path children at their own
+        // translations. After ungroup the children should sit at
+        // (10+1, 20+2) and (10+3, 20+4) under root; after undo they
+        // should be back inside the group at their original transforms.
+        let mut group = Node::group("g");
+        group.transform = Affine::translate(10.0, 20.0);
+        let group_id = scene.insert(root, group).unwrap();
+
+        let mut child_a = Node::path("a", make_test_path());
+        child_a.transform = Affine::translate(1.0, 2.0);
+        let a = scene.insert(group_id, child_a).unwrap();
+
+        let mut child_b = Node::path("b", make_test_path());
+        child_b.transform = Affine::translate(3.0, 4.0);
+        let b = scene.insert(group_id, child_b).unwrap();
+
+        let orig_a_transform = scene.get(a).unwrap().transform;
+        let orig_b_transform = scene.get(b).unwrap().transform;
+        let orig_root_kids = scene.get(root).unwrap().children.clone();
+
+        // Ungroup.
+        let undo = Command::Ungroup { group: group_id }
+            .apply(&mut scene)
+            .expect("ungroup should return undo");
+
+        // Group is gone; both children are reparented to root with
+        // composed transforms.
+        assert!(scene.get(group_id).is_none());
+        assert_eq!(scene.parent(a), Some(root));
+        assert_eq!(scene.parent(b), Some(root));
+        assert_eq!(scene.get(a).unwrap().transform.tx, 11.0);
+        assert_eq!(scene.get(a).unwrap().transform.ty, 22.0);
+        assert_eq!(scene.get(b).unwrap().transform.tx, 13.0);
+        assert_eq!(scene.get(b).unwrap().transform.ty, 24.0);
+
+        // Undo: children restored inside a fresh group at the original
+        // slot, with their original transforms intact.
+        let redo = undo.apply(&mut scene).expect("undo should return redo");
+
+        let root_kids = scene.get(root).unwrap().children.clone();
+        assert_eq!(root_kids.len(), orig_root_kids.len());
+        // Children of the resurrected group are still `a` and `b` with
+        // their original transforms.
+        let Command::Ungroup { group: new_group } = redo else {
+            panic!("redo of Regroup should be an Ungroup, got {redo:?}");
+        };
+        let new_group_kids = scene.get(new_group).unwrap().children.clone();
+        assert_eq!(new_group_kids, vec![a, b]);
+        assert_eq!(scene.get(a).unwrap().transform, orig_a_transform);
+        assert_eq!(scene.get(b).unwrap().transform, orig_b_transform);
     }
 
     #[test]

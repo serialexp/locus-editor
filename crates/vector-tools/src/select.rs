@@ -218,7 +218,7 @@ impl VertexRef {
 
 /// After moving a control point, enforce the vertex mode constraint on
 /// the opposite handle at the same anchor vertex.
-fn enforce_vertex_constraint(vr: &VertexRef, scene: &mut Scene) {
+pub fn enforce_vertex_constraint(vr: &VertexRef, scene: &mut Scene) {
     let subpath_idx = vr.subpath;
     let segment_idx = vr.segment;
     let kind = vr.kind;
@@ -787,6 +787,13 @@ impl Default for SelectState {
 
 /// Hit-test radius in screen pixels. Divided by zoom to get canvas-space radius.
 const HIT_RADIUS_SCREEN_PX: f64 = 8.0;
+
+/// Edge-interaction hit radius in screen pixels. Wider than the general
+/// handle radius because path edges are 1-2 px thin lines, so users need a
+/// generous corridor to land on them — landing on a 4 px square handle is
+/// much easier than landing on a stroke. Drives the segment-hover highlight,
+/// the ghost-insertion ball, and edge-based context-menu hits.
+const EDGE_HIT_RADIUS_SCREEN_PX: f64 = 18.0;
 
 /// A hit on a path edge (between vertices), used for inserting new points.
 #[derive(Debug, Clone, PartialEq)]
@@ -2056,7 +2063,7 @@ impl SelectState {
         zoom: f64,
         nodes: &[NodeId],
     ) -> Option<EdgeHit> {
-        let radius = HIT_RADIUS_SCREEN_PX / zoom;
+        let radius = EDGE_HIT_RADIUS_SCREEN_PX / zoom;
         let canvas_target = Point::new(canvas_pos[0], canvas_pos[1]);
         let mut best: Option<(EdgeHit, f64)> = None;
 
@@ -2439,6 +2446,197 @@ impl SelectState {
             Segment::Cubic { .. } => SegmentKind::Cubic,
             Segment::Arc { .. } => SegmentKind::Arc,
         })
+    }
+
+    /// Retract a control point onto its anchor, downgrading the segment.
+    ///
+    /// * `CubicCtrl1` / `CubicCtrl2` → segment becomes a Quad, using the
+    ///   surviving cubic control as the quad's ctrl.
+    /// * `QuadCtrl` → segment becomes a Line.
+    /// * Anchor-kind `VertexRef`s are rejected (no-op).
+    ///
+    /// Returns `true` if the path was changed.
+    pub fn retract_control(scene: &mut Scene, vref: &VertexRef) -> bool {
+        let subpath_idx = vref.subpath;
+        let seg_idx = vref.segment;
+        let kind = vref.kind;
+        scene
+            .with_path_data_mut(vref.node, |path| {
+                let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+                    return false;
+                };
+                let Some(seg) = subpath.segments.get_mut(seg_idx) else {
+                    return false;
+                };
+                match (kind, *seg) {
+                    (PointKind::QuadCtrl, Segment::Quad { to, .. }) => {
+                        *seg = Segment::Line { to };
+                        true
+                    }
+                    (PointKind::CubicCtrl1, Segment::Cubic { ctrl2, to, .. }) => {
+                        *seg = Segment::Quad { ctrl: ctrl2, to };
+                        true
+                    }
+                    (PointKind::CubicCtrl2, Segment::Cubic { ctrl1, to, .. }) => {
+                        *seg = Segment::Quad { ctrl: ctrl1, to };
+                        true
+                    }
+                    _ => false,
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    /// Mirror this control point's position across its anchor onto the
+    /// control on the *other* side of that anchor, producing a smooth
+    /// (symmetric) curve transition. Also sets the anchor's `VertexMode`
+    /// to `Symmetric`.
+    ///
+    /// Requires:
+    /// * `vref` is a cubic control (mirrors are well-defined; quad has only
+    ///   one control which isn't anchor-attached in the same sense).
+    /// * The segment on the other side of the anchor exists and is a Cubic
+    ///   (so it has a control point to write to). Quad on the other side is
+    ///   rejected — a future enhancement could degree-elevate it first.
+    ///
+    /// Returns `true` if the path was changed.
+    pub fn mirror_control_across_anchor(scene: &mut Scene, vref: &VertexRef) -> bool {
+        let subpath_idx = vref.subpath;
+        let seg_idx = vref.segment;
+        let kind = vref.kind;
+        scene
+            .with_path_data_mut(vref.node, |path| {
+                let Some(subpath) = path.subpaths.get_mut(subpath_idx) else {
+                    return false;
+                };
+
+                // Figure out (anchor_point, this_control, anchor_mode_index, other_seg_idx).
+                // "other_seg" is the segment on the opposite side of the anchor.
+                let (this_ctrl, anchor, anchor_mode_idx, other_seg_idx) = match kind {
+                    PointKind::CubicCtrl1 => {
+                        // ctrl1 lives on the START side of segment seg_idx.
+                        // The anchor is the segment's `from` point — i.e. the
+                        // endpoint of the previous segment (or subpath.start /
+                        // for closed paths, the last segment's endpoint).
+                        let anchor = if seg_idx == 0 {
+                            subpath.start
+                        } else {
+                            subpath.segments[seg_idx - 1].endpoint()
+                        };
+                        let other = if seg_idx == 0 {
+                            if subpath.closed && !subpath.segments.is_empty() {
+                                subpath.segments.len() - 1
+                            } else {
+                                return false;
+                            }
+                        } else {
+                            seg_idx - 1
+                        };
+                        let Segment::Cubic { ctrl1, .. } = subpath.segments[seg_idx] else {
+                            return false;
+                        };
+                        (ctrl1, anchor, seg_idx, other)
+                    }
+                    PointKind::CubicCtrl2 => {
+                        // ctrl2 lives on the END side of segment seg_idx — its
+                        // anchor is the segment's endpoint, and the "other"
+                        // segment is the next one (or first segment if closed).
+                        let Segment::Cubic { ctrl2, to, .. } = subpath.segments[seg_idx] else {
+                            return false;
+                        };
+                        let other = if seg_idx + 1 < subpath.segments.len() {
+                            seg_idx + 1
+                        } else if subpath.closed && !subpath.segments.is_empty() {
+                            0
+                        } else {
+                            return false;
+                        };
+                        (ctrl2, to, seg_idx + 1, other)
+                    }
+                    _ => return false,
+                };
+
+                // Compute the mirrored control position: reflect this_ctrl
+                // through the anchor — i.e. 2*anchor - this_ctrl.
+                let mirrored =
+                    Point::new(2.0 * anchor.x - this_ctrl.x, 2.0 * anchor.y - this_ctrl.y);
+
+                // Write the mirrored point into the OTHER segment's
+                // anchor-adjacent control. Which control depends on whether
+                // the other segment leaves or arrives at the anchor:
+                // * `this_ctrl == ctrl1 of seg_idx` (we leave anchor through seg_idx)
+                //   → other segment arrives at anchor → write its ctrl2.
+                // * `this_ctrl == ctrl2 of seg_idx` (we arrive at anchor through seg_idx)
+                //   → other segment leaves anchor → write its ctrl1.
+                let write_ctrl2_on_other = matches!(kind, PointKind::CubicCtrl1);
+                let Some(other_seg) = subpath.segments.get_mut(other_seg_idx) else {
+                    return false;
+                };
+                match (other_seg, write_ctrl2_on_other) {
+                    (Segment::Cubic { ctrl2, .. }, true) => *ctrl2 = mirrored,
+                    (Segment::Cubic { ctrl1, .. }, false) => *ctrl1 = mirrored,
+                    // The other side isn't a Cubic — bail rather than guess.
+                    // The caller already gates this case at the menu level.
+                    _ => return false,
+                }
+
+                // Promote the anchor's vertex mode to Symmetric so future
+                // drags of either handle keep the constraint live.
+                if let Some(mode) = subpath.vertex_modes.get_mut(anchor_mode_idx) {
+                    *mode = VertexMode::Symmetric;
+                }
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// True iff `mirror_control_across_anchor` would succeed for this vref.
+    /// Used by the right-click menu to grey-out / hide the option when it
+    /// can't be applied.
+    pub fn can_mirror_control(scene: &Scene, vref: &VertexRef) -> bool {
+        let Some(node) = scene.get(vref.node) else {
+            return false;
+        };
+        let NodeData::Path { ref path, .. } = node.data else {
+            return false;
+        };
+        let Some(subpath) = path.subpaths.get(vref.subpath) else {
+            return false;
+        };
+        let seg_idx = vref.segment;
+        let other_seg_idx = match vref.kind {
+            PointKind::CubicCtrl1 => {
+                if !matches!(subpath.segments.get(seg_idx), Some(Segment::Cubic { .. })) {
+                    return false;
+                }
+                if seg_idx == 0 {
+                    if subpath.closed && !subpath.segments.is_empty() {
+                        subpath.segments.len() - 1
+                    } else {
+                        return false;
+                    }
+                } else {
+                    seg_idx - 1
+                }
+            }
+            PointKind::CubicCtrl2 => {
+                if !matches!(subpath.segments.get(seg_idx), Some(Segment::Cubic { .. })) {
+                    return false;
+                }
+                if seg_idx + 1 < subpath.segments.len() {
+                    seg_idx + 1
+                } else if subpath.closed && !subpath.segments.is_empty() {
+                    0
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+        matches!(
+            subpath.segments.get(other_seg_idx),
+            Some(Segment::Cubic { .. })
+        )
     }
 }
 

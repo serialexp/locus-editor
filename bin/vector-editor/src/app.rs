@@ -450,6 +450,22 @@ impl ApplicationHandler for App {
                                                                     .enter_node_mode();
                                                                 handled = true;
                                                             }
+                                                        } else if self
+                                                            .state
+                                                            .select_state
+                                                            .group_scope()
+                                                            .is_some()
+                                                        {
+                                                            // Double-click on empty canvas while
+                                                            // inside a group: pop one level of
+                                                            // isolation. Mirrors the Escape
+                                                            // shortcut and gives the user a
+                                                            // discoverable mouse-only way out.
+                                                            self.state
+                                                                .select_state
+                                                                .exit_group_scope();
+                                                            gpu.renderer.mark_dirty();
+                                                            handled = true;
                                                         }
                                                     }
                                                     SelectionMode::Node => {
@@ -993,10 +1009,45 @@ impl ApplicationHandler for App {
                                 gpu.window.request_redraw();
                             }
                         }
+                        // Arrow-key nudge: move the current selection
+                        // (vertices or objects) by a screen-pixel-sized step.
+                        // Step is `2 / zoom` canvas units so the visible jump
+                        // stays constant regardless of zoom level; Shift
+                        // multiplies by 10× for coarse moves.
+                        Key::Named(key @ NamedKey::ArrowLeft)
+                        | Key::Named(key @ NamedKey::ArrowRight)
+                        | Key::Named(key @ NamedKey::ArrowUp)
+                        | Key::Named(key @ NamedKey::ArrowDown)
+                            if self.state.active_tool == ToolType::Select
+                                && !ctrl
+                                && !self.state.pen_state.is_building()
+                                && !self.state.shape_draw.is_drawing()
+                                && !self.state.text_tool.is_editing() =>
+                        {
+                            let zoom = self.state.camera.zoom.max(1e-6) as f64;
+                            let base_px = if modifiers.shift { 20.0 } else { 2.0 };
+                            let step = base_px / zoom;
+                            let (dx, dy) = match key {
+                                NamedKey::ArrowLeft => (-step, 0.0),
+                                NamedKey::ArrowRight => (step, 0.0),
+                                NamedKey::ArrowUp => (0.0, -step),
+                                NamedKey::ArrowDown => (0.0, step),
+                                _ => (0.0, 0.0),
+                            };
+                            if self.state.nudge_selection(dx, dy) {
+                                gpu.renderer.mark_dirty();
+                                gpu.window.request_redraw();
+                            }
+                        }
                         Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace)
                             if self.state.active_tool == ToolType::Select =>
                         {
-                            let deleted = self.state.delete_with_undo();
+                            // Gradient-stop focus takes priority over object
+                            // delete: if the user is editing a gradient and
+                            // has a stop selected in the properties panel,
+                            // Delete should remove that stop.
+                            let consumed = self.state.try_delete_focused_gradient_stop();
+                            let deleted = consumed || self.state.delete_with_undo();
                             if deleted {
                                 gpu.renderer.mark_dirty();
                                 gpu.window.request_redraw();

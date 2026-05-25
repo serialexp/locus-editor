@@ -24,7 +24,7 @@
 
 use egui::{Color32, Id, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Vec2};
 use vector_geom::Color;
-use vector_scene::{ColorStop, Gradient, Scene, SpreadMethod};
+use vector_scene::{ColorStop, Gradient, NodeId, Scene, SpreadMethod};
 
 use crate::paint_picker;
 use crate::util::color_to_egui;
@@ -41,17 +41,22 @@ pub(crate) fn show_gradient_editor(
     gradient: &mut Gradient,
     scene: &Scene,
     id_source: &str,
+    paint_id: NodeId,
+    stop_focus: &mut Option<(NodeId, usize)>,
 ) -> bool {
     let mut changed = false;
     let editor_id = ui.make_persistent_id(("gradient_editor", id_source));
 
-    // Selected stop index, persisted in egui memory so a click on a
-    // marker is remembered across frames without the caller threading
-    // state through.
-    let mut selected = ui
-        .data(|d| d.get_temp::<usize>(editor_id))
-        .unwrap_or(0)
-        .min(gradient.stops.len().saturating_sub(1));
+    // Selected stop index. We mirror it both in `EditorState.gradient_stop_focus`
+    // (so the canvas Delete handler can target the stop) and in egui temp
+    // memory (so the existing per-editor persistence still works for other
+    // gradients not held by `stop_focus`). Reads prefer `stop_focus` when its
+    // paint id matches this editor's paint.
+    let mut selected = match stop_focus {
+        Some((id, idx)) if *id == paint_id => *idx,
+        _ => ui.data(|d| d.get_temp::<usize>(editor_id)).unwrap_or(0),
+    }
+    .min(gradient.stops.len().saturating_sub(1));
 
     // ── Preview bar + markers ──
     let bar_response = paint_preview_bar(ui, gradient);
@@ -193,8 +198,10 @@ pub(crate) fn show_gradient_editor(
         }
     });
 
-    // Persist selected index for next frame.
+    // Persist selected index for next frame — both in egui temp memory
+    // (per-editor) and in the canvas-wide focus slot owned by EditorState.
     ui.data_mut(|d| d.insert_temp(editor_id, selected));
+    *stop_focus = Some((paint_id, selected));
 
     changed
 }

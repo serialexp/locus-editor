@@ -10,7 +10,7 @@ mod text;
 pub use pen::{PenAction, PenState};
 pub use select::{
     EdgeHit, GradientHandlePoint, GradientHandleRef, PointKind, ScaleHandle, SegmentKind,
-    SelectState, SelectionMode, VertexRef, for_each_handle_of_gradient,
+    SelectState, SelectionMode, VertexRef, enforce_vertex_constraint, for_each_handle_of_gradient,
 };
 pub use shape::ShapeDrawState;
 pub use text::{TextAction, TextToolState};

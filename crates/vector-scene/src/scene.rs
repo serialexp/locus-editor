@@ -7,7 +7,7 @@ use slotmap::{SecondaryMap, SlotMap};
 use crate::node::{GroupKind, Node, NodeData, RasterImage, TextData};
 use crate::paint::{Gradient, Paint, PaintRef};
 use crate::style::Style;
-use vector_geom::{Affine, Path};
+use vector_geom::{Affine, Bounds, Path, Point};
 
 // SlotMap's DefaultKey gives us stable, generational IDs for free:
 // - O(1) lookup
@@ -68,6 +68,17 @@ pub struct Scene {
     root: NodeId,
     /// The defs group (non-rendered). Child of root, always exists.
     defs: NodeId,
+    /// Document viewBox — the rectangle in canvas coordinates that represents
+    /// the "page". Stored as document metadata so SVG round-trips preserve
+    /// what the user set; the renderer draws a page rectangle here so the
+    /// user can see where content will be framed on export. Not derived from
+    /// content bounds — that's an explicit user action ("Fit Page to Content").
+    #[serde(default = "default_view_box")]
+    view_box: Bounds,
+}
+
+fn default_view_box() -> Bounds {
+    Bounds::new(Point::new(0.0, 0.0), Point::new(800.0, 600.0))
 }
 
 impl Scene {
@@ -101,6 +112,7 @@ impl Scene {
             ui_rev: 0,
             root,
             defs,
+            view_box: default_view_box(),
         }
     }
 
@@ -110,6 +122,21 @@ impl Scene {
 
     pub fn defs(&self) -> NodeId {
         self.defs
+    }
+
+    /// The document viewBox (page rectangle in canvas coordinates).
+    pub fn view_box(&self) -> Bounds {
+        self.view_box
+    }
+
+    /// Replace the document viewBox. Bumps the UI revision so the renderer's
+    /// page-rect overlay redraws and panels that show document metadata can
+    /// refresh.
+    pub fn set_view_box(&mut self, bounds: Bounds) {
+        if self.view_box != bounds {
+            self.view_box = bounds;
+            self.ui_rev = self.ui_rev.wrapping_add(1);
+        }
     }
 
     /// Get a node by ID.

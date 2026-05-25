@@ -81,6 +81,8 @@ pub(crate) fn run_ui(
     let structure_collapse = &mut state.structure_collapse;
     let structure_collapse_rev = &mut state.structure_collapse_rev;
     let cached_flatten = &mut state.cached_flatten;
+    let structure_rename = &mut state.structure_rename;
+    let gradient_stop_focus = &mut state.gradient_stop_focus;
     let trace_dialog = &mut state.trace_dialog;
     let last_trace_params = &mut state.last_trace_params;
     let recent_files = &mut state.recent_files;
@@ -96,6 +98,7 @@ pub(crate) fn run_ui(
     let mut llm_open_requested = false;
     let mut undo_requested = false;
     let mut redo_requested = false;
+    let mut fit_page_to_content_requested = false;
     // Set by clicks in the "Open Recent" submenu; the actual load runs
     // after the egui pass (same flag-then-defer pattern as `open_requested`).
     let mut recent_open_path: Option<PathBuf> = None;
@@ -192,6 +195,22 @@ pub(crate) fn run_ui(
                     .clicked()
                 {
                     redo_requested = true;
+                    ui.close();
+                }
+                ui.separator();
+                // Resize the page (document viewBox) to tightly frame all
+                // current scene content. Disabled when the scene has nothing
+                // to fit.
+                let has_content = !vector_bool::scene_content_bounds(scene).is_empty();
+                if ui
+                    .add_enabled(has_content, egui::Button::new("Fit Page to Content"))
+                    .on_hover_text(
+                        "Resize the document's page rectangle (viewBox) so it tightly \
+                         frames all visible content, with a small margin.",
+                    )
+                    .clicked()
+                {
+                    fit_page_to_content_requested = true;
                     ui.close();
                 }
             });
@@ -489,6 +508,7 @@ pub(crate) fn run_ui(
                                 selection,
                                 renderer,
                                 &mut structure_cmds,
+                                gradient_stop_focus,
                             );
                         });
                 });
@@ -567,6 +587,7 @@ pub(crate) fn run_ui(
                                 &mut reorder_cmd,
                                 &mut structure_cmds,
                                 &mut scene_dirty,
+                                structure_rename,
                             );
                         }
                     });
@@ -619,6 +640,25 @@ pub(crate) fn run_ui(
         selection.selected.clear();
         selection.hovered = None;
         renderer.mark_dirty();
+    }
+
+    if fit_page_to_content_requested {
+        // Compute tight content bounds (boolean-group aware so Intersect /
+        // Difference groups contribute their baked result, not their operand
+        // union) plus a small margin to absorb stroke anti-aliasing / acute
+        // miters. Dispatched through the history so the resize is undoable.
+        let content = vector_bool::scene_content_bounds(scene);
+        if !content.is_empty() {
+            let margin = 1.0;
+            let new_view_box = content.expand(margin);
+            history.execute(
+                Command::SetViewBox {
+                    bounds: new_view_box,
+                },
+                scene,
+            );
+            renderer.mark_dirty();
+        }
     }
 
     // ── File dialogs (blocking — runs after egui pass) ──

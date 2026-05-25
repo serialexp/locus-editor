@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use vector_geom::{Affine, Color, Path, Point, Segment, SubPath, VertexMode};
+use vector_geom::{Affine, Bounds, Color, Path, Point, Segment, SubPath, VertexMode};
 use vector_scene::{Node, TextData};
 use vector_scene::{NodeData, NodeId, Scene, Style};
 
@@ -22,9 +22,72 @@ pub fn import_svg(data: &[u8]) -> Result<Scene, ImportError> {
     // We key by the Arc's raw pointer to avoid creating duplicate paint nodes.
     let mut gradient_cache: HashMap<usize, NodeId> = HashMap::new();
 
-    import_group(tree.root(), &mut scene, root, &mut gradient_cache);
+    // usvg normalises the SVG so that `tree.root()` always sees a viewBox
+    // anchored at (0, 0). If the source file's viewBox had a non-zero origin
+    // (which our own exporter produces whenever content doesn't start at
+    // origin), usvg compensates by wrapping the entire document in a
+    // synthetic `<g transform="translate(-vbX, -vbY)">`. That synthetic group
+    // has no semantic meaning — it would just accumulate as a ghost wrapper
+    // around the scene every round-trip. Strip it here, baking its translate
+    // into the children we import.
+    let (source, pre_transform) = unwrap_viewbox_normalizer(tree.root());
+
+    // Reconstruct the original viewBox: the synthetic wrapper's translate is
+    // (-vbX, -vbY), and the tree's size is the viewBox's width × height.
+    // When no wrapper was present, the viewBox was at origin.
+    let size = tree.size();
+    let (vbx, vby) = if pre_transform.is_identity() {
+        (0.0, 0.0)
+    } else {
+        (-pre_transform.tx, -pre_transform.ty)
+    };
+    scene.set_view_box(Bounds::new(
+        Point::new(vbx, vby),
+        Point::new(vbx + size.width() as f64, vby + size.height() as f64),
+    ));
+
+    import_group(source, &mut scene, root, &mut gradient_cache, pre_transform);
 
     Ok(scene)
+}
+
+/// Detect the synthetic top-level wrapper that usvg injects when an SVG's
+/// viewBox doesn't start at the origin. The wrapper is the sole child of
+/// `tree.root()`, has no id, no clip/mask/filter/opacity/blend, and a
+/// transform that's pure translate (no rotation or scale). When found,
+/// returns the wrapper's *contents* together with the translate that needs
+/// to be applied to each child to preserve world position. Otherwise returns
+/// `(root, IDENTITY)` and import proceeds normally.
+fn unwrap_viewbox_normalizer(root: &usvg::Group) -> (&usvg::Group, Affine) {
+    if root.children().len() != 1 {
+        return (root, Affine::IDENTITY);
+    }
+    let usvg::Node::Group(g) = &root.children()[0] else {
+        return (root, Affine::IDENTITY);
+    };
+    let only_translate = g.transform().sx == 1.0
+        && g.transform().sy == 1.0
+        && g.transform().kx == 0.0
+        && g.transform().ky == 0.0;
+    let unadorned = g.id().is_empty()
+        && g.opacity() == usvg::Opacity::ONE
+        && g.blend_mode() == usvg::BlendMode::Normal
+        && g.clip_path().is_none()
+        && g.mask().is_none()
+        && g.filters().is_empty();
+    if only_translate && unadorned {
+        let t = Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            tx: g.transform().tx as f64,
+            ty: g.transform().ty as f64,
+        };
+        (g, t)
+    } else {
+        (root, Affine::IDENTITY)
+    }
 }
 
 /// Returns true if a usvg Group carries no meaningful attributes beyond
@@ -45,19 +108,24 @@ fn import_group(
     scene: &mut Scene,
     parent: NodeId,
     gradient_cache: &mut HashMap<usize, NodeId>,
+    pre_transform: Affine,
 ) {
     for child in group.children() {
         match child {
             usvg::Node::Group(g) => {
                 if is_trivial_group(g) {
                     // Skip trivial wrapper groups — import children directly
-                    // into the current parent.
-                    import_group(g, scene, parent, gradient_cache);
+                    // into the current parent. The pre-transform propagates
+                    // through transparent wrappers untouched.
+                    import_group(g, scene, parent, gradient_cache, pre_transform);
                 } else {
                     let mut node = Node::group(g.id().to_string());
-                    // Preserve the group's transform.
+                    // Preserve the group's transform, composed with any
+                    // pre-transform from an absorbed wrapper above. The
+                    // pre-transform applies to *this* group's world position,
+                    // so it goes on the outside: world = pre * g.transform.
                     let ut = g.transform();
-                    node.transform = Affine {
+                    let g_t = Affine {
                         a: ut.sx as f64,
                         b: ut.kx as f64,
                         c: ut.ky as f64,
@@ -65,8 +133,15 @@ fn import_group(
                         tx: ut.tx as f64,
                         ty: ut.ty as f64,
                     };
+                    node.transform = if pre_transform.is_identity() {
+                        g_t
+                    } else {
+                        pre_transform.then(g_t)
+                    };
                     if let Some(id) = scene.insert(parent, node) {
-                        import_group(g, scene, id, gradient_cache);
+                        // Children inherit the group's transform naturally
+                        // via the scene graph; no further pre-transform.
+                        import_group(g, scene, id, gradient_cache, Affine::IDENTITY);
                     }
                 }
             }
@@ -77,13 +152,19 @@ fn import_group(
                 if let NodeData::Path { style: s, .. } = &mut node.data {
                     *s = style;
                 }
+                if !pre_transform.is_identity() {
+                    node.transform = pre_transform.then(node.transform);
+                }
                 scene.insert(parent, node);
             }
             usvg::Node::Image(_) => {
                 log::warn!("Image nodes not yet supported, skipping");
             }
             usvg::Node::Text(t) => {
-                let text_node = convert_text(t);
+                let mut text_node = convert_text(t);
+                if !pre_transform.is_identity() {
+                    text_node.transform = pre_transform.then(text_node.transform);
+                }
                 scene.insert(parent, text_node);
             }
         }
@@ -578,7 +659,13 @@ fn convert_paint(
             };
 
             // Recursively import the pattern's children into the content group.
-            import_group(pat.root(), scene, content_id, gradient_cache);
+            import_group(
+                pat.root(),
+                scene,
+                content_id,
+                gradient_cache,
+                Affine::IDENTITY,
+            );
 
             // Create the Pattern paint node.
             let rect = pat.rect();

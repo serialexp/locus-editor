@@ -114,6 +114,17 @@ pub(crate) struct EditorState {
     /// the editor state so per-frame re-flattening is avoided when
     /// nothing the structure panel cares about has changed.
     pub(crate) cached_flatten: Option<crate::structure_panel::FlattenCache>,
+    /// Inline rename in the structure panel. `Some((node, buffer))` while the
+    /// user is editing a row's label; `None` otherwise. Set by double-clicking
+    /// the label area; cleared on commit (Enter / focus loss) or cancel (Esc).
+    pub(crate) structure_rename: Option<(NodeId, String)>,
+    /// Currently focused gradient stop in the properties-panel gradient
+    /// editor: `(paint_node_id, stop_index)`. Set when the user clicks a
+    /// stop marker; consumed by the canvas Delete handler so pressing
+    /// Delete while a stop is focused removes that stop instead of the
+    /// owning object. Cleared when the focused paint node disappears,
+    /// when its stop index goes out of bounds, or when Delete consumes it.
+    pub(crate) gradient_stop_focus: Option<(NodeId, usize)>,
     /// Most recent geometry-snap target, set by `screen_to_canvas_snapped`.
     /// Cleared when the cursor moves without snapping. Consumed by the
     /// renderer to draw an on-canvas indicator at the snap point.
@@ -166,6 +177,8 @@ impl Default for EditorState {
             structure_collapse: HashMap::new(),
             structure_collapse_rev: 0,
             cached_flatten: None,
+            structure_rename: None,
+            gradient_stop_focus: None,
             last_snap: None,
             recent_files: RecentFiles::load(),
             llm_dialog: None,
@@ -555,6 +568,147 @@ impl EditorState {
             return None;
         };
         Some(path.clone())
+    }
+
+    /// Nudge the current selection by a world-space delta `(dx, dy)`.
+    /// Vertex selection wins over object selection (matches drag-tool
+    /// precedence). Records a single undo command per call. Returns `true`
+    /// if anything moved.
+    ///
+    /// Caller is responsible for picking `dx`/`dy` — typically derived from
+    /// camera zoom so that the on-screen step is constant (e.g. 1 screen
+    /// pixel per tap → `1.0 / zoom` canvas units).
+    pub(crate) fn nudge_selection(&mut self, dx: f64, dy: f64) -> bool {
+        if dx == 0.0 && dy == 0.0 {
+            return false;
+        }
+
+        // Vertex nudge: translate every selected vertex, snapshot+undo
+        // path data for affected nodes. Mirrors `record_vertex_drag_undo`.
+        if !self.select_state.selected.is_empty() {
+            self.snapshot_selected_vertex_paths();
+            let mut moved = false;
+            for vr in self.select_state.selected.clone() {
+                let world = self.scene.world_transform(vr.node);
+                let (lx, ly) = if world.is_identity() {
+                    (dx, dy)
+                } else if let Some(inv) = world.inverse() {
+                    (inv.a * dx + inv.b * dy, inv.c * dx + inv.d * dy)
+                } else {
+                    continue;
+                };
+                vr.translate(&mut self.scene, lx, ly);
+                if matches!(
+                    vr.kind,
+                    vector_tools::PointKind::CubicCtrl1
+                        | vector_tools::PointKind::CubicCtrl2
+                        | vector_tools::PointKind::QuadCtrl
+                ) {
+                    vector_tools::enforce_vertex_constraint(&vr, &mut self.scene);
+                }
+                moved = true;
+            }
+            if moved {
+                self.record_vertex_drag_undo();
+            } else {
+                // Discard the snapshot we took above.
+                self.drag_path_snapshots.clear();
+            }
+            return moved;
+        }
+
+        // Object nudge: translate every selected node's transform.
+        if !self.select_state.selected_nodes.is_empty() {
+            self.snapshot_selected_transforms();
+            let mut moved = false;
+            for &node_id in &self.select_state.selected_nodes.clone() {
+                let parent_world = self.scene.parent_world_transform(node_id);
+                let (local_dx, local_dy) = if parent_world.is_identity() {
+                    (dx, dy)
+                } else if let Some(inv) = parent_world.inverse() {
+                    (inv.a * dx + inv.b * dy, inv.c * dx + inv.d * dy)
+                } else {
+                    continue;
+                };
+                if let Some(node) = self.scene.get(node_id) {
+                    let mut t = node.transform;
+                    t.tx += local_dx;
+                    t.ty += local_dy;
+                    self.scene.set_transform(node_id, t);
+                    moved = true;
+                }
+            }
+            if moved {
+                self.record_object_drag_undo();
+            } else {
+                self.drag_transform_snapshots.clear();
+            }
+            return moved;
+        }
+
+        false
+    }
+
+    /// If a gradient stop is currently focused (via the properties-panel
+    /// gradient editor) AND the focused gradient is being used by one of
+    /// the selected nodes' fill or stroke, remove that stop with undo
+    /// support and return `true`. Otherwise return `false`, letting the
+    /// caller fall through to normal selection delete.
+    ///
+    /// Refuses to delete if the gradient would drop below 2 stops, since
+    /// `show_gradient_editor` maintains the same invariant.
+    pub(crate) fn try_delete_focused_gradient_stop(&mut self) -> bool {
+        let Some((paint_id, idx)) = self.gradient_stop_focus else {
+            return false;
+        };
+        // Only consume the focus when the focused paint is referenced by
+        // the current selection. Otherwise the user has clicked away to a
+        // different shape and Delete should target that shape.
+        let used_by_selection = self.select_state.selected_nodes.iter().any(|&nid| {
+            let Some(node) = self.scene.get(nid) else {
+                return false;
+            };
+            let mut found = false;
+            node.for_each_paint_ref(|p| {
+                if matches!(p, vector_scene::PaintRef::Ref(id) if *id == paint_id) {
+                    found = true;
+                }
+            });
+            found
+        });
+        if !used_by_selection {
+            return false;
+        }
+        let Some(node) = self.scene.get(paint_id) else {
+            self.gradient_stop_focus = None;
+            return false;
+        };
+        let vector_scene::NodeData::Paint(vector_scene::Paint::Gradient(g)) = &node.data else {
+            self.gradient_stop_focus = None;
+            return false;
+        };
+        if idx >= g.stops.len() {
+            self.gradient_stop_focus = None;
+            return false;
+        }
+        if g.stops.len() <= 2 {
+            // Gradients must keep ≥2 stops; fall through silently rather
+            // than fall back to deleting the owning object — the user
+            // didn't ask for that.
+            return false;
+        }
+        let mut new_g = g.clone();
+        new_g.stops.remove(idx);
+        let new_focus_idx = idx.min(new_g.stops.len() - 1);
+        self.history.execute(
+            Command::SetGradient {
+                id: paint_id,
+                gradient: new_g,
+            },
+            &mut self.scene,
+        );
+        self.gradient_stop_focus = Some((paint_id, new_focus_idx));
+        true
     }
 
     /// Delete the current selection with proper undo recording.

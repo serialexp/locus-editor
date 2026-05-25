@@ -23,6 +23,7 @@ pub(crate) fn show_properties(
     selection: &SelectState,
     renderer: &mut Renderer,
     structure_cmds: &mut StructureCommands,
+    stop_focus: &mut Option<(vector_scene::NodeId, usize)>,
 ) {
     if selection.selected_nodes.is_empty() {
         ui.label("No selection");
@@ -605,6 +606,7 @@ pub(crate) fn show_properties(
                     bbox,
                     "fill",
                     &mut gradient_undos,
+                    stop_focus,
                 ) {
                     changed = true;
                 }
@@ -652,6 +654,7 @@ pub(crate) fn show_properties(
                     bbox,
                     "stroke",
                     &mut gradient_undos,
+                    stop_focus,
                 ) {
                     changed = true;
                 }
@@ -807,6 +810,7 @@ fn paint_section_editor(
     bbox: vector_geom::Bounds,
     id_source: &str,
     gradient_undos: &mut Vec<Command>,
+    stop_focus: &mut Option<(vector_scene::NodeId, usize)>,
 ) -> bool {
     use vector_scene::{NodeData, Paint, PaintRef};
 
@@ -868,8 +872,14 @@ fn paint_section_editor(
                 && let NodeData::Paint(Paint::Gradient(g)) = &grad_node.data
             {
                 let mut new_grad = g.clone();
-                if crate::gradient_editor::show_gradient_editor(ui, &mut new_grad, scene, id_source)
-                    && let Some(old) = scene.set_gradient(grad_id, new_grad)
+                if crate::gradient_editor::show_gradient_editor(
+                    ui,
+                    &mut new_grad,
+                    scene,
+                    id_source,
+                    grad_id,
+                    stop_focus,
+                ) && let Some(old) = scene.set_gradient(grad_id, new_grad)
                 {
                     gradient_undos.push(Command::SetGradient {
                         id: grad_id,

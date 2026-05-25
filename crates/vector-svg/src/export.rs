@@ -9,22 +9,16 @@ use vector_scene::{
 
 /// Export a scene graph to an SVG string.
 pub fn export_svg(scene: &Scene) -> String {
-    // Use the boolean-group-aware content bounds so Intersect/Difference
-    // groups contribute their tight baked bounds, not their operand union.
-    let bounds = vector_bool::scene_content_bounds(scene);
-    let (vx, vy, vw, vh) = if bounds.is_empty() {
+    // Emit the document's stored viewBox verbatim. This is the page
+    // rectangle the user sees in the editor — it comes from the imported
+    // file or from explicit actions like "Fit Page to Content"; it is NOT
+    // recomputed at save time. That makes round-trips byte-stable and gives
+    // the user direct control over what viewers see when they open the file.
+    let vb = scene.view_box();
+    let (vx, vy, vw, vh) = if vb.is_empty() {
         (0.0, 0.0, 800.0, 600.0)
     } else {
-        // content_bounds() already includes stroke visual expansion;
-        // add a small extra margin as a safety buffer for anti-aliasing
-        // and acute-angle miter joins (which can exceed width/2).
-        let margin = 1.0;
-        (
-            bounds.min.x - margin,
-            bounds.min.y - margin,
-            bounds.width() + 2.0 * margin,
-            bounds.height() + 2.0 * margin,
-        )
+        (vb.min.x, vb.min.y, vb.width(), vb.height())
     };
 
     // Build paint label map: NodeId → SVG id string (gradients + patterns).

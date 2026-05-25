@@ -170,8 +170,11 @@ pub(crate) fn render_virtual_row(
     reorder_cmd: &mut ReorderCommand,
     structure_cmds: &mut StructureCommands,
     scene_dirty: &mut bool,
+    rename: &mut Option<(NodeId, String)>,
 ) {
     profiling::scope!("render_virtual_row");
+
+    let is_renaming = rename.as_ref().is_some_and(|(id, _)| *id == row.node_id);
 
     let node_selected = selection.is_node_selected(row.node_id);
     // Locked rows render with muted text for the same reason hidden ones do:
@@ -322,29 +325,103 @@ pub(crate) fn render_virtual_row(
     }
     cursor_x += LOCK_W + GLYPH_GAP;
 
-    // Icon + label, painted directly.
-    let label_text = format!("{} {}", row.icon, row.label);
+    // Paint the icon first — the editable label sits to its right.
+    let icon_text = format!("{} ", row.icon);
+    let icon_galley = ui
+        .painter()
+        .layout_no_wrap(icon_text.clone(), font_id.clone(), text_color);
+    let icon_width = icon_galley.size().x;
     ui.painter().text(
         egui::pos2(cursor_x, row_rect.center().y),
         egui::Align2::LEFT_CENTER,
-        &label_text,
+        &icon_text,
+        font_id.clone(),
+        text_color,
+    );
+
+    let label_left = cursor_x + icon_width;
+    let label_area = egui::Rect::from_min_max(
+        egui::pos2(label_left, row_rect.top()),
+        row_rect.right_bottom(),
+    );
+
+    if is_renaming {
+        // Inline rename in progress: replace the painted label with a
+        // singleline TextEdit. Commit on Enter or focus loss; cancel on Esc.
+        let Some((_, buf)) = rename.as_mut() else {
+            unreachable!("is_renaming implies rename is Some");
+        };
+        // Reserve a slightly narrower rect so the TextEdit doesn't slam into
+        // the scrollbar.
+        let edit_rect = egui::Rect::from_min_max(
+            egui::pos2(label_left, row_rect.top() + 1.0),
+            egui::pos2(row_rect.right() - 4.0, row_rect.bottom() - 1.0),
+        );
+        let resp = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(edit_rect), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(buf)
+                        .id(egui::Id::new(("rename_edit", row.node_id)))
+                        .desired_width(edit_rect.width())
+                        .margin(egui::vec2(2.0, 0.0)),
+                )
+            })
+            .inner;
+
+        // First frame: grab focus + select all so the user can just type.
+        if !resp.has_focus() && !resp.lost_focus() {
+            resp.request_focus();
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
+                let len = buf.chars().count();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(len),
+                    )));
+                state.store(ui.ctx(), resp.id);
+            }
+        }
+
+        let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        if escape_pressed {
+            *rename = None;
+        } else if (enter_pressed || resp.lost_focus())
+            && let Some((id, new_label)) = rename.take()
+        {
+            let trimmed = new_label.trim().to_string();
+            if !trimmed.is_empty() {
+                scene.set_label(id, trimmed);
+                *scene_dirty = true;
+            }
+        }
+        // Don't expose row click/drag/context-menu interactions while editing.
+        return;
+    }
+
+    // Not renaming: paint the label text and treat the label area as
+    // click+drag target.
+    ui.painter().text(
+        egui::pos2(label_left, row_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &row.label,
         font_id,
         text_color,
     );
 
-    // The "rest of the row" (everything right of the eye) is the row's
-    // click + drag target.
-    let label_area = egui::Rect::from_min_max(
-        egui::pos2(cursor_x, row_rect.top()),
-        row_rect.right_bottom(),
-    );
     let row_response = ui.interact(
         label_area,
         egui::Id::new(("row_click", row.node_id)),
         egui::Sense::click_and_drag(),
     );
 
-    if row_response.clicked() {
+    if row_response.double_clicked() && !row.is_defs {
+        // Enter inline rename. Initialise buffer with the current label so
+        // the user can extend or replace it.
+        *rename = Some((row.node_id, row.label.clone()));
+    } else if row_response.clicked() {
         let shift = ui.input(|i| i.modifiers.shift);
         let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
         structure_panel_click(selection, row.node_id, shift || ctrl);
@@ -599,33 +676,21 @@ pub(crate) fn apply_structure_action(action: StructureAction, state: &mut Editor
             }
             let children: Vec<NodeId> = group_node.children.clone();
             if children.is_empty() {
-                // Just delete the empty group.
+                // Just delete the empty group — nothing to reparent, so
+                // the dedicated Command::Ungroup machinery isn't needed.
                 state
                     .history
                     .execute(Command::Delete { id: group }, &mut state.scene);
                 return;
             }
 
-            let Some(parent) = state.scene.parent(group) else {
-                return;
-            };
-            let group_index = state.scene.child_index(group).unwrap_or(0);
-
-            // Reparent each child to the group's parent, at sequential indices
-            // starting from the group's current position.
-            let mut reparent_cmds = Vec::new();
-            for (i, &child) in children.iter().enumerate() {
-                reparent_cmds.push(Command::Reparent {
-                    id: child,
-                    new_parent: parent,
-                    index: group_index + i,
-                });
-            }
-            reparent_cmds.push(Command::Delete { id: group });
-
+            // Run the atomic ungroup command. It folds the group's
+            // transform into each child, reparents them, and deletes the
+            // (now empty) group, with a single Regroup undo that
+            // preserves the original children's NodeIds.
             state
                 .history
-                .execute(Command::Batch(reparent_cmds), &mut state.scene);
+                .execute(Command::Ungroup { group }, &mut state.scene);
 
             // Select the ungrouped children.
             state.select_state.selected_nodes = children;

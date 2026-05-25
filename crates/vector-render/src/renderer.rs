@@ -637,7 +637,7 @@ impl Renderer {
         // Rebuild grid every frame (depends on camera, which changes without dirtying scene)
         {
             profiling::scope!("build_grid");
-            self.build_grid(device);
+            self.build_grid(device, scene);
         }
 
         // Rebuild handle overlay only when its inputs change. Inputs are:
@@ -1411,7 +1411,7 @@ impl Renderer {
     /// A two-tone checkerboard is also drawn behind the lines so that
     /// transparent fills in the scene visibly composite over a "missing
     /// pixels" pattern (the same convention used by Photoshop, Krita, etc).
-    fn build_grid(&mut self, device: &wgpu::Device) {
+    fn build_grid(&mut self, device: &wgpu::Device, scene: &Scene) {
         let mut verts: Vec<Vertex> = Vec::new();
         let mut idxs: Vec<u32> = Vec::new();
 
@@ -1545,6 +1545,88 @@ impl Renderer {
                 y += cell_size;
                 row += 1;
             }
+        }
+
+        // ── Page rectangle ───────────────────────────────────────────
+        // Draw the document's viewBox as a "page" — a soft drop shadow,
+        // a flat white fill that paints over the checkerboard inside the
+        // page area, and a thin border so the page edge stays visible
+        // even when the fill matches surrounding light backgrounds.
+        // Sits above the checkerboard but below the grid lines, so the
+        // grid is drawn on top of the page (matches Inkscape's layering).
+        let view_box = scene.view_box();
+        if !view_box.is_empty() {
+            let px = view_box.min.x as f32;
+            let py = view_box.min.y as f32;
+            let pw = view_box.width() as f32;
+            let ph = view_box.height() as f32;
+            let cx = px + pw * 0.5;
+            let cy = py + ph * 0.5;
+            let hx = pw * 0.5;
+            let hy = ph * 0.5;
+
+            // Drop shadow: a slightly larger, darker quad offset down-right.
+            // Offset scales inversely with zoom so it stays a few screen
+            // pixels regardless of zoom level.
+            let shadow_offset = 4.0 / zoom;
+            let shadow_color: [f32; 4] = [0.0, 0.0, 0.0, 0.25];
+            push_quad(
+                &mut verts,
+                &mut idxs,
+                cx + shadow_offset,
+                cy + shadow_offset,
+                hx,
+                hy,
+                shadow_color,
+            );
+
+            // Page fill — translucent white. Kept semi-transparent so the
+            // alpha checkerboard remains visible behind the page area; this
+            // way the user can tell that the page itself is "nothing" yet,
+            // and any actual transparent content composited on top still
+            // shows the checker the way they expect.
+            let page_color: [f32; 4] = [1.0, 1.0, 1.0, 0.4];
+            push_quad(&mut verts, &mut idxs, cx, cy, hx, hy, page_color);
+
+            // Border — thin dark line around the page rectangle.
+            let border_thickness = 1.0 / zoom;
+            let border_color: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
+            let tl = Point::new(px as f64, py as f64);
+            let tr = Point::new((px + pw) as f64, py as f64);
+            let bl = Point::new(px as f64, (py + ph) as f64);
+            let br = Point::new((px + pw) as f64, (py + ph) as f64);
+            push_line(
+                &mut verts,
+                &mut idxs,
+                tl,
+                tr,
+                border_thickness,
+                border_color,
+            );
+            push_line(
+                &mut verts,
+                &mut idxs,
+                tr,
+                br,
+                border_thickness,
+                border_color,
+            );
+            push_line(
+                &mut verts,
+                &mut idxs,
+                br,
+                bl,
+                border_thickness,
+                border_color,
+            );
+            push_line(
+                &mut verts,
+                &mut idxs,
+                bl,
+                tl,
+                border_thickness,
+                border_color,
+            );
         }
 
         // Determine whether minor lines are visible:

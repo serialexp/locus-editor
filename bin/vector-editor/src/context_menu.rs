@@ -88,6 +88,26 @@ pub(crate) fn show_canvas_context_menu(
                                 action = Some(CanvasContextAction::DeleteVertex(vr));
                                 close = true;
                             }
+                        } else {
+                            // Control point. Two actions, both gated on the
+                            // surrounding segment geometry so we never offer
+                            // a no-op item.
+                            if ui.button("Retract handle").clicked() {
+                                action = Some(CanvasContextAction::RetractControl(vr));
+                                close = true;
+                            }
+                            if SelectState::can_mirror_control(&state.scene, &vr)
+                                && ui
+                                    .button("Mirror to opposite handle")
+                                    .on_hover_text(
+                                        "Reflect this control across its anchor onto \
+                                         the other side, producing a symmetric curve.",
+                                    )
+                                    .clicked()
+                            {
+                                action = Some(CanvasContextAction::MirrorControl(vr));
+                                close = true;
+                            }
                         }
                     }
                     Some(CanvasContextMenu {
@@ -161,6 +181,8 @@ enum CanvasContextAction {
     DeleteVertex(VertexRef),
     ConvertSegment(EdgeHit, vector_tools::SegmentKind),
     InsertVertex(EdgeHit),
+    RetractControl(VertexRef),
+    MirrorControl(VertexRef),
 }
 
 fn apply_canvas_context_action(
@@ -239,6 +261,38 @@ fn apply_canvas_context_action(
             if let Some(vr) = SelectState::insert_point_on_edge(&mut state.scene, &hit) {
                 state.select_state.selected.clear();
                 state.select_state.selected.push(vr);
+                renderer.mark_dirty();
+            }
+        }
+        CanvasContextAction::RetractControl(vr) => {
+            // Snapshot for undo.
+            if let Some(node) = state.scene.get(vr.node)
+                && let NodeData::Path { ref path, .. } = node.data
+            {
+                state.history.record_undo(Command::SetPathData {
+                    id: vr.node,
+                    path: path.clone(),
+                });
+            }
+            if SelectState::retract_control(&mut state.scene, &vr) {
+                // The control point we were referencing no longer exists
+                // (the segment downgraded). Drop any vertex selection
+                // pointing at it so we don't render a stale handle.
+                state.select_state.selected.retain(|v| v != &vr);
+                renderer.mark_dirty();
+            }
+        }
+        CanvasContextAction::MirrorControl(vr) => {
+            // Snapshot for undo.
+            if let Some(node) = state.scene.get(vr.node)
+                && let NodeData::Path { ref path, .. } = node.data
+            {
+                state.history.record_undo(Command::SetPathData {
+                    id: vr.node,
+                    path: path.clone(),
+                });
+            }
+            if SelectState::mirror_control_across_anchor(&mut state.scene, &vr) {
                 renderer.mark_dirty();
             }
         }
