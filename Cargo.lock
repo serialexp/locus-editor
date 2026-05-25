@@ -4858,7 +4858,7 @@ checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 
 [[package]]
 name = "vector-bool"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "i_overlay",
  "lyon_geom",
@@ -4869,7 +4869,7 @@ dependencies = [
 
 [[package]]
 name = "vector-editor"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "directories",
  "egui",
@@ -4903,7 +4903,7 @@ dependencies = [
 
 [[package]]
 name = "vector-geom"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "bytemuck",
  "kurbo 0.11.3",
@@ -4912,7 +4912,7 @@ dependencies = [
 
 [[package]]
 name = "vector-llm"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "keyring",
  "log",
@@ -4924,7 +4924,7 @@ dependencies = [
 
 [[package]]
 name = "vector-ops"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "vector-geom",
  "vector-scene",
@@ -4932,7 +4932,7 @@ dependencies = [
 
 [[package]]
 name = "vector-render"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "bytemuck",
  "log",
@@ -4949,7 +4949,7 @@ dependencies = [
 
 [[package]]
 name = "vector-scene"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "slotmap",
@@ -4960,7 +4960,7 @@ dependencies = [
 
 [[package]]
 name = "vector-svg"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "log",
  "usvg",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "vector-tess"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "bytemuck",
  "lyon_geom",
@@ -4984,7 +4984,7 @@ dependencies = [
 
 [[package]]
 name = "vector-text"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "fontdb",
  "log",
@@ -4995,7 +4995,7 @@ dependencies = [
 
 [[package]]
 name = "vector-tools"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "egui-phosphor",
  "vector-bool",
@@ -5008,7 +5008,7 @@ dependencies = [
 
 [[package]]
 name = "vector-trace"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "image 0.25.10",
  "log",
