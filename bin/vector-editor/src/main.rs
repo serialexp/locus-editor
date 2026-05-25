@@ -1,7 +1,6 @@
 mod app;
 mod camera;
 mod context_menu;
-mod demo;
 mod editor_state;
 mod gradient_editor;
 mod hud;
@@ -12,6 +11,7 @@ mod properties_panel;
 mod recent_files;
 mod snap;
 mod structure_panel;
+mod svg_drop_dialog;
 mod trace_dialog;
 mod ui;
 mod util;

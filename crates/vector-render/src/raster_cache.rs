@@ -34,13 +34,13 @@ pub struct GpuRasterDraw {
 }
 
 impl GpuRasterDraw {
-    pub fn new(transform: &Affine, width: f64, height: f64) -> Self {
+    pub fn new(transform: &Affine, width: f64, height: f64, alpha_mul: f32) -> Self {
         Self {
             row0: [
                 transform.a as f32,
                 transform.b as f32,
                 transform.tx as f32,
-                0.0,
+                alpha_mul,
             ],
             row1: [
                 transform.c as f32,

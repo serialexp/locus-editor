@@ -18,7 +18,9 @@ struct Globals {
 
 struct RasterDraw {
     // World-space affine transform, matching `GpuTransform` packing in
-    // shader.wgsl: row0 = (a, b, tx, _), row1 = (c, d, ty, _).
+    // shader.wgsl: row0 = (a, b, tx, alpha_mul), row1 = (c, d, ty, _).
+    // `alpha_mul` is a per-instance opacity multiplier (1.0 = no effect),
+    // used to dim out-of-scope nodes when group isolation is active.
     row0: vec4<f32>,
     row1: vec4<f32>,
     // Local-space box dimensions: (width, height, _pad, _pad).
@@ -40,6 +42,7 @@ var<uniform> raster: RasterDraw;
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) alpha_mul: f32,
 };
 
 @vertex
@@ -68,10 +71,13 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     // UVs are the unit-square coordinates; (0,0) = top-left of the image
     // since textures and our local space share a y-down convention here.
     out.uv = p_unit;
+    out.alpha_mul = raster.row0.w;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(raster_tex, raster_samp, in.uv);
+    var color = textureSample(raster_tex, raster_samp, in.uv);
+    color.a *= in.alpha_mul;
+    return color;
 }

@@ -122,6 +122,24 @@ impl Scene {
         self.parents.get(id).copied()
     }
 
+    /// Whether `id` is `ancestor` itself or a transitive descendant of it.
+    /// Walks the parent chain — bounded by tree depth, which is small in
+    /// practice. Useful for "is this node inside that subtree" checks
+    /// without materializing the descendant set.
+    pub fn is_descendant_or_self(&self, id: NodeId, ancestor: NodeId) -> bool {
+        if id == ancestor {
+            return true;
+        }
+        let mut cur = id;
+        while let Some(parent) = self.parent(cur) {
+            if parent == ancestor {
+                return true;
+            }
+            cur = parent;
+        }
+        false
+    }
+
     // ── Revision accessors ─────────────────────────────────────────
 
     /// Current geometry revision for `id` (0 if missing).

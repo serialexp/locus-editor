@@ -48,18 +48,15 @@ pub(crate) fn paint_transparency_checkerboard(
 }
 
 /// Compute the combined world-space bounding box for a set of node IDs.
+///
+/// Delegates to `vector_bool::selection_visual_bounds`, which is group-aware:
+/// for a regular Group it recursively unions visible descendant bounds, and
+/// for a Boolean Group it uses the baked computed-path bounds. The naive
+/// `NodeData::visual_bounds` returns `Bounds::EMPTY` for groups (groups have
+/// no intrinsic geometry), so using it directly would hide groups from the
+/// properties panel's W/H readout.
 pub(crate) fn combined_bounds(scene: &Scene, node_ids: &[NodeId]) -> vector_geom::Bounds {
-    let mut combined = vector_geom::Bounds::EMPTY;
-    for &id in node_ids {
-        if let Some(node) = scene.get(id) {
-            let world = scene.world_transform(id);
-            let b = node.data.visual_bounds(world);
-            if !b.is_empty() {
-                combined = combined.union(b);
-            }
-        }
-    }
-    combined
+    vector_bool::selection_visual_bounds(scene, node_ids)
 }
 
 /// Build the display label and icon for a scene node. Used by both the

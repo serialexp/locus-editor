@@ -3,6 +3,21 @@ use vector_scene::{
     FillRule, Gradient, GradientKind, GroupKind, NodeData, NodeId, Paint, PaintRef, Scene,
 };
 
+/// Whether `id` is a (transitive) descendant of `ancestor`. Walks the
+/// parent chain — bounded by tree depth, which is small in practice.
+/// Returns `false` when `id == ancestor` (a node is not its own
+/// descendant).
+fn scene_node_is_descendant(scene: &Scene, id: NodeId, ancestor: NodeId) -> bool {
+    let mut cur = id;
+    while let Some(parent) = scene.parent(cur) {
+        if parent == ancestor {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
 /// Compute the world-space bounding box for a node's visual content,
 /// including the visible stroke area around the geometry.
 ///
@@ -730,6 +745,11 @@ pub struct SelectState {
     /// Shown when the cursor is near an edge but not near an existing vertex,
     /// indicating where a double-click would insert a new point.
     pub edge_hover_point: Option<Point>,
+    /// The segment currently under the cursor in node mode (if any).
+    /// Drives a segment-highlight overlay so the user can see which segment
+    /// a right-click context menu would act on. Always `None` outside Node
+    /// mode and when a vertex handle is hovered (vertex hover wins).
+    pub edge_hover_hit: Option<EdgeHit>,
     /// Gradient handle currently under the cursor — when an Object-mode
     /// selected path has a gradient fill or stroke. Vertex handles still
     /// win the priority order in Node mode.
@@ -738,6 +758,14 @@ pub struct SelectState {
     drag_mode: DragMode,
     /// Whether we're in object mode (bounding box) or node mode (vertex handles).
     pub mode: SelectionMode,
+    /// Group isolation stack — outermost-first list of Regular groups the
+    /// user has "entered" via double-click. The innermost (last) is the
+    /// current scope; clicks resolve to its direct children, and marquee
+    /// only picks direct children. Empty = top-level scope (the scene
+    /// root). Stored as a stack so that deleting an entered group can
+    /// auto-fall-back to the next outer scope rather than dropping all
+    /// the way to the top.
+    group_scope_stack: Vec<NodeId>,
 }
 
 impl Default for SelectState {
@@ -748,9 +776,11 @@ impl Default for SelectState {
             selected: Vec::new(),
             hovered: None,
             edge_hover_point: None,
+            edge_hover_hit: None,
             gradient_hovered: None,
             drag_mode: DragMode::Idle,
             mode: SelectionMode::Object,
+            group_scope_stack: Vec::new(),
         }
     }
 }
@@ -759,7 +789,7 @@ impl Default for SelectState {
 const HIT_RADIUS_SCREEN_PX: f64 = 8.0;
 
 /// A hit on a path edge (between vertices), used for inserting new points.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EdgeHit {
     /// Which node.
     pub node: NodeId,
@@ -772,6 +802,138 @@ pub struct EdgeHit {
 }
 
 impl SelectState {
+    // ── Group isolation scope ────────────────────────────────────────
+
+    /// The currently entered Regular group, or `None` for top-level
+    /// scope. When set, clicks resolve to direct children of this group
+    /// rather than to top-level groups, and marquee only picks direct
+    /// children. Inkscape calls this "isolation mode".
+    pub fn group_scope(&self) -> Option<NodeId> {
+        self.group_scope_stack.last().copied()
+    }
+
+    /// Returns the node ID whose direct children are the current scope's
+    /// pick targets — the innermost entered group, or the scene root if
+    /// no group is entered.
+    fn scope_root(&self, scene: &Scene) -> NodeId {
+        self.group_scope_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| scene.root())
+    }
+
+    /// Walk up from `leaf` toward the current scope root and return the
+    /// ancestor that is a *direct* child of the scope root — i.e. the
+    /// outermost group whose contents the leaf belongs to. If the leaf
+    /// is itself a direct child of the scope root, returns `leaf`. Used
+    /// to implement "click selects the topmost group, not the leaf".
+    pub fn resolve_pick_in_scope(&self, scene: &Scene, leaf: NodeId) -> NodeId {
+        let scope_root = self.scope_root(scene);
+        if leaf == scope_root {
+            return leaf;
+        }
+        let mut current = leaf;
+        while let Some(parent) = scene.parent(current) {
+            if parent == scope_root {
+                return current;
+            }
+            current = parent;
+        }
+        // The leaf isn't a descendant of the current scope — possible if
+        // the scope was stale. Return the leaf and let validate_group_scope
+        // clean up.
+        leaf
+    }
+
+    /// Enter a Regular group: subsequent picks resolve relative to it
+    /// and marquee selection picks only its direct children. Pushes the
+    /// group onto the scope stack and clears any object/vertex selection
+    /// from the outer scope. No-op if `id` is not a Regular group, isn't
+    /// in the scene, or is already at the top of the stack.
+    pub fn enter_group(&mut self, scene: &Scene, id: NodeId) -> bool {
+        let Some(node) = scene.get(id) else {
+            return false;
+        };
+        if !matches!(
+            node.data,
+            NodeData::Group {
+                kind: GroupKind::Regular,
+                ..
+            }
+        ) {
+            return false;
+        }
+        if self.group_scope_stack.last() == Some(&id) {
+            return false;
+        }
+        self.group_scope_stack.push(id);
+        self.selected_nodes.clear();
+        self.selected.clear();
+        self.mode = SelectionMode::Object;
+        true
+    }
+
+    /// Pop one level off the group scope stack. Returns true if the
+    /// scope changed. Bound to Esc when nothing else needs it.
+    pub fn exit_group_scope(&mut self) -> bool {
+        if self.group_scope_stack.pop().is_some() {
+            self.selected_nodes.clear();
+            self.selected.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Truncate the scope stack to `depth` entries. Used by the
+    /// breadcrumb to jump to a specific level in one click — `depth = 0`
+    /// returns to top-level scope; `depth = N` keeps the first N entered
+    /// groups. No-op if `depth` is already the current depth or larger.
+    /// Returns true if anything was popped.
+    pub fn truncate_group_scope(&mut self, depth: usize) -> bool {
+        if self.group_scope_stack.len() <= depth {
+            return false;
+        }
+        self.group_scope_stack.truncate(depth);
+        self.selected_nodes.clear();
+        self.selected.clear();
+        true
+    }
+
+    /// Read access to the entered-group stack, outermost-first. Used by
+    /// the breadcrumb UI to render one segment per level.
+    pub fn group_scope_path(&self) -> &[NodeId] {
+        &self.group_scope_stack
+    }
+
+    /// Drop scope-stack entries whose group nodes no longer exist in the
+    /// scene. Call after structural changes (delete, undo/redo) so a
+    /// dangling scope falls back to the nearest still-living ancestor —
+    /// or to top-level if none survives.
+    pub fn validate_group_scope(&mut self, scene: &Scene) {
+        let mut changed = false;
+        while let Some(&id) = self.group_scope_stack.last() {
+            let still_valid = scene.get(id).is_some_and(|n| {
+                matches!(
+                    n.data,
+                    NodeData::Group {
+                        kind: GroupKind::Regular,
+                        ..
+                    }
+                )
+            });
+            if still_valid {
+                break;
+            }
+            self.group_scope_stack.pop();
+            changed = true;
+        }
+        if changed {
+            self.selected_nodes.clear();
+            self.selected.clear();
+        }
+    }
+
     // ── Vertex-level hit testing ─────────────────────────────────────
 
     /// Find the closest vertex to `canvas_pos` within a screen-space radius,
@@ -1000,18 +1162,15 @@ impl SelectState {
     // ── Rotation zone hit-testing ─────────────────────────────────────
 
     /// Compute the combined world-space bounding box of all object-selected nodes.
+    ///
+    /// Delegates to `vector_bool::selection_visual_bounds`, which is group-aware:
+    /// for a regular Group it recursively unions the visible descendants' bounds
+    /// rather than relying on `NodeData::visual_bounds`, which is intentionally
+    /// `Bounds::EMPTY` for groups (groups have no intrinsic geometry of their
+    /// own). Without this, selecting a group produces an empty selection bbox,
+    /// which makes the scale handles and rotation zone untestable.
     pub fn selection_bounds(&self, scene: &Scene) -> Bounds {
-        let mut combined = Bounds::EMPTY;
-        for &id in &self.selected_nodes {
-            if let Some(node) = scene.get(id) {
-                let world = scene.world_transform(id);
-                let b = node_bounds(scene, id, &node.data, world);
-                if !b.is_empty() {
-                    combined = combined.union(b);
-                }
-            }
-        }
-        combined
+        vector_bool::selection_visual_bounds(scene, &self.selected_nodes)
     }
 
     /// Test whether `canvas_pos` is in the rotation zone: near a corner of
@@ -1097,18 +1256,32 @@ impl SelectState {
             changed = true;
         }
 
-        // When no vertex is hovered, check for an edge nearby to show
-        // a ghost insertion point.
-        let new_edge_pt = if self.mode == SelectionMode::Node
+        // When no vertex is hovered, check for an edge nearby. We populate
+        // both `edge_hover_point` (the ghost insertion ball) and
+        // `edge_hover_hit` (the full segment for the highlight overlay)
+        // from the same hit test so they're never out of sync.
+        let (new_edge_pt, new_edge_hit) = if self.mode == SelectionMode::Node
             && self.hovered.is_none()
             && !self.selected_nodes.is_empty()
         {
-            Self::edge_hover_position(scene, canvas_pos, zoom, &self.selected_nodes)
+            match Self::edge_hit_test(scene, canvas_pos, zoom, &self.selected_nodes) {
+                Some(hit) => {
+                    // Reconstruct the world-space point on the segment at
+                    // parameter `t` for the ghost-insertion marker.
+                    let pt = Self::edge_hover_point_from_hit(scene, &hit);
+                    (pt, Some(hit))
+                }
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         if new_edge_pt != self.edge_hover_point {
             self.edge_hover_point = new_edge_pt;
+            changed = true;
+        }
+        if new_edge_hit != self.edge_hover_hit {
+            self.edge_hover_hit = new_edge_hit;
             changed = true;
         }
 
@@ -1242,16 +1415,25 @@ impl SelectState {
     /// 1. Object hit → object select.
     /// 2. Empty space → clear all, start marquee.
     ///
-    /// `alt`: when true and clicking on a stack of overlapping shapes,
-    /// pick the next shape *under* the currently-selected top one
-    /// (Inkscape's standard "alt-click cycle"). Without `alt` the
-    /// front-most fill-aware hit is picked, same as before.
+    /// Group / pierce / cycle modifiers:
+    /// - **default** (no `alt`, no `ctrl`): the click resolves to the
+    ///   *outermost* group ancestor that lives in the current isolation
+    ///   scope — i.e. you select the whole group, not a leaf inside it.
+    ///   Matches Inkscape / Illustrator default click behaviour.
+    /// - **`alt`** alone: pierce — pick the leaf-most shape under the
+    ///   cursor, ignoring its enclosing groups.
+    /// - **`alt` + `ctrl`**: pierce + cycle stacked overlapping shapes
+    ///   (the candidate just *behind* the currently-selected top one,
+    ///   wrapping). This was the old plain-Alt cycle behaviour.
+    /// - **`shift`** is independent and toggles the resolved hit in/out
+    ///   of the existing selection.
     pub fn on_press(
         &mut self,
         scene: &Scene,
         canvas_pos: [f64; 2],
         shift: bool,
         alt: bool,
+        ctrl: bool,
         zoom: f64,
     ) {
         if self.mode == SelectionMode::Node {
@@ -1349,15 +1531,29 @@ impl SelectState {
             return;
         }
 
-        // Object mode: try object hit. Alt-click cycles through stacked
-        // overlapping shapes — pick the candidate just *behind* the
-        // currently-selected top one. Without alt, take the front-most.
-        let candidates = Self::objects_at_point(scene, canvas_pos);
-        let object_hit = if alt {
-            // Find the index of the current top selection in the
-            // candidate stack and pick the next one. If the current top
-            // isn't in the stack (e.g. clicked elsewhere then alt-clicked
-            // here), fall back to the front-most. Wraps around the end.
+        // Object mode: pick from the stack of leaf-level fill hits, then
+        // resolve up to the current isolation scope unless the user
+        // pierced with Alt. Ctrl+Alt cycles through stacked shapes (the
+        // pre-group-aware Alt-cycle behaviour, rebound to free Alt for
+        // pierce-only).
+        //
+        // Filter the leaf candidates to only those that are descendants
+        // of the current scope root — clicks on shapes outside an
+        // entered group shouldn't grab them. (Effectively: the marquee
+        // and click both honour isolation.)
+        let scope_root = self.scope_root(scene);
+        let all_candidates = Self::objects_at_point(scene, canvas_pos);
+        let candidates: Vec<NodeId> = all_candidates
+            .into_iter()
+            .filter(|&id| id == scope_root || scene_node_is_descendant(scene, id, scope_root))
+            .collect();
+
+        let cycle = alt && ctrl;
+        let pierce = alt; // pierce-to-leaf for either Alt or Ctrl+Alt
+
+        let leaf_hit = if cycle {
+            // Ctrl+Alt: pick the candidate just behind the currently-
+            // selected top one (wraps).
             let current_top = self.selected_nodes.last().copied();
             match current_top
                 .and_then(|id| candidates.iter().position(|c| *c == id))
@@ -1370,6 +1566,16 @@ impl SelectState {
             candidates.first().copied()
         };
 
+        let object_hit = leaf_hit.map(|leaf| {
+            if pierce {
+                leaf
+            } else {
+                // Default click: walk up to the topmost group ancestor
+                // that's a direct child of the current scope.
+                self.resolve_pick_in_scope(scene, leaf)
+            }
+        });
+
         if let Some(node_id) = object_hit {
             self.selected.clear();
 
@@ -1380,12 +1586,11 @@ impl SelectState {
                     self.selected_nodes.push(node_id);
                 }
             } else {
-                // Alt-click always replaces the selection — that's how
-                // the cycle exposes one shape at a time. Without alt, we
-                // keep the legacy "clicking inside an existing
-                // multi-selection preserves the selection so a drag can
-                // start" behaviour.
-                if alt || !self.selected_nodes.contains(&node_id) {
+                // Cycle (Ctrl+Alt) always replaces the selection — that's
+                // how the cycle exposes one shape at a time. Otherwise
+                // keep the "clicking inside an existing multi-selection
+                // preserves the selection so a drag can start" behaviour.
+                if cycle || !self.selected_nodes.contains(&node_id) {
                     self.selected_nodes.clear();
                     self.selected_nodes.push(node_id);
                 }
@@ -1410,7 +1615,17 @@ impl SelectState {
     }
 
     /// Handle mouse move during a drag. Returns true if a redraw is needed.
-    pub fn on_drag(&mut self, scene: &mut Scene, canvas_pos: [f64; 2]) -> bool {
+    ///
+    /// `constrain_aspect` (Shift): only meaningful for `ScaleObjects` drags —
+    /// forces uniform scale (the larger of |sx|, |sy|) so corner handles
+    /// preserve the original aspect ratio. Side-handle drags are unaffected
+    /// because there's only one free axis.
+    pub fn on_drag(
+        &mut self,
+        scene: &mut Scene,
+        canvas_pos: [f64; 2],
+        constrain_aspect: bool,
+    ) -> bool {
         match &mut self.drag_mode {
             DragMode::Idle => false,
             DragMode::MoveGradientHandle { handle } => {
@@ -1546,16 +1761,28 @@ impl SelectState {
                 };
 
                 // Clamp scale to avoid collapsing to zero.
-                let sx = if sx.abs() < 0.01 {
+                let mut sx = if sx.abs() < 0.01 {
                     0.01_f64.copysign(sx)
                 } else {
                     sx
                 };
-                let sy = if sy.abs() < 0.01 {
+                let mut sy = if sy.abs() < 0.01 {
                     0.01_f64.copysign(sy)
                 } else {
                     sy
                 };
+
+                // Shift-drag: uniform scale on corner handles. We unify the
+                // two axes by picking the larger absolute factor and copying
+                // its sign — this is what Figma / Illustrator / Inkscape all
+                // do for corner-handle aspect lock. Side handles only have
+                // one free axis (the other was forced to 1.0 above), so this
+                // branch is a no-op for them.
+                if constrain_aspect && handle.scales_x() && handle.scales_y() {
+                    let f = sx.abs().max(sy.abs());
+                    sx = f.copysign(sx);
+                    sy = f.copysign(sy);
+                }
 
                 // Build a world-space transform: translate anchor to origin,
                 // scale, translate back.
@@ -1581,7 +1808,15 @@ impl SelectState {
             } => {
                 *current = canvas_pos;
                 let (min, max) = marquee_rect(*anchor, *current);
-                self.marquee_preview_nodes = Self::objects_in_rect(scene, min, max);
+                // Marquee respects group isolation: only direct children
+                // of the current scope are picked. At top level this also
+                // avoids the surprise of grabbing both a group and its
+                // children at the same time.
+                let scope_root = self.scope_root(scene);
+                self.marquee_preview_nodes = Self::objects_in_rect(scene, min, max)
+                    .into_iter()
+                    .filter(|&id| scene.parent(id) == Some(scope_root))
+                    .collect();
                 true
             }
         }
@@ -1893,76 +2128,102 @@ impl SelectState {
         best.map(|(hit, _)| hit)
     }
 
-    /// Find the world-space point on the nearest edge to `canvas_pos`,
-    /// if one is within the hit radius. Used for the ghost insertion preview.
-    fn edge_hover_position(
-        scene: &Scene,
-        canvas_pos: [f64; 2],
-        zoom: f64,
-        nodes: &[NodeId],
-    ) -> Option<Point> {
-        let radius = HIT_RADIUS_SCREEN_PX / zoom;
-        let canvas_target = Point::new(canvas_pos[0], canvas_pos[1]);
-        let mut best: Option<(Point, f64)> = None;
+    /// World-space point on the segment described by `hit` at its `t`.
+    /// Returns `None` if the segment can't be resolved (missing node, wrong
+    /// node kind, out-of-range indices). Handles the implicit closing-edge
+    /// encoding (`segment == subpath.segments.len()`).
+    pub fn edge_hover_point_from_hit(scene: &Scene, hit: &EdgeHit) -> Option<Point> {
+        let node = scene.get(hit.node)?;
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
+        let subpath = path.subpaths.get(hit.subpath)?;
 
-        for &node_id in nodes {
-            let Some(node) = scene.get(node_id) else {
-                continue;
-            };
-            // Locked nodes are non-interactive: no vertex iteration / edge
-            // hits / object hits land on them. They're still rendered.
-            if !node.is_interactive() {
-                continue;
-            }
-            let NodeData::Path { ref path, .. } = node.data else {
-                continue;
-            };
-
-            let world = scene.world_transform(node_id);
-            let target = if world.is_identity() {
-                canvas_target
-            } else if let Some(inv) = world.inverse() {
-                inv.apply(canvas_target)
+        // Compute `from` (the segment's implicit start point) and the segment.
+        let (from, seg) = if hit.segment < subpath.segments.len() {
+            let from = if hit.segment == 0 {
+                subpath.start
             } else {
-                continue;
+                subpath.segments[hit.segment - 1].endpoint()
             };
+            (from, subpath.segments[hit.segment])
+        } else if hit.segment == subpath.segments.len()
+            && subpath.closed
+            && !subpath.segments.is_empty()
+        {
+            let from = subpath.segments.last().unwrap().endpoint();
+            (from, Segment::Line { to: subpath.start })
+        } else {
+            return None;
+        };
 
-            for subpath in &path.subpaths {
-                let mut current = subpath.start;
-                for seg in &subpath.segments {
-                    let (t, _pt, dist) = seg.closest_point(current, target);
-                    if dist < radius && best.as_ref().is_none_or(|(_, bd)| dist < *bd) {
-                        // Compute world-space position of the point on the edge.
-                        let local_pt = seg.eval_at(current, t);
-                        let world_pt = if world.is_identity() {
-                            local_pt
-                        } else {
-                            world.apply(local_pt)
-                        };
-                        best = Some((world_pt, dist));
-                    }
-                    current = seg.endpoint();
-                }
+        let local = seg.eval_at(from, hit.t);
+        let world = scene.world_transform(hit.node);
+        Some(if world.is_identity() {
+            local
+        } else {
+            world.apply(local)
+        })
+    }
 
-                // Implicit closing edge for closed paths (see `edge_hit_test`
-                // for the rationale).
-                if subpath.closed && !subpath.segments.is_empty() && current != subpath.start {
-                    let closing = Segment::Line { to: subpath.start };
-                    let (t, _pt, dist) = closing.closest_point(current, target);
-                    if dist < radius && best.as_ref().is_none_or(|(_, bd)| dist < *bd) {
-                        let local_pt = closing.eval_at(current, t);
-                        let world_pt = if world.is_identity() {
-                            local_pt
-                        } else {
-                            world.apply(local_pt)
-                        };
-                        best = Some((world_pt, dist));
-                    }
-                }
+    /// Build an `EdgeHit` for the segment immediately *before* `vref`'s
+    /// anchor (i.e. the segment whose endpoint is this vertex). Returns
+    /// `None` if `vref` is a control point, or if the anchor is the start
+    /// of an open subpath (no incoming segment exists).
+    pub fn incoming_edge_for_vertex(scene: &Scene, vref: &VertexRef) -> Option<EdgeHit> {
+        let node = scene.get(vref.node)?;
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
+        let subpath = path.subpaths.get(vref.subpath)?;
+        match vref.kind {
+            PointKind::Endpoint => Some(EdgeHit {
+                node: vref.node,
+                subpath: vref.subpath,
+                segment: vref.segment,
+                t: 0.5,
+            }),
+            PointKind::SubpathStart if subpath.closed && !subpath.segments.is_empty() => {
+                // The implicit (or last explicit) segment that lands on the
+                // start. We use the closing-edge encoding so callers that
+                // care (e.g. convert helpers) gracefully no-op rather than
+                // touching some unrelated segment.
+                Some(EdgeHit {
+                    node: vref.node,
+                    subpath: vref.subpath,
+                    segment: subpath.segments.len(),
+                    t: 0.5,
+                })
             }
+            _ => None,
         }
+    }
 
-        best.map(|(pt, _)| pt)
+    /// Build an `EdgeHit` for the segment immediately *after* `vref`'s anchor
+    /// (i.e. the segment whose implicit start is this vertex). Returns
+    /// `None` if `vref` is a control point, or if no outgoing segment exists
+    /// (last endpoint of an open subpath).
+    pub fn outgoing_edge_for_vertex(scene: &Scene, vref: &VertexRef) -> Option<EdgeHit> {
+        let node = scene.get(vref.node)?;
+        let NodeData::Path { ref path, .. } = node.data else {
+            return None;
+        };
+        let subpath = path.subpaths.get(vref.subpath)?;
+        let seg_idx = match vref.kind {
+            PointKind::SubpathStart => 0,
+            PointKind::Endpoint => vref.segment + 1,
+            _ => return None,
+        };
+        if seg_idx < subpath.segments.len() {
+            Some(EdgeHit {
+                node: vref.node,
+                subpath: vref.subpath,
+                segment: seg_idx,
+                t: 0.5,
+            })
+        } else {
+            None
+        }
     }
 
     /// Insert a new anchor point on the edge described by `hit`, splitting

@@ -24,6 +24,7 @@ use crate::hud::PerfStats;
 use crate::llm_dialog::LlmDialogState;
 use crate::recent_files::RecentFiles;
 use crate::snap::{SnapHit, SnapSettings};
+use crate::svg_drop_dialog::SvgDropDialogState;
 use crate::trace_dialog::TraceDialogState;
 
 /// What kind of canvas element was right-clicked, driving the context menu.
@@ -127,6 +128,12 @@ pub(crate) struct EditorState {
     /// "Generate SVG from prompt…" menu item is greyed out while this
     /// is `Some` so two dialogs can't fight over the same preview slot.
     pub(crate) llm_dialog: Option<LlmDialogState>,
+    /// Pending drop of an SVG file awaiting the user's "replace document
+    /// vs add as group" choice. `Some` only while the choice dialog is
+    /// open. The dropped file bytes are held here so the choice handler
+    /// doesn't have to re-read the source file (which may have changed
+    /// or been deleted while the dialog sat open).
+    pub(crate) svg_drop_dialog: Option<SvgDropDialogState>,
 }
 
 impl Default for EditorState {
@@ -162,6 +169,7 @@ impl Default for EditorState {
             last_snap: None,
             recent_files: RecentFiles::load(),
             llm_dialog: None,
+            svg_drop_dialog: None,
         }
     }
 }
@@ -288,6 +296,86 @@ impl EditorState {
 
         renderer.mark_dirty();
         Ok(id)
+    }
+
+    /// Replace the current document with the SVG decoded from `bytes`.
+    /// Clears undo history and selection, re-zooms to fit on the next
+    /// frame, and records the file in the recent-files list. This is
+    /// the behaviour you get from File → Open SVG… and from drag-drop
+    /// onto an empty document.
+    pub(crate) fn load_svg_replace(
+        &mut self,
+        bytes: &[u8],
+        path: &std::path::Path,
+        renderer: &mut Renderer,
+    ) -> Result<(), String> {
+        let scene = vector_svg::import_svg(bytes).map_err(|e| format!("{e}"))?;
+        self.scene = scene;
+        self.history = History::new();
+        self.select_state = SelectState::default();
+        self.pending_zoom_to_fit = true;
+        self.recent_files.add(path);
+        self.recent_files.save();
+        renderer.mark_dirty();
+        Ok(())
+    }
+
+    /// Add the SVG decoded from `bytes` as a new top-level group on
+    /// top of the current document. The group is labelled with the
+    /// file stem. Recorded as a single undoable insert
+    /// (`Command::Delete` is the inverse — undo removes the whole
+    /// imported subtree in one step).
+    ///
+    /// Returns the new group's id on success. The file is added to
+    /// the recent-files list either way — opening a file via drop
+    /// counts as "opening" even when it's being layered in.
+    pub(crate) fn load_svg_as_group(
+        &mut self,
+        bytes: &[u8],
+        path: &std::path::Path,
+        renderer: &mut Renderer,
+    ) -> Result<NodeId, String> {
+        let source = vector_svg::import_svg(bytes).map_err(|e| format!("{e}"))?;
+        let label = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Imported SVG")
+            .to_string();
+        let dest_parent = self.scene.root();
+        let new_group = vector_scene::merge_as_group(&mut self.scene, dest_parent, &source, label)
+            .ok_or_else(|| "merge_as_group failed (root parent vanished?)".to_string())?;
+
+        // Undo = remove the freshly-inserted group (and its merged
+        // defs descendants are cleaned up automatically because
+        // they're parented under the new group's defs copies, which
+        // Delete walks). Same shape as insert_raster_from_bytes.
+        self.history.record_undo(Command::Delete { id: new_group });
+
+        // Select the new group so it's obvious in the UI where the
+        // import landed and so further actions (e.g. moving it) act on
+        // it by default.
+        self.select_state.selected_nodes.clear();
+        self.select_state.selected_nodes.push(new_group);
+        self.select_state.selected.clear();
+        self.select_state.hovered = None;
+
+        self.recent_files.add(path);
+        self.recent_files.save();
+        renderer.mark_dirty();
+        Ok(new_group)
+    }
+
+    /// True iff the scene has any user-authored content — i.e. the
+    /// root has at least one child that isn't the defs subtree.
+    /// Used by the drop handler to decide whether to prompt the user
+    /// for a replace-vs-add-as-group choice (skipped on empty docs,
+    /// where the question only has one sensible answer).
+    pub(crate) fn scene_has_user_content(&self) -> bool {
+        let defs = self.scene.defs();
+        self.scene
+            .get(self.scene.root())
+            .map(|n| n.children.iter().any(|&c| c != defs))
+            .unwrap_or(false)
     }
 
     /// Process a PenAction result — auto-select, switch tools, mark dirty.
@@ -546,6 +634,10 @@ impl EditorState {
             self.history.execute(cmd, &mut self.scene);
             self.select_state.selected.clear();
             self.select_state.hovered = None;
+            // If the user just deleted the group they were inside (or one
+            // of its ancestors), pop the stack back to the nearest still-
+            // living entered group — or top level if all are gone.
+            self.select_state.validate_group_scope(&self.scene);
             true
         } else {
             false
@@ -559,6 +651,8 @@ impl EditorState {
         self.select_state.selected_nodes.clear();
         self.select_state.selected.clear();
         self.select_state.hovered = None;
+        // Undo can remove nodes that the scope stack still references.
+        self.select_state.validate_group_scope(&self.scene);
     }
 
     /// Perform redo: apply the top redo command to the scene.
@@ -568,6 +662,8 @@ impl EditorState {
         self.select_state.selected_nodes.clear();
         self.select_state.selected.clear();
         self.select_state.hovered = None;
+        // Redo can re-delete a group the scope stack still references.
+        self.select_state.validate_group_scope(&self.scene);
     }
 
     /// Update the mouse cursor icon based on tool, hover state, and panning.
@@ -640,8 +736,11 @@ impl EditorState {
                     canvas_f64,
                     self.camera.zoom as f64,
                 ) {
-                    // Crosshair when hovering the rotation zone outside bbox corners.
-                    window.set_cursor(winit::window::CursorIcon::Crosshair);
+                    // Winit's CursorIcon enum has no dedicated "rotate" cursor,
+                    // so `Grab` is the closest semantic match — it suggests the
+                    // user is about to grab and drag. `Crosshair` (the previous
+                    // choice) reads as a precision pointer and was misleading.
+                    window.set_cursor(winit::window::CursorIcon::Grab);
                 } else if self.select_state.hovered.is_some()
                     || SelectState::object_hit_test(&self.scene, canvas_f64).is_some()
                 {

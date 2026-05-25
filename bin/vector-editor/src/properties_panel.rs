@@ -305,6 +305,81 @@ pub(crate) fn show_properties(
                                             }
                                         }
                                     }
+
+                                    // Adjacent-segment type buttons. Lets the
+                                    // user make either side of a vertex
+                                    // sharp (Line) or curved (Quad/Cubic)
+                                    // without having to right-click the
+                                    // segment itself. Side rows are only
+                                    // drawn when an adjacent segment exists
+                                    // (open subpath endpoints get one side).
+                                    use vector_tools::SegmentKind;
+                                    let render_side_row = |ui: &mut egui::Ui,
+                                                           label: &str,
+                                                           hit_opt: Option<
+                                        vector_tools::EdgeHit,
+                                    >|
+                                     -> Option<(
+                                        vector_tools::EdgeHit,
+                                        SegmentKind,
+                                    )> {
+                                        let hit = hit_opt?;
+                                        let current = SelectState::segment_type(scene, &hit)?;
+                                        let mut clicked: Option<SegmentKind> = None;
+                                        ui.horizontal(|ui| {
+                                            ui.label(label);
+                                            for (kind, lbl) in [
+                                                (SegmentKind::Line, "Line"),
+                                                (SegmentKind::Quad, "Quad"),
+                                                (SegmentKind::Cubic, "Cubic"),
+                                            ] {
+                                                let is_active = current == kind;
+                                                if ui.selectable_label(is_active, lbl).clicked()
+                                                    && !is_active
+                                                {
+                                                    clicked = Some(kind);
+                                                }
+                                            }
+                                        });
+                                        clicked.map(|k| (hit, k))
+                                    };
+
+                                    let incoming_hit =
+                                        SelectState::incoming_edge_for_vertex(scene, &vref);
+                                    let outgoing_hit =
+                                        SelectState::outgoing_edge_for_vertex(scene, &vref);
+
+                                    // Resolve conversions outside the closure
+                                    // so we can borrow `scene` mutably after.
+                                    let in_change = render_side_row(ui, "In", incoming_hit);
+                                    let out_change = render_side_row(ui, "Out", outgoing_hit);
+
+                                    for (hit, kind) in [in_change, out_change].into_iter().flatten()
+                                    {
+                                        if let Some(node) = scene.get(hit.node)
+                                            && let NodeData::Path { ref path, .. } = node.data
+                                        {
+                                            history.record_undo(Command::SetPathData {
+                                                id: hit.node,
+                                                path: path.clone(),
+                                            });
+                                        }
+                                        let changed = match kind {
+                                            SegmentKind::Line => {
+                                                SelectState::convert_segment_to_line(scene, &hit)
+                                            }
+                                            SegmentKind::Quad => {
+                                                SelectState::convert_segment_to_quad(scene, &hit)
+                                            }
+                                            SegmentKind::Cubic => {
+                                                SelectState::convert_segment_to_cubic(scene, &hit)
+                                            }
+                                            SegmentKind::Arc => false,
+                                        };
+                                        if changed {
+                                            renderer.mark_dirty();
+                                        }
+                                    }
                                 }
 
                                 let mut vx = wp.x as f32;

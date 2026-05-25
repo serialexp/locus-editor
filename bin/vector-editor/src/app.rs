@@ -12,13 +12,12 @@ use winit::window::{Icon, Window, WindowId};
 const ICON_RGBA: &[u8] = include_bytes!("../../../assets/generated/icon-256.rgba");
 const ICON_SIZE: u32 = 256;
 
-use vector_ops::{Command, History};
+use vector_ops::Command;
 use vector_render::Renderer;
 use vector_scene::NodeData;
 use vector_tools::{SelectState, TextAction, ToolType};
 
 use crate::context_menu::show_canvas_context_menu;
-use crate::demo::create_demo_content;
 use crate::editor_state::{CanvasContextMenu, CanvasContextTarget, EditorState};
 use crate::llm_dialog;
 use crate::preview_group::DialogAction;
@@ -175,9 +174,6 @@ impl ApplicationHandler for App {
             egui_renderer,
             renderer,
         });
-
-        // Create a demo triangle path so we see something on screen
-        create_demo_content(&mut self.state.scene);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -241,24 +237,47 @@ impl ApplicationHandler for App {
                 if let Some(kind) = kind {
                     match std::fs::read(&path) {
                         Ok(data) => match kind {
-                            DroppedKind::Svg => match vector_svg::import_svg(&data) {
-                                Ok(scene) => {
-                                    self.state.scene = scene;
-                                    self.state.history = History::new();
-                                    self.state.select_state = SelectState::default();
-                                    self.state.pending_zoom_to_fit = true;
-                                    // Drag-drop is just another way to open a
-                                    // file — keep the recent list in sync.
-                                    self.state.recent_files.add(&path);
-                                    self.state.recent_files.save();
-                                    if let Some(gpu) = &mut self.gpu {
-                                        gpu.renderer.mark_dirty();
+                            DroppedKind::Svg => {
+                                if let Some(gpu) = &mut self.gpu {
+                                    // If the document is empty there's
+                                    // nothing to merge into — just open
+                                    // the file. Otherwise stash the bytes
+                                    // and let the choice dialog decide.
+                                    if !self.state.scene_has_user_content() {
+                                        match self.state.load_svg_replace(
+                                            &data,
+                                            &path,
+                                            &mut gpu.renderer,
+                                        ) {
+                                            Ok(()) => {
+                                                gpu.window.request_redraw();
+                                                log::info!(
+                                                    "Loaded {}: {}",
+                                                    kind.label(),
+                                                    path.display()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                log::error!("Failed to load {}: {e}", kind.label())
+                                            }
+                                        }
+                                    } else {
+                                        // Replace any pending drop —
+                                        // the most recent file wins.
+                                        // (Rare race: user drags two
+                                        // SVGs in quick succession;
+                                        // we'd rather not stack
+                                        // dialogs.)
+                                        self.state.svg_drop_dialog =
+                                            Some(crate::svg_drop_dialog::SvgDropDialogState {
+                                                bytes: data,
+                                                path: path.clone(),
+                                            });
                                         gpu.window.request_redraw();
+                                        log::info!("Drop pending choice: {}", path.display());
                                     }
-                                    log::info!("Loaded {}: {}", kind.label(), path.display());
                                 }
-                                Err(e) => log::error!("Failed to load {}: {e}", kind.label()),
-                            },
+                            }
                             DroppedKind::Raster => {
                                 // Insert (don't trace) — this is the "use as
                                 // tracing reference" path. File menu still
@@ -348,58 +367,87 @@ impl ApplicationHandler for App {
                                                 use vector_tools::SelectionMode;
                                                 match self.state.select_state.mode {
                                                     SelectionMode::Object => {
-                                                        // Double-click in object mode on a
-                                                        // selected object → enter node mode.
-                                                        if !self
-                                                            .state
-                                                            .select_state
-                                                            .selected_nodes
-                                                            .is_empty()
-                                                        {
-                                                            let hit = SelectState::object_hit_test(
-                                                                &self.state.scene,
-                                                                canvas_f64,
+                                                        // Double-click in object mode resolves
+                                                        // the leaf hit relative to the current
+                                                        // group-isolation scope and then dispatches
+                                                        // by what was hit:
+                                                        //   - Regular group → enter it (isolation).
+                                                        //   - Text node → switch to text tool and
+                                                        //     start editing.
+                                                        //   - anything else → enter vertex/node
+                                                        //     editing mode.
+                                                        let leaf_hit = SelectState::object_hit_test(
+                                                            &self.state.scene,
+                                                            canvas_f64,
+                                                        );
+                                                        let resolved_hit = leaf_hit.map(|leaf| {
+                                                            self.state
+                                                                .select_state
+                                                                .resolve_pick_in_scope(
+                                                                    &self.state.scene,
+                                                                    leaf,
+                                                                )
+                                                        });
+                                                        if let Some(node_id) = resolved_hit {
+                                                            let kind = self
+                                                                .state
+                                                                .scene
+                                                                .get(node_id)
+                                                                .map(|n| n.data.clone());
+                                                            let is_regular_group = matches!(
+                                                                kind.as_ref(),
+                                                                Some(NodeData::Group {
+                                                                    kind:
+                                                                        vector_scene::GroupKind::Regular,
+                                                                    ..
+                                                                })
                                                             );
-                                                            if let Some(node_id) = hit
+                                                            let is_text = matches!(
+                                                                kind.as_ref(),
+                                                                Some(NodeData::Text(_))
+                                                            );
+                                                            if is_regular_group {
+                                                                // Enter the group: subsequent
+                                                                // clicks pick its direct children.
+                                                                self.state
+                                                                    .select_state
+                                                                    .enter_group(
+                                                                        &self.state.scene,
+                                                                        node_id,
+                                                                    );
+                                                                // Re-tessellation rebuilds the
+                                                                // per-instance alpha multipliers,
+                                                                // so out-of-scope nodes dim.
+                                                                gpu.renderer.mark_dirty();
+                                                                handled = true;
+                                                            } else if is_text {
+                                                                self.state.active_tool =
+                                                                    ToolType::Text;
+                                                                let action =
+                                                                    self.state.text_tool.on_press(
+                                                                        &mut self.state.scene,
+                                                                        canvas_f64,
+                                                                        self.state.camera.zoom
+                                                                            as f64,
+                                                                    );
+                                                                self.state.handle_text_action(
+                                                                    action,
+                                                                    &mut gpu.renderer,
+                                                                );
+                                                                handled = true;
+                                                            } else if !self
+                                                                .state
+                                                                .select_state
+                                                                .selected_nodes
+                                                                .is_empty()
                                                                 && self
                                                                     .state
                                                                     .select_state
                                                                     .is_node_selected(node_id)
                                                             {
-                                                                // Text nodes: switch to text tool
-                                                                // and start editing instead of
-                                                                // entering vertex mode.
-                                                                let is_text = self
-                                                                    .state
-                                                                    .scene
-                                                                    .get(node_id)
-                                                                    .is_some_and(|n| {
-                                                                        matches!(
-                                                                            n.data,
-                                                                            NodeData::Text(_)
-                                                                        )
-                                                                    });
-                                                                if is_text {
-                                                                    self.state.active_tool =
-                                                                        ToolType::Text;
-                                                                    let action = self
-                                                                        .state
-                                                                        .text_tool
-                                                                        .on_press(
-                                                                            &mut self.state.scene,
-                                                                            canvas_f64,
-                                                                            self.state.camera.zoom
-                                                                                as f64,
-                                                                        );
-                                                                    self.state.handle_text_action(
-                                                                        action,
-                                                                        &mut gpu.renderer,
-                                                                    );
-                                                                } else {
-                                                                    self.state
-                                                                        .select_state
-                                                                        .enter_node_mode();
-                                                                }
+                                                                self.state
+                                                                    .select_state
+                                                                    .enter_node_mode();
                                                                 handled = true;
                                                             }
                                                         }
@@ -483,14 +531,19 @@ impl ApplicationHandler for App {
                                             }
 
                                             if !handled {
-                                                let (shift, alt) = gpu.egui_ctx.input(|i| {
-                                                    (i.modifiers.shift, i.modifiers.alt)
+                                                let (shift, alt, ctrl) = gpu.egui_ctx.input(|i| {
+                                                    (
+                                                        i.modifiers.shift,
+                                                        i.modifiers.alt,
+                                                        i.modifiers.ctrl || i.modifiers.mac_cmd,
+                                                    )
                                                 });
                                                 self.state.select_state.on_press(
                                                     &self.state.scene,
                                                     canvas_f64,
                                                     shift,
                                                     alt,
+                                                    ctrl,
                                                     self.state.camera.zoom as f64,
                                                 );
                                                 // If on_press started a drag,
@@ -692,11 +745,13 @@ impl ApplicationHandler for App {
                         let c = self.state.camera.screen_to_canvas(new_pos[0], new_pos[1]);
                         [c[0] as f64, c[1] as f64]
                     };
+                    let drag_shift = gpu.egui_ctx.input(|i| i.modifiers.shift);
                     let changed = match self.state.active_tool {
-                        ToolType::Select => self
-                            .state
-                            .select_state
-                            .on_drag(&mut self.state.scene, canvas_f64),
+                        ToolType::Select => self.state.select_state.on_drag(
+                            &mut self.state.scene,
+                            canvas_f64,
+                            drag_shift,
+                        ),
                         ToolType::Pen => self
                             .state
                             .pen_state
@@ -929,6 +984,13 @@ impl ApplicationHandler for App {
                             {
                                 self.state.select_state.exit_node_mode();
                                 gpu.window.request_redraw();
+                            } else if self.state.active_tool == ToolType::Select
+                                && self.state.select_state.group_scope().is_some()
+                            {
+                                // Pop one level out of group isolation.
+                                self.state.select_state.exit_group_scope();
+                                gpu.renderer.mark_dirty();
+                                gpu.window.request_redraw();
                             }
                         }
                         Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace)
@@ -1076,6 +1138,43 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
                 gpu.window.request_redraw();
             }
             DialogAction::None => {}
+        }
+
+        // Drop-choice dialog for SVG files. Pending only when a drop
+        // landed on a non-empty document; otherwise opens never get
+        // here because the drop handler imports directly. Three
+        // terminal choices (Replace, AddAsGroup, Cancel) plus None
+        // (still open) — each terminal one clears the pending state.
+        let drop_choice = crate::svg_drop_dialog::show(state, &gpu.egui_ctx);
+        match drop_choice {
+            crate::svg_drop_dialog::DropChoice::Replace => {
+                if let Some(pending) = state.svg_drop_dialog.take() {
+                    match state.load_svg_replace(&pending.bytes, &pending.path, &mut gpu.renderer) {
+                        Ok(()) => {
+                            gpu.window.request_redraw();
+                            log::info!("Loaded SVG (replace): {}", pending.path.display());
+                        }
+                        Err(e) => log::error!("Failed to load SVG: {e}"),
+                    }
+                }
+            }
+            crate::svg_drop_dialog::DropChoice::AddAsGroup => {
+                if let Some(pending) = state.svg_drop_dialog.take() {
+                    match state.load_svg_as_group(&pending.bytes, &pending.path, &mut gpu.renderer)
+                    {
+                        Ok(_id) => {
+                            gpu.window.request_redraw();
+                            log::info!("Loaded SVG (as group): {}", pending.path.display());
+                        }
+                        Err(e) => log::error!("Failed to load SVG as group: {e}"),
+                    }
+                }
+            }
+            crate::svg_drop_dialog::DropChoice::Cancel => {
+                state.svg_drop_dialog = None;
+                gpu.window.request_redraw();
+            }
+            crate::svg_drop_dialog::DropChoice::None => {}
         }
 
         // Live-preview LLM-generation dialog. Same shape as the trace

@@ -345,6 +345,67 @@ pub(crate) fn run_ui(
         });
     });
 
+    // Group-isolation breadcrumb (always visible). Reads
+    // `selection.group_scope_path()` and renders one clickable segment per
+    // entered group, plus a leading "Document" segment for the top scope.
+    // Clicking a segment truncates the scope stack to that depth — i.e.
+    // "jump back to that level". When no group is entered, only the
+    // (non-clickable) "Document" segment shows so users still see where
+    // they are.
+    let breadcrumb_resp = egui::Panel::top("scope_breadcrumb").show(ctx, |ui| {
+        let path = selection.group_scope_path().to_vec();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            // Document root segment: clickable when nested, plain when at top.
+            let doc_label = format!("{} Document", egui_phosphor::regular::HOUSE);
+            if path.is_empty() {
+                // At top level — show the segment as plain text so it
+                // doesn't pretend to be actionable.
+                ui.add_enabled(false, egui::Button::new(doc_label).frame(false));
+            } else {
+                let resp = ui.add(egui::Button::new(doc_label).frame(false));
+                if resp.clicked() {
+                    // Truncate to depth 0 — exit all groups.
+                    selection.truncate_group_scope(0);
+                    renderer.mark_dirty();
+                }
+            }
+            // One segment per entered group, with a chevron separator.
+            for (idx, &node_id) in path.iter().enumerate() {
+                ui.label(
+                    egui::RichText::new(egui_phosphor::regular::CARET_RIGHT)
+                        .weak()
+                        .small(),
+                );
+                let (icon, label) = if let Some(node) = scene.get(node_id) {
+                    crate::util::node_display(node)
+                } else {
+                    // Stale scope entry — should be cleaned up by
+                    // validate_group_scope, but render defensively just
+                    // in case we got here mid-frame.
+                    (egui_phosphor::regular::FOLDER, "(missing)".to_string())
+                };
+                let segment_text = format!("{icon} {label}");
+                let is_current = idx + 1 == path.len();
+                if is_current {
+                    // Innermost: bold-ish, not clickable (you're already
+                    // here). egui doesn't have a direct "active crumb"
+                    // style; using a strong RichText conveys it well.
+                    ui.label(egui::RichText::new(segment_text).strong());
+                } else {
+                    let resp = ui.add(egui::Button::new(segment_text).frame(false));
+                    if resp.clicked() {
+                        // Truncate to depth `idx + 1` — keep ancestors up
+                        // to and including this segment, drop everything
+                        // deeper.
+                        selection.truncate_group_scope(idx + 1);
+                        renderer.mark_dirty();
+                    }
+                }
+            }
+        });
+    });
+
     let tools_resp = egui::Panel::left("tools_panel")
         .default_size(120.0)
         .resizable(false)
@@ -528,6 +589,10 @@ pub(crate) fn run_ui(
         log::info!("=== egui layout dump ===");
         log::info!("{}", fmt_rect("canvas (available)", available));
         log::info!("{}", fmt_rect("menu_bar", menu_resp.response.rect));
+        log::info!(
+            "{}",
+            fmt_rect("scope_breadcrumb", breadcrumb_resp.response.rect)
+        );
         log::info!("{}", fmt_rect("tools_panel", tools_resp.response.rect));
         log::info!(
             "{}",

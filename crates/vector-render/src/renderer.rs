@@ -70,6 +70,16 @@ fn compute_handles_key(
     } else {
         0u8.hash(&mut h);
     }
+    if let Some(hit) = &selection.edge_hover_hit {
+        1u8.hash(&mut h);
+        hit.node.hash(&mut h);
+        hit.subpath.hash(&mut h);
+        hit.segment.hash(&mut h);
+        // Don't hash `t` — the highlight covers the whole segment, so
+        // pointer movement along it shouldn't keep busting the cache.
+    } else {
+        0u8.hash(&mut h);
+    }
     if let Some((p, kind)) = snap_indicator {
         1u8.hash(&mut h);
         p[0].to_bits().hash(&mut h);
@@ -242,8 +252,14 @@ impl GpuPattern {
 // ── GPU-side per-path transform ──────────────────────────────────────
 //
 // Must match the WGSL shader's `GpuTransform` layout exactly.
-//   row0 = [a, b, tx, _]  — world_x = a*x + b*y + tx
-//   row1 = [c, d, ty, _]  — world_y = c*x + d*y + ty
+//   row0 = [a, b, tx, alpha_mul]  — world_x = a*x + b*y + tx
+//   row1 = [c, d, ty, _]          — world_y = c*x + d*y + ty
+//
+// `alpha_mul` is a per-instance opacity multiplier applied in the
+// vertex shader to the vertex color's alpha channel. It's used to dim
+// out-of-scope nodes when the user has entered a group (Inkscape-style
+// isolation): in-scope nodes get 1.0, out-of-scope nodes get a smaller
+// value (e.g. 0.5). 1.0 = no effect.
 
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -254,13 +270,13 @@ struct GpuTransform {
 
 impl GpuTransform {
     const IDENTITY: Self = Self {
-        row0: [1.0, 0.0, 0.0, 0.0],
+        row0: [1.0, 0.0, 0.0, 1.0],
         row1: [0.0, 1.0, 0.0, 0.0],
     };
 
-    fn from_affine(a: &Affine) -> Self {
+    fn from_affine_with_alpha(a: &Affine, alpha_mul: f32) -> Self {
         Self {
-            row0: [a.a as f32, a.b as f32, a.tx as f32, 0.0],
+            row0: [a.a as f32, a.b as f32, a.tx as f32, alpha_mul],
             row1: [a.c as f32, a.d as f32, a.ty as f32, 0.0],
         }
     }
@@ -1131,6 +1147,21 @@ impl Renderer {
 
         let root = scene.root();
         let mut path_count: u32 = 0;
+        // Group-isolation dim: when the user has "entered" a group via
+        // double-click, every node that isn't the entered group or one
+        // of its descendants is rendered at reduced opacity, mirroring
+        // Inkscape / Illustrator's isolation mode. The multiplier is
+        // baked into the per-instance `GpuTransform.alpha_mul` slot so
+        // the tess cache stays valid (it's keyed by node + revision and
+        // is independent of scope).
+        const OUT_OF_SCOPE_DIM: f32 = 0.5;
+        let scope_root = selection.group_scope();
+        let alpha_for = |id: NodeId| -> f32 {
+            match scope_root {
+                Some(root_id) if !scene.is_descendant_or_self(id, root_id) => OUT_OF_SCOPE_DIM,
+                _ => 1.0,
+            }
+        };
         // Split the borrow of `self` so the closure can hold `&mut` on the
         // tess cache, the bool-path cache, and the raster cache independently
         // of `scene`. We also capture the per-draw layout + sampler by
@@ -1182,7 +1213,10 @@ impl Renderer {
                         let stroke = style.stroke.as_ref().map(&resolve_stroke);
                         let mesh = tessellate_path(computed, fill, stroke);
                         let slot = transforms.len() as u32;
-                        transforms.push(GpuTransform::from_affine(&world_transform));
+                        transforms.push(GpuTransform::from_affine_with_alpha(
+                            &world_transform,
+                            alpha_for(id),
+                        ));
                         push_cached(
                             &mesh.vertices,
                             &mesh.indices,
@@ -1208,7 +1242,10 @@ impl Renderer {
                     let cached = tess_cache
                         .get_or_insert_with(id, rev, || tessellate_path(path, fill, stroke));
                     let slot = transforms.len() as u32;
-                    transforms.push(GpuTransform::from_affine(&world_transform));
+                    transforms.push(GpuTransform::from_affine_with_alpha(
+                        &world_transform,
+                        alpha_for(id),
+                    ));
                     push_cached(
                         &cached.vertices,
                         &cached.indices,
@@ -1234,7 +1271,10 @@ impl Renderer {
                         tessellate_path(&shaped.path, fill, stroke)
                     });
                     let slot = transforms.len() as u32;
-                    transforms.push(GpuTransform::from_affine(&world_transform));
+                    transforms.push(GpuTransform::from_affine_with_alpha(
+                        &world_transform,
+                        alpha_for(id),
+                    ));
                     push_cached(
                         &cached.vertices,
                         &cached.indices,
@@ -1270,7 +1310,7 @@ impl Renderer {
                     );
                     // Update per-draw uniform with the current world
                     // transform and box size. Cheap (48 bytes per raster).
-                    let draw = GpuRasterDraw::new(&world_transform, width, height);
+                    let draw = GpuRasterDraw::new(&world_transform, width, height, alpha_for(id));
                     raster_cache.write_uniform(queue, id, &draw);
 
                     draw_ops.push(DrawOp::Raster { node_id: id });
@@ -1744,8 +1784,14 @@ impl Renderer {
                     }
                     NodeData::Group { .. } => {
                         // For groups, walk the subtree to get the aggregate bounds.
+                        // `walk_depth_first`'s second arg is the *parent*'s transform —
+                        // it composes the visited node's own transform on top — so we
+                        // must pass the group's *parent* world, not its own world,
+                        // otherwise the group's transform gets applied twice and the
+                        // bbox drifts at 2× the rate of its contents when dragged.
+                        let parent_world = scene.parent_world_transform(id);
                         let mut b = vector_geom::Bounds::EMPTY;
-                        scene.walk_depth_first(id, world_transform, &mut |_cid, cnode, cworld| {
+                        scene.walk_depth_first(id, parent_world, &mut |_cid, cnode, cworld| {
                             if !cnode.visible {
                                 return false;
                             }
@@ -1840,8 +1886,14 @@ impl Renderer {
                             local.transform(world)
                         }
                         NodeData::Group { .. } => {
+                            // Same pitfall as the selection-bbox path above:
+                            // walk_depth_first composes the visited node's own
+                            // transform on top of its second arg, so pass the
+                            // parent's world to avoid applying `id.transform`
+                            // twice.
+                            let parent_world = scene.parent_world_transform(id);
                             let mut gb = vector_geom::Bounds::EMPTY;
-                            scene.walk_depth_first(id, world, &mut |_cid, cnode, cworld| {
+                            scene.walk_depth_first(id, parent_world, &mut |_cid, cnode, cworld| {
                                 if !cnode.visible {
                                     return false;
                                 }
@@ -1976,6 +2028,71 @@ impl Renderer {
                     true
                 },
             );
+        }
+
+        // ── Hovered-segment highlight (Node mode only) ──────────────────
+        // Drawn before the handle lines / vertex squares so that the
+        // overlay sits *underneath* them — handles and anchors should
+        // remain visually on top of the highlight strip.
+        if selection.mode == SelectionMode::Node
+            && let Some(hit) = &selection.edge_hover_hit
+            && let Some(node) = scene.get(hit.node)
+            && let vector_scene::NodeData::Path { ref path, .. } = node.data
+            && let Some(subpath) = path.subpaths.get(hit.subpath)
+        {
+            let world = scene.world_transform(hit.node);
+            let xf = |p: Point| -> Point {
+                if world.is_identity() {
+                    p
+                } else {
+                    world.apply(p)
+                }
+            };
+
+            // Resolve segment + its implicit start. Handles the closing-edge
+            // encoding (segment == subpath.segments.len()).
+            let resolved = if hit.segment < subpath.segments.len() {
+                let from = if hit.segment == 0 {
+                    subpath.start
+                } else {
+                    subpath.segments[hit.segment - 1].endpoint()
+                };
+                Some((from, subpath.segments[hit.segment]))
+            } else if hit.segment == subpath.segments.len()
+                && subpath.closed
+                && !subpath.segments.is_empty()
+            {
+                let from = subpath.segments.last().unwrap().endpoint();
+                Some((from, Segment::Line { to: subpath.start }))
+            } else {
+                None
+            };
+
+            if let Some((from, seg)) = resolved {
+                // Highlight thickness in screen pixels, converted to canvas
+                // units. Sits a hair thicker than the handle lines so it's
+                // unmistakeable but not noisy.
+                let hl_thickness = 3.0 / zoom as f32;
+                let hl_color: [f32; 4] = [0.3, 0.7, 1.0, 0.55];
+
+                // Sample-and-segment: 24 segments gives a smooth curve at
+                // typical zoom levels. Lines short-circuit to a single
+                // push_line call.
+                if matches!(seg, Segment::Line { to: _ }) {
+                    let a = xf(from);
+                    let b = xf(seg.endpoint());
+                    push_line(&mut verts, &mut idxs, a, b, hl_thickness, hl_color);
+                } else {
+                    const STEPS: usize = 24;
+                    let mut prev = xf(from);
+                    for i in 1..=STEPS {
+                        let t = i as f64 / STEPS as f64;
+                        let curr = xf(seg.eval_at(from, t));
+                        push_line(&mut verts, &mut idxs, prev, curr, hl_thickness, hl_color);
+                        prev = curr;
+                    }
+                }
+            }
         }
 
         // ── Vertex handles (Node mode only) ─────────────────────────────

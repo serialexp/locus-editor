@@ -344,8 +344,15 @@ pub fn selection_visual_bounds(scene: &Scene, ids: &[NodeId]) -> Bounds {
             } => boolean_group_visual_bounds(scene, id, world),
             NodeData::Group { is_defs: true, .. } => Bounds::EMPTY,
             NodeData::Group { .. } => {
+                // `walk_depth_first`'s second arg is the *parent* transform —
+                // the visitor receives `parent.then(visited.transform)` as
+                // world. Passing `world` (= id's own world, parent.then(id.t))
+                // would compose id.t a second time, doubling every descendant's
+                // motion when the group is dragged. Use the group's parent
+                // world here so the walk lands at id with the correct world.
+                let parent_world = scene.parent_world_transform(id);
                 let mut gb = Bounds::EMPTY;
-                scene.walk_depth_first(id, world, &mut |_cid, cnode, cworld| {
+                scene.walk_depth_first(id, parent_world, &mut |_cid, cnode, cworld| {
                     if !cnode.visible {
                         return false;
                     }
@@ -582,6 +589,48 @@ mod tests {
             (bounds.max.y - 10.0).abs() < 1e-3,
             "max.y = {}",
             bounds.max.y
+        );
+    }
+
+    /// Regression: `selection_visual_bounds` of a Group with a non-identity
+    /// transform must not apply the group's transform twice. The bug
+    /// manifested as the on-screen selection bbox drifting at 2× the rate
+    /// of the group's contents when the group was dragged.
+    ///
+    /// Setup: a 10×10 square at local origin, wrapped in a Group whose
+    /// transform translates by (100, 50). Correct world bounds are
+    /// (100,50)..(110,60). The doubled-transform bug would produce
+    /// (200,100)..(210,110).
+    #[test]
+    fn selection_bounds_of_translated_group_applies_transform_once() {
+        use vector_scene::Node;
+        let mut scene = Scene::new();
+        let root = scene.root();
+
+        let group_id = scene.insert(root, Node::group("g")).unwrap();
+        scene.set_transform(group_id, Affine::translate(100.0, 50.0));
+
+        let mut path_node = Node::path("sq", square(0.0, 0.0, 10.0));
+        // Give the path a fill so visual_bounds includes its area.
+        if let NodeData::Path { ref mut style, .. } = path_node.data {
+            style.fill = Some(vector_scene::Fill {
+                paint: vector_scene::PaintRef::Solid(vector_geom::Color::from_srgb8(
+                    255, 0, 0, 255,
+                )),
+                rule: vector_scene::FillRule::NonZero,
+                opacity: 1.0,
+            });
+        }
+        scene.insert(group_id, path_node).unwrap();
+
+        let bounds = selection_visual_bounds(&scene, &[group_id]);
+        assert!(!bounds.is_empty(), "expected non-empty bounds");
+        assert!(
+            (bounds.min.x - 100.0).abs() < 1e-6
+                && (bounds.min.y - 50.0).abs() < 1e-6
+                && (bounds.max.x - 110.0).abs() < 1e-6
+                && (bounds.max.y - 60.0).abs() < 1e-6,
+            "group transform applied twice — bounds = {bounds:?}"
         );
     }
 

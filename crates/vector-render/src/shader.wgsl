@@ -91,10 +91,13 @@ struct GpuPattern {
 };
 
 // 2D affine transform, packed as two vec4s:
-//   row0 = [a, b, tx, _]
+//   row0 = [a, b, tx, alpha_mul]
 //   row1 = [c, d, ty, _]
 // world_x = a*x + b*y + tx
 // world_y = c*x + d*y + ty
+// `alpha_mul` is a per-instance opacity multiplier applied to vertex
+// color alpha in the vertex shader (1.0 = no effect). Used to dim
+// out-of-scope nodes when the user has entered a group.
 struct GpuTransform {
     row0: vec4<f32>,
     row1: vec4<f32>,
@@ -129,7 +132,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
         t.row1.x * in.position.x + t.row1.y * in.position.y + t.row1.z,
     );
     out.clip_position = globals.view_proj * vec4<f32>(world, 0.0, 1.0);
-    out.color = in.color;
+    // Per-instance alpha multiplier (group-isolation dim).
+    out.color = vec4<f32>(in.color.rgb, in.color.a * t.row0.w);
     out.world_pos = world;
     out.gradient_index = in.gradient_index;
     out.pattern_index = in.pattern_index;
