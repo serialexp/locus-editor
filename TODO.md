@@ -50,28 +50,28 @@
 
 ### Editor features users expect
 - [ ] Align & distribute panel — align selection left/center/right/top/middle/bottom, distribute with equal spacing. Uses existing `combined_bounds`.
-- [x] Boolean path operations — non-destructive boolean groups (`GroupKind::Boolean { op, style }`) via new `vector-bool` crate wrapping `i_overlay`. Union / Difference / Intersect / Exclude; operands preserved as children, result recomputes on edit. Path menu actions + properties-panel op combo + Flatten-to-path. SVG export bakes to a single `<path>` with `data-vector-boolean-op` attribute.
+- [x] Boolean path operations — non-destructive boolean groups (`GroupKind::Boolean { op, style }`) via new `locus-bool` crate wrapping `i_overlay`. Union / Difference / Intersect / Exclude; operands preserved as children, result recomputes on edit. Path menu actions + properties-panel op combo + Flatten-to-path. SVG export bakes to a single `<path>` with `data-vector-boolean-op` attribute.
 - [ ] Boolean groups: cache per-group computed path, invalidate on descendant path/transform edits (currently recomputed every frame; part of the broader per-path tess caching work below).
-- [x] Boolean groups: boolean-group-aware `vector_bool::scene_content_bounds` — short-circuits at Boolean groups and returns the tight baked-path bounds (with the group's stroke expansion). Used by SVG viewBox export and zoom-to-fit. `Scene::content_bounds` remains the naive fallback for contexts without the vector-bool dep.
+- [x] Boolean groups: boolean-group-aware `locus_bool::scene_content_bounds` — short-circuits at Boolean groups and returns the tight baked-path bounds (with the group's stroke expansion). Used by SVG viewBox export and zoom-to-fit. `Scene::content_bounds` remains the naive fallback for contexts without the locus-bool dep.
 - [ ] Boolean groups: curve fidelity — result is all `Line` segments (polyline approximation at 0.1 tolerance). Add an optional post-pass refit to cubics for round-trippable curves.
 - [x] Boolean groups: Inkscape-style keybindings — Ctrl++ / Ctrl+= (Union), Ctrl+- (Difference), Ctrl+* (Intersect), Ctrl+^ (Exclude). Requires ≥2 selected nodes. Wired directly into the winit key handler; menu labels show the shortcut.
 - [ ] Boolean groups: allow `Text` nodes as operands (auto-convert to path on evaluation).
-- [ ] Convert stroke to path — outline the stroked region as a fillable path. Reuses the stroke-tessellation machinery in `vector-tess`.
-- [x] Zoom-to-fit and zoom-to-selection — `1` zooms to `vector_bool::scene_content_bounds`, `3` zooms to `vector_bool::selection_visual_bounds(scene, &selected_nodes)` (boolean-group-aware: baked path bounds for boolean operands, recursive descendant union for regular groups). Suppressed while pen/shape/text tools are mid-action; ignored with ctrl/alt held to leave Ctrl+1/3 free for future bindings.
+- [ ] Convert stroke to path — outline the stroked region as a fillable path. Reuses the stroke-tessellation machinery in `locus-tess`.
+- [x] Zoom-to-fit and zoom-to-selection — `1` zooms to `locus_bool::scene_content_bounds`, `3` zooms to `locus_bool::selection_visual_bounds(scene, &selected_nodes)` (boolean-group-aware: baked path bounds for boolean operands, recursive descendant union for regular groups). Suppressed while pen/shape/text tools are mid-action; ignored with ctrl/alt held to leave Ctrl+1/3 free for future bindings.
 - [ ] Layers as first-class concept — a layer is a group with a UI role (name, lock, solo). Structure-panel affordance + `is_layer` flag on groups.
 
 ### Performance
 - [x] Gate `build_handles` on selection/scene change — `Renderer::last_handles_key` (u64 hash of `Scene::ui_revision()` + zoom + selection state + text-edit target). Rebuild skipped when key matches and the buffer exists; idle frames produce zero handle vertex writes.
 - [x] Cache `flatten_tree` output — `EditorState::cached_flatten` keyed on `(Scene::ui_revision(), structure_collapse_rev)`. New `Scene::ui_revision()` bumps on every mutation (including the visible/locked/label setters that intentionally don't bump the geometry/subtree revs); `structure_collapse_rev` bumps when the chevron toggles collapse state.
-- [x] Per-path tessellation cache — `TessCache` in `vector-render`, keyed on each node's `Scene::geometry_revision`. Vertices live in local space; per-path `path_id` indexes a `transforms` storage buffer rebuilt per frame. Transform-only edits reuse cached vertex/index buffers verbatim.
-- [x] Per-boolean-group computed-path cache — `BoolPathCache` in `vector-render`, keyed on `Scene::subtree_revision`. Eliminates per-frame `i_overlay` calls for idle boolean groups.
-- [ ] Nice-to-have: thread `BoolPathCache` through `vector_bool::compute_boolean_group_path`'s recursion so nested boolean groups hit their own cache while the outer group is being recomputed. Only matters when a wide/deeply-nested boolean tree has active edits in one branch while siblings stay idle — uncommon enough that the outer-only cache is fine for now.
+- [x] Per-path tessellation cache — `TessCache` in `locus-render`, keyed on each node's `Scene::geometry_revision`. Vertices live in local space; per-path `path_id` indexes a `transforms` storage buffer rebuilt per frame. Transform-only edits reuse cached vertex/index buffers verbatim.
+- [x] Per-boolean-group computed-path cache — `BoolPathCache` in `locus-render`, keyed on `Scene::subtree_revision`. Eliminates per-frame `i_overlay` calls for idle boolean groups.
+- [ ] Nice-to-have: thread `BoolPathCache` through `locus_bool::compute_boolean_group_path`'s recursion so nested boolean groups hit their own cache while the outer group is being recomputed. Only matters when a wide/deeply-nested boolean tree has active edits in one branch while siblings stay idle — uncommon enough that the outer-only cache is fine for now.
 
 ### Architecture
-- [x] Split `bin/vector-editor/src/app.rs` (3491 → 986 lines) into focused modules: camera, demo, snap, util, hud, editor_state, context_menu, structure_panel, properties_panel, ui.
+- [x] Split `bin/locus-editor/src/app.rs` (3491 → 986 lines) into focused modules: camera, demo, snap, util, hud, editor_state, context_menu, structure_panel, properties_panel, ui.
 
-### Raster tracing (`vector-trace`)
+### Raster tracing (`locus-trace`)
 - [ ] Preset/parameter tuning UI — egui dialog exposing TracePreset (Bw/Poster/Photo) and the key vtracer knobs (filter_speckle, color_precision, corner_threshold, splice_threshold, layer_difference, path simplify mode). Currently hard-coded to Poster default.
-- [ ] Async tracing — run `vector_trace::trace_image_bytes` off the UI thread (std::thread + channel, or a simple worker). Large images block the UI for seconds.
+- [ ] Async tracing — run `locus_trace::trace_image_bytes` off the UI thread (std::thread + channel, or a simple worker). Large images block the UI for seconds.
 - [ ] Live preview while tuning — reduced-resolution preview that re-traces on parameter change (depends on async tracing + parameter UI).
 - [ ] Centerline tracing — v2 feature for line art / technical drawings where strokes should become single stroked paths instead of filled outlines. No good Rust crate exists; custom skeletonization (medial axis) required.

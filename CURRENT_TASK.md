@@ -12,7 +12,7 @@ boundary.
    thousands of paths (raster-traced SVGs, complex imports) this dominates
    frame time.
 
-2. **Per-boolean-group computed-path cache** — `vector_bool::compute_boolean_group_path`
+2. **Per-boolean-group computed-path cache** — `locus_bool::compute_boolean_group_path`
    runs on every frame inside the renderer's dirty-check tessellation loop,
    plus again from selection-bbox, scale-handle bounds, SVG export, and
    hit-testing. `i_overlay`'s polygon boolean is expensive (O(n log n) with
@@ -144,7 +144,7 @@ Pure refactor + new infrastructure. Mergeable as its own commit.
    convert to setter or guard.
 6. Wire `insert` / `insert_at` / `insert_subtree` / `remove` / `reparent`
    to bump the affected parent chains.
-7. Unit tests (in `vector-scene`):
+7. Unit tests (in `locus-scene`):
    - `set_path_data` bumps geometry_rev + subtree_rev chain.
    - `set_transform` bumps subtree_rev only (not geometry_rev).
    - `insert` bumps parent's subtree_rev + all further ancestors.
@@ -169,11 +169,11 @@ Adds the first cache consumer. Small, self-contained in the renderer.
    (main tess, selection bbox, scale-handle bounds) with a
    `cached_boolean_group_path(scene, id)` helper that checks the cache
    and recomputes only on subtree_rev mismatch.
-3. Standalone call sites (`vector-svg`, `vector-tools`, flatten action,
-   `vector-bool::boolean_group_visual_bounds`) stay uncached for now —
+3. Standalone call sites (`locus-svg`, `locus-tools`, flatten action,
+   `locus-bool::boolean_group_visual_bounds`) stay uncached for now —
    they're one-shot, not on the hot loop. Revisit later if profiling
    says otherwise.
-4. Test: unit test in vector-render or via a smoke test — touch a
+4. Test: unit test in locus-render or via a smoke test — touch a
    descendant's subtree_rev → cache miss → recompute; no touch → cache
    hit.
 5. Cache eviction on node deletion is automatic (SecondaryMap).
@@ -236,7 +236,7 @@ tess cache with local-space vertices + per-draw transforms`.
 5. **Boolean-group cache inside boolean groups** — `compute_boolean_group_path`
    recurses into nested boolean descendants. The cache should benefit
    nested groups too (each level caches its own path). Verify the
-   recursive call in `vector_bool::lib.rs:281` goes through the cache,
+   recursive call in `locus_bool::lib.rs:281` goes through the cache,
    not the uncached function.
 
 ## Where we are now
@@ -246,15 +246,15 @@ tess cache with local-space vertices + per-draw transforms`.
   closure helpers. 17 new scene tests pass.
   Commit: `3510833 refactor(scene): per-node revision tracking for cache
   invalidation`.
-- **Phase B done** — `BoolPathCache` in `vector-render`, keyed on
+- **Phase B done** — `BoolPathCache` in `locus-render`, keyed on
   `Scene::subtree_revision`. Replaces all three in-renderer
   `compute_boolean_group_path` call sites. 4 new cache tests pass.
   (Note on risk #5: nested-boolean recursion in
-  `vector_bool::compute_boolean_group_path` still goes through the
+  `locus_bool::compute_boolean_group_path` still goes through the
   uncached function, but in the common steady state the outer cache
   short-circuits before recursion happens at all, so nested groups
   effectively benefit. Filed as nice-to-have in TODO.md.)
-- **Phase C done** — `TessCache` in `vector-render`, keyed on each
+- **Phase C done** — `TessCache` in `locus-render`, keyed on each
   node's `Scene::geometry_revision`. Tessellation moved into local
   space; each vertex carries a `path_id` that indexes into a new
   `transforms` storage buffer populated per frame. Transform-only

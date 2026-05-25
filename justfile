@@ -1,4 +1,4 @@
-# Build automation for Vector Editor
+# Build automation for Locus
 
 # Default recipe
 default: build
@@ -13,17 +13,17 @@ release:
 
 # Run the editor (debug)
 run:
-    cargo run -p vector-editor
+    cargo run -p locus-editor
 
 # Run the editor (release, faster rendering)
 run-release:
-    cargo run -p vector-editor --release
+    cargo run -p locus-editor --release
 
 # Run the editor with Tracy profiling enabled. Launch `tracy-profiler` (the
 # Tracy capture UI) first, or start it after — it will connect to a running
 # client. Use release to get realistic timings.
 run-tracy:
-    cargo run -p vector-editor --release --features tracy
+    cargo run -p locus-editor --release --features tracy
 
 # Run all tests
 test:

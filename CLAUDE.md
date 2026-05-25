@@ -1,4 +1,4 @@
-# Vector Editor
+# Locus
 
 A greenfield SVG/vector graphics editor in Rust — an Inkscape replacement built from first principles.
 
@@ -11,16 +11,16 @@ A greenfield SVG/vector graphics editor in Rust — an Inkscape replacement buil
 ### Workspace layout
 
 ```
-bin/vector-editor/     Main GUI binary (winit + wgpu + egui app loop)
+bin/locus-editor/     Main GUI binary (winit + wgpu + egui app loop)
 crates/
-  vector-geom/         Point, Vec2, Affine, Bounds, Segment, Path, SubPath, Color (linear RGBA)
-  vector-scene/        Node tree (SlotMap-based), Style, Paint, PaintRef, stable IDs
-  vector-svg/          SVG import (usvg) / export (stub)
-  vector-text/         Text shaping (rustybuzz + ttf-parser) — stub
-  vector-tess/         Path tessellation via lyon (fill + stroke)
-  vector-render/       wgpu pipeline, shader, ortho projection, scene rendering
-  vector-ops/          Undo/redo command history
-  vector-tools/        Editing tools (select, pen, etc.) — stub
+  locus-geom/         Point, Vec2, Affine, Bounds, Segment, Path, SubPath, Color (linear RGBA)
+  locus-scene/        Node tree (SlotMap-based), Style, Paint, PaintRef, stable IDs
+  locus-svg/          SVG import (usvg) / export (stub)
+  locus-text/         Text shaping (rustybuzz + ttf-parser) — stub
+  locus-tess/         Path tessellation via lyon (fill + stroke)
+  locus-render/       wgpu pipeline, shader, ortho projection, scene rendering
+  locus-ops/          Undo/redo command history
+  locus-tools/        Editing tools (select, pen, etc.) — stub
 ```
 
 ### Key design decisions
@@ -35,7 +35,7 @@ crates/
 ## Build & Run
 
 ```sh
-cargo run -p vector-editor          # launch the editor
+cargo run -p locus-editor          # launch the editor
 cargo build                         # build all crates
 cargo test --workspace              # run all tests
 cargo clippy --workspace            # lint

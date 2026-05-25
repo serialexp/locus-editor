@@ -1,4 +1,4 @@
-# Vector Editor
+# Locus
 
 A GPU-accelerated SVG/vector graphics editor built from first principles in Rust. Intended as a modern, fast alternative to Inkscape.
 
@@ -21,7 +21,7 @@ A GPU-accelerated SVG/vector graphics editor built from first principles in Rust
 ### From release (Linux/macOS)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/serialexp/vector-editor/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/serialexp/locus-editor/main/install.sh | bash
 ```
 
 ### From source
@@ -35,17 +35,17 @@ sudo apt-get install -y libxkbcommon-dev libx11-dev libxcb1-dev \
   libwayland-dev libgtk-3-dev
 
 # Build and run
-cargo run -p vector-editor --release
+cargo run -p locus-editor --release
 ```
 
 ## Usage
 
 ```sh
 # Launch the editor
-vector-editor
+locus-editor
 
 # Open an SVG file
-vector-editor path/to/file.svg
+locus-editor path/to/file.svg
 ```
 
 ## Development
@@ -60,16 +60,16 @@ just ci             # full CI check (fmt + clippy + test)
 ## Architecture
 
 ```
-bin/vector-editor/     Main GUI binary (winit + wgpu + egui)
+bin/locus-editor/     Main GUI binary (winit + wgpu + egui)
 crates/
-  vector-geom/         Point, Vec2, Affine, Bounds, Segment, Path, Color
-  vector-scene/        Node tree (SlotMap-based), Style, Paint, PaintRef
-  vector-svg/          SVG import (usvg) / export
-  vector-text/         Text shaping (rustybuzz + ttf-parser)
-  vector-tess/         Path tessellation via lyon (fill + stroke)
-  vector-render/       wgpu pipeline, shaders, scene rendering
-  vector-ops/          Undo/redo command history
-  vector-tools/        Editing tools (select, pen)
+  locus-geom/         Point, Vec2, Affine, Bounds, Segment, Path, Color
+  locus-scene/        Node tree (SlotMap-based), Style, Paint, PaintRef
+  locus-svg/          SVG import (usvg) / export
+  locus-text/         Text shaping (rustybuzz + ttf-parser)
+  locus-tess/         Path tessellation via lyon (fill + stroke)
+  locus-render/       wgpu pipeline, shaders, scene rendering
+  locus-ops/          Undo/redo command history
+  locus-tools/        Editing tools (select, pen)
 ```
 
 ## License

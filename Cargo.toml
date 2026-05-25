@@ -1,17 +1,17 @@
 [workspace]
 members = [
-    "crates/vector-geom",
-    "crates/vector-scene",
-    "crates/vector-svg",
-    "crates/vector-text",
-    "crates/vector-tess",
-    "crates/vector-render",
-    "crates/vector-ops",
-    "crates/vector-bool",
-    "crates/vector-tools",
-    "crates/vector-trace",
-    "crates/vector-llm",
-    "bin/vector-editor",
+    "crates/locus-geom",
+    "crates/locus-scene",
+    "crates/locus-svg",
+    "crates/locus-text",
+    "crates/locus-tess",
+    "crates/locus-render",
+    "crates/locus-ops",
+    "crates/locus-bool",
+    "crates/locus-tools",
+    "crates/locus-trace",
+    "crates/locus-llm",
+    "bin/locus-editor",
 ]
 resolver = "2"
 
@@ -33,9 +33,9 @@ nalgebra = "0.33"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1"
 
-# Cross-platform per-app config dir (~/.config/vector-editor on Linux,
-# ~/Library/Application Support/vector-editor on macOS,
-# %APPDATA%/vector-editor on Windows). Used for the recent-files list.
+# Cross-platform per-app config dir (~/.config/locus-editor on Linux,
+# ~/Library/Application Support/locus-editor on macOS,
+# %APPDATA%/locus-editor on Windows). Used for the recent-files list.
 directories = "6"
 
 # SVG
@@ -90,7 +90,7 @@ keyring = { version = "3", default-features = false, features = [
     "vendored",
 ] }
 
-# Profiling. No-op by default; the `tracy` feature on `vector-editor` flips
+# Profiling. No-op by default; the `tracy` feature on `locus-editor` flips
 # the backend on across all crates that declare this dep.
 profiling = "1"
 

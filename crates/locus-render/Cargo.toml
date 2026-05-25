@@ -1,0 +1,20 @@
+[package]
+name = "locus-render"
+description = "wgpu rendering pipeline for the vector scene"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../locus-geom" }
+locus-scene = { path = "../locus-scene" }
+locus-bool = { path = "../locus-bool" }
+locus-tess = { path = "../locus-tess" }
+locus-text = { path = "../locus-text" }
+locus-tools = { path = "../locus-tools" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+profiling = { workspace = true }
+slotmap = { workspace = true }

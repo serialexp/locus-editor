@@ -1,0 +1,12 @@
+[package]
+name = "locus-geom"
+description = "Pure math primitives: points, transforms, bounding boxes, path segments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+kurbo = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }

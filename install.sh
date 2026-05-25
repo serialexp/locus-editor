@@ -1,12 +1,12 @@
 #!/bin/bash
-# Universal installer script for Vector Editor
+# Universal installer script for Locus
 # Downloads and installs the appropriate release for the current platform
 
 set -euo pipefail
 
-REPO="serialexp/vector-editor"
-APP_NAME="vector-editor"
-DISPLAY_NAME="Vector Editor"
+REPO="serialexp/locus-editor"
+APP_NAME="locus-editor"
+DISPLAY_NAME="Locus"
 
 # Colors for output
 RED='\033[0;31m'
@@ -247,7 +247,7 @@ install_windows() {
 main() {
     echo ""
     echo "  ╔═══════════════════════════════════════╗"
-    echo "  ║     Vector Editor Installer            ║"
+    echo "  ║     Locus Installer            ║"
     echo "  ╚═══════════════════════════════════════╝"
     echo ""
 

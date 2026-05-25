@@ -1,0 +1,13 @@
+[package]
+name = "locus-bool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../locus-geom" }
+locus-scene = { path = "../locus-scene" }
+locus-tess = { path = "../locus-tess" }
+i_overlay = "4"
+lyon_geom = { workspace = true }

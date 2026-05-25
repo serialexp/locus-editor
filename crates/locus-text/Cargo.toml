@@ -1,0 +1,14 @@
+[package]
+name = "locus-text"
+description = "Text shaping and glyph outline extraction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../locus-geom" }
+rustybuzz = { workspace = true }
+ttf-parser = { workspace = true }
+fontdb = { workspace = true }
+log = { workspace = true }

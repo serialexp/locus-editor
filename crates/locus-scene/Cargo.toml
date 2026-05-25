@@ -1,0 +1,14 @@
+[package]
+name = "locus-scene"
+description = "Scene graph: nodes, stable IDs, references, transform cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../locus-geom" }
+locus-text = { path = "../locus-text" }
+locus-tess = { path = "../locus-tess" }
+slotmap = { workspace = true }
+serde = { workspace = true }

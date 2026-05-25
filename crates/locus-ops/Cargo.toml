@@ -1,0 +1,11 @@
+[package]
+name = "locus-ops"
+description = "Editing commands and undo/redo over the scene graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../locus-geom" }
+locus-scene = { path = "../locus-scene" }

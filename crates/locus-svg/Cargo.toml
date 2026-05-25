@@ -1,0 +1,15 @@
+[package]
+name = "locus-svg"
+description = "SVG import/export with geometric round-trip fidelity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../locus-geom" }
+locus-scene = { path = "../locus-scene" }
+locus-bool = { path = "../locus-bool" }
+locus-text = { path = "../locus-text" }
+usvg = { workspace = true }
+log = { workspace = true }

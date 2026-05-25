@@ -1,0 +1,16 @@
+[package]
+name = "locus-tools"
+description = "Interactive editor tools: selection, pen, shapes, node editing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../locus-geom" }
+locus-scene = { path = "../locus-scene" }
+locus-bool = { path = "../locus-bool" }
+locus-tess = { path = "../locus-tess" }
+locus-text = { path = "../locus-text" }
+locus-ops = { path = "../locus-ops" }
+egui-phosphor = { workspace = true }

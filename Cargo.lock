@@ -2343,6 +2343,170 @@ dependencies = [
 ]
 
 [[package]]
+name = "locus-bool"
+version = "0.5.5"
+dependencies = [
+ "i_overlay",
+ "locus-geom",
+ "locus-scene",
+ "locus-tess",
+ "lyon_geom",
+]
+
+[[package]]
+name = "locus-editor"
+version = "0.5.5"
+dependencies = [
+ "directories",
+ "egui",
+ "egui-phosphor",
+ "egui-wgpu",
+ "egui-winit",
+ "embed-resource",
+ "env_logger",
+ "image 0.25.10",
+ "locus-bool",
+ "locus-geom",
+ "locus-llm",
+ "locus-ops",
+ "locus-render",
+ "locus-scene",
+ "locus-svg",
+ "locus-tess",
+ "locus-text",
+ "locus-tools",
+ "locus-trace",
+ "log",
+ "memory-stats",
+ "pollster",
+ "profiling",
+ "rfd",
+ "serde",
+ "serde_json",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "locus-geom"
+version = "0.5.5"
+dependencies = [
+ "bytemuck",
+ "kurbo 0.11.3",
+ "serde",
+]
+
+[[package]]
+name = "locus-llm"
+version = "0.5.5"
+dependencies = [
+ "keyring",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "locus-ops"
+version = "0.5.5"
+dependencies = [
+ "locus-geom",
+ "locus-scene",
+]
+
+[[package]]
+name = "locus-render"
+version = "0.5.5"
+dependencies = [
+ "bytemuck",
+ "locus-bool",
+ "locus-geom",
+ "locus-scene",
+ "locus-tess",
+ "locus-text",
+ "locus-tools",
+ "log",
+ "profiling",
+ "slotmap",
+ "wgpu",
+]
+
+[[package]]
+name = "locus-scene"
+version = "0.5.5"
+dependencies = [
+ "locus-geom",
+ "locus-tess",
+ "locus-text",
+ "serde",
+ "slotmap",
+]
+
+[[package]]
+name = "locus-svg"
+version = "0.5.5"
+dependencies = [
+ "locus-bool",
+ "locus-geom",
+ "locus-scene",
+ "locus-text",
+ "log",
+ "usvg",
+]
+
+[[package]]
+name = "locus-tess"
+version = "0.5.5"
+dependencies = [
+ "bytemuck",
+ "locus-geom",
+ "lyon_geom",
+ "lyon_tessellation",
+ "profiling",
+ "wgpu",
+]
+
+[[package]]
+name = "locus-text"
+version = "0.5.5"
+dependencies = [
+ "fontdb",
+ "locus-geom",
+ "log",
+ "rustybuzz",
+ "ttf-parser 0.24.1",
+]
+
+[[package]]
+name = "locus-tools"
+version = "0.5.5"
+dependencies = [
+ "egui-phosphor",
+ "locus-bool",
+ "locus-geom",
+ "locus-ops",
+ "locus-scene",
+ "locus-tess",
+ "locus-text",
+]
+
+[[package]]
+name = "locus-trace"
+version = "0.5.5"
+dependencies = [
+ "image 0.25.10",
+ "locus-geom",
+ "locus-scene",
+ "locus-svg",
+ "log",
+ "thiserror 2.0.18",
+ "visioncortex",
+ "vtracer",
+]
+
+[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4855,170 +5019,6 @@ name = "vec_map"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
-
-[[package]]
-name = "vector-bool"
-version = "0.5.5"
-dependencies = [
- "i_overlay",
- "lyon_geom",
- "vector-geom",
- "vector-scene",
- "vector-tess",
-]
-
-[[package]]
-name = "vector-editor"
-version = "0.5.5"
-dependencies = [
- "directories",
- "egui",
- "egui-phosphor",
- "egui-wgpu",
- "egui-winit",
- "embed-resource",
- "env_logger",
- "image 0.25.10",
- "log",
- "memory-stats",
- "pollster",
- "profiling",
- "rfd",
- "serde",
- "serde_json",
- "vector-bool",
- "vector-geom",
- "vector-llm",
- "vector-ops",
- "vector-render",
- "vector-scene",
- "vector-svg",
- "vector-tess",
- "vector-text",
- "vector-tools",
- "vector-trace",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "vector-geom"
-version = "0.5.5"
-dependencies = [
- "bytemuck",
- "kurbo 0.11.3",
- "serde",
-]
-
-[[package]]
-name = "vector-llm"
-version = "0.5.5"
-dependencies = [
- "keyring",
- "log",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "vector-ops"
-version = "0.5.5"
-dependencies = [
- "vector-geom",
- "vector-scene",
-]
-
-[[package]]
-name = "vector-render"
-version = "0.5.5"
-dependencies = [
- "bytemuck",
- "log",
- "profiling",
- "slotmap",
- "vector-bool",
- "vector-geom",
- "vector-scene",
- "vector-tess",
- "vector-text",
- "vector-tools",
- "wgpu",
-]
-
-[[package]]
-name = "vector-scene"
-version = "0.5.5"
-dependencies = [
- "serde",
- "slotmap",
- "vector-geom",
- "vector-tess",
- "vector-text",
-]
-
-[[package]]
-name = "vector-svg"
-version = "0.5.5"
-dependencies = [
- "log",
- "usvg",
- "vector-bool",
- "vector-geom",
- "vector-scene",
- "vector-text",
-]
-
-[[package]]
-name = "vector-tess"
-version = "0.5.5"
-dependencies = [
- "bytemuck",
- "lyon_geom",
- "lyon_tessellation",
- "profiling",
- "vector-geom",
- "wgpu",
-]
-
-[[package]]
-name = "vector-text"
-version = "0.5.5"
-dependencies = [
- "fontdb",
- "log",
- "rustybuzz",
- "ttf-parser 0.24.1",
- "vector-geom",
-]
-
-[[package]]
-name = "vector-tools"
-version = "0.5.5"
-dependencies = [
- "egui-phosphor",
- "vector-bool",
- "vector-geom",
- "vector-ops",
- "vector-scene",
- "vector-tess",
- "vector-text",
-]
-
-[[package]]
-name = "vector-trace"
-version = "0.5.5"
-dependencies = [
- "image 0.25.10",
- "log",
- "thiserror 2.0.18",
- "vector-geom",
- "vector-scene",
- "vector-svg",
- "visioncortex",
- "vtracer",
-]
 
 [[package]]
 name = "vello_common"

@@ -7,7 +7,7 @@
 #
 # Outputs (under assets/generated/):
 #   png/icon-{16,32,48,64,128,256,512}.png   — individual sizes
-#   png/vector-editor.png                    — copy of icon-256.png, named for
+#   png/locus-editor.png                    — copy of icon-256.png, named for
 #                                              Linux hicolor / .desktop usage
 #   icon.ico        — Windows multi-resolution
 #   icon.icns       — macOS multi-resolution
@@ -77,7 +77,7 @@ done
 for size in 64 128 256 512; do
     rasterize "$SRC_MAIN" "$size" "$PNG_OUT/icon-${size}.png"
 done
-cp "$PNG_OUT/icon-256.png" "$PNG_OUT/vector-editor.png"
+cp "$PNG_OUT/icon-256.png" "$PNG_OUT/locus-editor.png"
 
 echo "==> packing icon.ico (Windows)"
 # Windows .ico: include the standard set. Explorer picks the right one per DPI.

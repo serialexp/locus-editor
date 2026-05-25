@@ -1,0 +1,67 @@
+[package]
+name = "locus-editor"
+description = "SVG/vector editor — Inkscape replacement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+locus-geom = { path = "../../crates/locus-geom" }
+locus-scene = { path = "../../crates/locus-scene" }
+locus-svg = { path = "../../crates/locus-svg" }
+locus-text = { path = "../../crates/locus-text" }
+locus-tess = { path = "../../crates/locus-tess" }
+locus-render = { path = "../../crates/locus-render" }
+locus-ops = { path = "../../crates/locus-ops" }
+locus-bool = { path = "../../crates/locus-bool" }
+locus-tools = { path = "../../crates/locus-tools" }
+locus-trace = { path = "../../crates/locus-trace" }
+locus-llm = { path = "../../crates/locus-llm" }
+
+# Rendering + windowing
+wgpu = { workspace = true }
+winit = { workspace = true }
+pollster = { workspace = true }
+
+# GUI
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+egui-phosphor = { workspace = true }
+
+# File dialog
+rfd = { workspace = true }
+
+# Persisted UI state (currently just the recent-files list).
+serde = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+
+# Raster decoding (drag-drop / Insert Image flow). Same crate + features as
+# locus-trace so we share the decoder cache; we just don't go through the
+# tracer — we keep the pixels and build a Raster scene node directly.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+
+# Utilities
+log = { workspace = true }
+env_logger = { workspace = true }
+memory-stats = "1"
+profiling = { workspace = true }
+
+[build-dependencies]
+# Embeds icon.rc → icon.ico into the .exe so Explorer / taskbar pick up the
+# application icon. The build.rs only invokes it under cfg(target_os =
+# "windows"), so on every other target this is just a small extra crate to
+# compile once. Listed unconditionally (rather than under
+# [target.'cfg(windows)'.build-dependencies]) because that variant keys off
+# the *host* platform — it would break Linux→Windows cross-builds, where
+# the host isn't Windows but the build.rs target_os check is true.
+embed-resource = "3"
+
+[features]
+default = []
+# Enable Tracy profiling. Run the Tracy capture UI to connect. Adds
+# non-zero overhead even when no client is attached, so leave off for
+# release builds.
+tracy = ["profiling/profile-with-tracy"]
