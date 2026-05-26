@@ -9,6 +9,7 @@ mod paint_picker;
 mod preview_group;
 mod properties_panel;
 mod recent_files;
+mod script_dialog;
 mod snap;
 mod structure_panel;
 mod svg_drop_dialog;

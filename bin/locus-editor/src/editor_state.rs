@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,6 +24,7 @@ use crate::camera::Camera;
 use crate::hud::PerfStats;
 use crate::llm_dialog::LlmDialogState;
 use crate::recent_files::RecentFiles;
+use crate::script_dialog::ScriptDialogState;
 use crate::snap::{SnapHit, SnapSettings};
 use crate::svg_drop_dialog::SvgDropDialogState;
 use crate::trace_dialog::TraceDialogState;
@@ -145,6 +147,41 @@ pub(crate) struct EditorState {
     /// doesn't have to re-read the source file (which may have changed
     /// or been deleted while the dialog sat open).
     pub(crate) svg_drop_dialog: Option<SvgDropDialogState>,
+    /// Active "Generate shape from script…" dialog. Same single-instance
+    /// pattern as `trace_dialog` / `llm_dialog`: while `Some`, a live
+    /// preview group is parented at the scene root, re-evaluated on
+    /// every input change, and the menu item that opens this dialog is
+    /// greyed out.
+    pub(crate) script_dialog: Option<ScriptDialogState>,
+    /// Path of the file the document was loaded from (or last saved to).
+    /// `None` for a never-saved, never-opened document. Drives the "Save"
+    /// action (which writes back to this path) — distinct from "Save As…"
+    /// which always prompts. Also feeds the window title so the user can
+    /// see which file is open.
+    pub(crate) current_path: Option<PathBuf>,
+    /// Pending Save trigger from a keyboard shortcut (Ctrl+S). The egui
+    /// pass in `run_ui` reads + clears this each frame and runs the save
+    /// through the same path as the menu item. Lives on the state (rather
+    /// than being passed in) because the key handler runs before `run_ui`
+    /// and the egui pass already owns the disjoint state borrows.
+    pub(crate) pending_save: bool,
+    /// Pending Save As trigger from a keyboard shortcut (Ctrl+Shift+S).
+    /// Same shape as `pending_save`.
+    pub(crate) pending_save_as: bool,
+    /// `Scene::ui_revision()` value at the last save / load. The document
+    /// is considered dirty when `scene.ui_revision() != clean_revision`.
+    /// Bumped to the current revision by `mark_clean()` after a successful
+    /// save or a load-replace; left alone otherwise so the dirty marker
+    /// (the leading "★" in the window title and the enabled state of
+    /// the "Save" button) reflects pending changes.
+    ///
+    /// Caveat: any history-recorded mutation bumps `ui_revision`, including
+    /// undo. So undoing back to the saved revision shows as "dirty" — the
+    /// scene state is identical but the revision counter has moved on.
+    /// This matches Inkscape's "you touched it, prove you don't want to
+    /// keep that" behaviour and is preferred over the alternative of
+    /// false-cleans (which would let the user lose work).
+    pub(crate) clean_revision: u64,
 }
 
 impl Default for EditorState {
@@ -183,6 +220,13 @@ impl Default for EditorState {
             recent_files: RecentFiles::load(),
             llm_dialog: None,
             svg_drop_dialog: None,
+            script_dialog: None,
+            current_path: None,
+            // Match Scene::new()'s initial ui_rev so a brand-new document
+            // is considered clean until the user actually edits it.
+            clean_revision: 0,
+            pending_save: false,
+            pending_save_as: false,
         }
     }
 }
@@ -329,6 +373,11 @@ impl EditorState {
         self.pending_zoom_to_fit = true;
         self.recent_files.add(path);
         self.recent_files.save();
+        // The loaded document is, by definition, in sync with the file
+        // on disk — no unsaved changes yet. Remember its path so "Save"
+        // (as opposed to "Save As…") writes back here without prompting.
+        self.current_path = Some(path.to_path_buf());
+        self.mark_clean();
         renderer.mark_dirty();
         Ok(())
     }
@@ -377,6 +426,52 @@ impl EditorState {
         self.recent_files.save();
         renderer.mark_dirty();
         Ok(new_group)
+    }
+
+    /// Has the document changed since the last successful save or load?
+    /// Compares `Scene::ui_revision()` against the revision captured by
+    /// `mark_clean()`. See the `clean_revision` field's doc comment for
+    /// the caveat about undo not restoring a "clean" state.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.scene.ui_revision() != self.clean_revision
+    }
+
+    /// Mark the current scene state as "in sync with disk". Called after
+    /// a successful save (Save or Save As) or load-replace; do NOT call
+    /// after Add-as-Group or other partial imports — those leave the
+    /// document modified relative to whatever file it was loaded from.
+    pub(crate) fn mark_clean(&mut self) {
+        self.clean_revision = self.scene.ui_revision();
+    }
+
+    /// Title to show in the OS window. "Locus" for a brand-new untitled
+    /// document, "filename — Locus" when a file is loaded, with a leading
+    /// "★ " when there are unsaved changes. The bullet star is what tells
+    /// the user "you have work that isn't on disk yet" — same convention
+    /// as Inkscape's leading asterisk.
+    pub(crate) fn window_title(&self) -> String {
+        const APP: &str = "Locus";
+        let dirty = self.is_dirty();
+        match &self.current_path {
+            Some(p) => {
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("(unnamed)");
+                if dirty {
+                    format!("★ {name} — {APP}")
+                } else {
+                    format!("{name} — {APP}")
+                }
+            }
+            None => {
+                if dirty {
+                    format!("★ Untitled — {APP}")
+                } else {
+                    APP.to_string()
+                }
+            }
+        }
     }
 
     /// True iff the scene has any user-authored content — i.e. the

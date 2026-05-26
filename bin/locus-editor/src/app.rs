@@ -21,6 +21,7 @@ use crate::context_menu::show_canvas_context_menu;
 use crate::editor_state::{CanvasContextMenu, CanvasContextTarget, EditorState};
 use crate::llm_dialog;
 use crate::preview_group::DialogAction;
+use crate::script_dialog;
 use crate::structure_panel::{StructureAction, apply_structure_action};
 use crate::trace_dialog;
 use crate::ui::run_ui;
@@ -58,6 +59,12 @@ struct GpuState {
 pub struct App {
     gpu: Option<GpuState>,
     state: EditorState,
+    /// Last `state.window_title()` we pushed to the OS. We cache it so
+    /// the per-frame `set_title` call is a no-op string compare in the
+    /// steady state (X11 and Wayland both round-trip the title; KDE's
+    /// taskbar redraws on each call). Cheap enough to recompute every
+    /// frame; not free enough to push unconditionally.
+    last_title: String,
 }
 
 impl ApplicationHandler for App {
@@ -972,6 +979,31 @@ impl ApplicationHandler for App {
                             gpu.renderer.mark_dirty();
                             gpu.window.request_redraw();
                         }
+                        // Save: Ctrl+S (no shift), Save As: Ctrl+Shift+S.
+                        // Both run through the same code path as the menu
+                        // — `run_ui` handles the dialog and write — by
+                        // synthesising a flag that the next egui pass
+                        // consumes. We can't dispatch the dialog from
+                        // here directly because the egui closures already
+                        // own disjoint borrows of `state`.
+                        Key::Character(c)
+                            if (c.as_str() == "s" || c.as_str() == "S")
+                                && ctrl
+                                && !self.state.pen_state.is_building()
+                                && !self.state.shape_draw.is_drawing()
+                                && !self.state.text_tool.is_editing() =>
+                        {
+                            if modifiers.shift {
+                                self.state.pending_save_as = true;
+                            } else if self.state.current_path.is_some() && self.state.is_dirty() {
+                                self.state.pending_save = true;
+                            } else if self.state.current_path.is_none() {
+                                // Ctrl+S on a never-saved doc still does
+                                // something useful: open the Save As dialog.
+                                self.state.pending_save_as = true;
+                            }
+                            gpu.window.request_redraw();
+                        }
                         // Redo: Ctrl+Shift+Z or Ctrl+Y
                         Key::Character(c)
                             if ((c.as_str() == "z" || c.as_str() == "Z") && modifiers.shift
@@ -1129,6 +1161,17 @@ impl App {
     fn draw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
         draw_frame(gpu, &mut self.state);
+
+        // Refresh the OS window title to reflect (a) which file is open
+        // and (b) whether it has unsaved changes — i.e. the "★ name —
+        // Locus" pattern. Done after draw_frame so any save/load that
+        // ran this frame is already reflected in `state.current_path` /
+        // `clean_revision` and we won't show stale state for a frame.
+        let want = self.state.window_title();
+        if want != self.last_title {
+            gpu.window.set_title(&want);
+            self.last_title = want;
+        }
     }
 }
 
@@ -1160,6 +1203,12 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
     // result into the preview group before drawing.
     llm_dialog::poll(state, &mut gpu.renderer, &gpu.egui_ctx);
 
+    // Script-generated-shape dialog: re-evaluate the Rhai script if any
+    // input (script text / width / height / N) has changed, then update
+    // the preview group. Runs synchronously on this thread because Rhai
+    // eval is fast enough not to need a worker.
+    script_dialog::poll(state, &mut gpu.renderer);
+
     // Run egui — use begin_pass/end_pass so the canvas area is NOT part of
     // any egui Ui, which lets is_pointer_over_egui() return false for it.
     let full_output = {
@@ -1171,6 +1220,7 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
             ui_scene_dirty_inner,
             insert_image_requested_inner,
             llm_open_requested_inner,
+            script_open_requested_inner,
         ) = run_ui(&gpu.egui_ctx, state, &mut gpu.renderer);
 
         // Canvas context menu (right-click on vertex/segment in node mode).
@@ -1243,6 +1293,22 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
             DialogAction::None => {}
         }
 
+        // Live-preview script-shape dialog. Same Apply / Cancel / None
+        // contract; the dialog's own `poll` above already updated the
+        // preview group before this `show` call.
+        let script_action = script_dialog::show(state, &gpu.egui_ctx);
+        match script_action {
+            DialogAction::Apply => {
+                script_dialog::apply(state, &mut gpu.renderer);
+                gpu.window.request_redraw();
+            }
+            DialogAction::Cancel => {
+                script_dialog::cancel(state, &mut gpu.renderer);
+                gpu.window.request_redraw();
+            }
+            DialogAction::None => {}
+        }
+
         // Capture the canvas rect (area not covered by egui panels) before ending the pass.
         #[expect(deprecated)] // content_rect may not exist in this egui version yet
         let avail = gpu.egui_ctx.available_rect();
@@ -1255,16 +1321,31 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
             ui_scene_dirty_inner,
             insert_image_requested_inner,
             llm_open_requested_inner,
+            script_open_requested_inner,
         )
     };
-    let (full_output, structure_cmds, ui_scene_dirty, insert_image_requested, llm_open_requested) =
-        full_output;
+    let (
+        full_output,
+        structure_cmds,
+        ui_scene_dirty,
+        insert_image_requested,
+        llm_open_requested,
+        script_open_requested,
+    ) = full_output;
 
     // File → Generate SVG from prompt…: opens the LLM dialog. The
     // dialog itself loads the API key from the keychain on construction
     // (so it can show a paste-key fallback if the keychain is missing).
     if llm_open_requested && state.llm_dialog.is_none() {
         llm_dialog::open(state);
+        gpu.window.request_redraw();
+    }
+
+    // File → Generate shape from script…: opens the Rhai script dialog
+    // with the default star preset. Like the LLM dialog, opens lazily
+    // here (post-`run_ui`) so we have the full `&mut EditorState`.
+    if script_open_requested && state.script_dialog.is_none() {
+        script_dialog::open(state);
         gpu.window.request_redraw();
     }
 

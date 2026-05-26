@@ -33,6 +33,9 @@ egui-phosphor = { workspace = true }
 # File dialog
 rfd = { workspace = true }
 
+# Embedded scripting for the "Generate shape from script…" dialog.
+rhai = { workspace = true }
+
 # Persisted UI state (currently just the recent-files list).
 serde = { workspace = true }
 serde_json = { workspace = true }

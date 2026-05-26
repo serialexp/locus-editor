@@ -24,6 +24,7 @@ use crate::structure_panel::{
 ///
 /// Shared between the "Open SVG…" file dialog and the "Open Recent"
 /// submenu so both paths behave identically.
+#[allow(clippy::too_many_arguments)]
 fn load_svg_from_path(
     path: &Path,
     scene: &mut Scene,
@@ -31,6 +32,8 @@ fn load_svg_from_path(
     selection: &mut SelectState,
     pending_zoom_to_fit: &mut bool,
     recent_files: &mut RecentFiles,
+    current_path: &mut Option<PathBuf>,
+    clean_revision: &mut u64,
     renderer: &mut Renderer,
 ) {
     match std::fs::read(path) {
@@ -43,6 +46,12 @@ fn load_svg_from_path(
                 renderer.mark_dirty();
                 recent_files.add(path);
                 recent_files.save();
+                // The freshly-loaded scene is in sync with the file on
+                // disk: remember its path (so "Save" targets it without
+                // prompting) and snapshot its `ui_revision` as the
+                // clean baseline.
+                *current_path = Some(path.to_path_buf());
+                *clean_revision = scene.ui_revision();
                 log::info!("Opened SVG: {}", path.display());
             }
             Err(e) => log::error!("Failed to import SVG: {e}"),
@@ -56,17 +65,17 @@ fn load_svg_from_path(
 /// `is_pointer_over_egui()` return false for the canvas.
 ///
 /// Returns `(structure_commands, scene_dirty, insert_image_requested,
-/// llm_open_requested)`.
-/// `insert_image_requested` and `llm_open_requested` are handled by the
-/// caller (which has access to the full `&mut EditorState`); we can't
-/// open them inline because state is already destructured into disjoint
-/// borrows by the time we reach the menu code.
+/// llm_open_requested, script_open_requested)`.
+/// The `*_requested` booleans are handled by the caller (which has
+/// access to the full `&mut EditorState`); we can't open dialogs inline
+/// because state is already destructured into disjoint borrows by the
+/// time we reach the menu code.
 #[expect(deprecated)] // Panel::show is deprecated in 0.34 but needed for top-level panels
 pub(crate) fn run_ui(
     ctx: &egui::Context,
     state: &mut EditorState,
     renderer: &mut Renderer,
-) -> (StructureCommands, bool, bool, bool) {
+) -> (StructureCommands, bool, bool, bool, bool) {
     let scene = &mut state.scene;
     let history = &mut state.history;
     let active_tool = &mut state.active_tool;
@@ -86,16 +95,29 @@ pub(crate) fn run_ui(
     let trace_dialog = &mut state.trace_dialog;
     let last_trace_params = &mut state.last_trace_params;
     let recent_files = &mut state.recent_files;
+    let current_path = &mut state.current_path;
+    let clean_revision = &mut state.clean_revision;
     let llm_dialog_open = state.llm_dialog.is_some();
+    let script_dialog_open = state.script_dialog.is_some();
+    // Snapshot the dirty flag here so we don't have to re-borrow `scene`
+    // just for the menu's enabled-state check. `scene.ui_revision()` is
+    // an O(1) load; safe to read once per frame.
+    let is_dirty = scene.ui_revision() != *clean_revision;
     let mut dump_requested = false;
     let mut reorder_cmd: ReorderCommand = None;
     let mut structure_cmds: StructureCommands = Vec::new();
     let mut scene_dirty = false;
     let mut open_requested = false;
-    let mut save_requested = false;
+    // Drain any keyboard-shortcut-triggered save requests from the prior
+    // event pump. We do this here (instead of at the call site) so the
+    // menu handler and the shortcut handler take the same path through
+    // the dialog / write logic below.
+    let mut save_requested = std::mem::take(&mut state.pending_save);
+    let mut save_as_requested = std::mem::take(&mut state.pending_save_as);
     let mut trace_requested = false;
     let mut insert_image_requested = false;
     let mut llm_open_requested = false;
+    let mut script_open_requested = false;
     let mut undo_requested = false;
     let mut redo_requested = false;
     let mut fit_page_to_content_requested = false;
@@ -146,8 +168,21 @@ pub(crate) fn run_ui(
                         }
                     });
                 });
-                if ui.button("Save SVG...").clicked() {
+                // "Save" writes back to the currently-loaded file. Greyed
+                // out when there is no current file (never saved/opened)
+                // or when there are no unsaved changes — nothing useful
+                // would happen on click in either case. "Save As…" is
+                // always available.
+                let can_save = current_path.is_some() && is_dirty;
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save  Ctrl+S"))
+                    .clicked()
+                {
                     save_requested = true;
+                    ui.close();
+                }
+                if ui.button("Save As...  Ctrl+Shift+S").clicked() {
+                    save_as_requested = true;
                     ui.close();
                 }
                 ui.separator();
@@ -179,6 +214,20 @@ pub(crate) fn run_ui(
                     .clicked()
                 {
                     llm_open_requested = true;
+                    ui.close();
+                }
+                // Same single-instance pattern as trace / LLM: the
+                // dialog owns one live preview group in the scene at a
+                // time, so the menu item is greyed out while a script
+                // dialog is already up.
+                if ui
+                    .add_enabled(
+                        !script_dialog_open,
+                        egui::Button::new("Generate shape from script..."),
+                    )
+                    .clicked()
+                {
+                    script_open_requested = true;
                     ui.close();
                 }
             });
@@ -699,6 +748,8 @@ pub(crate) fn run_ui(
             selection,
             pending_zoom_to_fit,
             recent_files,
+            current_path,
+            clean_revision,
             renderer,
         );
     }
@@ -708,15 +759,48 @@ pub(crate) fn run_ui(
         recent_files.save();
     }
 
-    if save_requested
-        && let Some(path) = rfd::FileDialog::new()
-            .add_filter("SVG files", &["svg"])
-            .set_file_name("untitled.svg")
-            .save_file()
+    // "Save" without a current path falls through to Save As so the user
+    // still gets prompted instead of silently failing or invoking nothing.
+    // (The menu greys Save out in that case; this guards Ctrl+S, which
+    // is wired in app.rs without an enabled check.)
+    if save_requested && current_path.is_some() {
+        if let Some(path) = current_path.clone() {
+            let svg = locus_svg::export_svg(scene);
+            match std::fs::write(&path, &svg) {
+                Ok(()) => {
+                    *clean_revision = scene.ui_revision();
+                    log::info!("Saved SVG: {}", path.display());
+                }
+                Err(e) => log::error!("Failed to save file: {e}"),
+            }
+        }
+    } else if (save_requested || save_as_requested)
+        && let Some(path) = {
+            // Pre-fill the save dialog with the current file's name if we
+            // have one; otherwise an "untitled.svg" placeholder. rfd
+            // doesn't expose a separate initial-directory hook on every
+            // platform, so set_file_name on its own is the portable lever.
+            let suggested = current_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("untitled.svg")
+                .to_string();
+            rfd::FileDialog::new()
+                .add_filter("SVG files", &["svg"])
+                .set_file_name(&suggested)
+                .save_file()
+        }
     {
         let svg = locus_svg::export_svg(scene);
         match std::fs::write(&path, &svg) {
-            Ok(()) => log::info!("Saved SVG: {}", path.display()),
+            Ok(()) => {
+                *current_path = Some(path.clone());
+                *clean_revision = scene.ui_revision();
+                recent_files.add(&path);
+                recent_files.save();
+                log::info!("Saved SVG: {}", path.display());
+            }
             Err(e) => log::error!("Failed to save file: {e}"),
         }
     }
@@ -761,5 +845,6 @@ pub(crate) fn run_ui(
         scene_dirty,
         insert_image_requested,
         llm_open_requested,
+        script_open_requested,
     )
 }

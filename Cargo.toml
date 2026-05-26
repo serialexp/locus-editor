@@ -71,6 +71,13 @@ slotmap = { version = "1.0", features = ["serde"] }
 # File dialog
 rfd = "0.15"
 
+# Embedded scripting language used by the "Generate shape from script…"
+# dialog. Pure Rust, no unsafe in the embedding API. `sync` feature makes
+# `Engine` `Send + Sync` so we can keep the option of moving evaluation
+# off the UI thread later. We turn off the default-features grab-bag to
+# avoid pulling in the optimizer and other features we don't use.
+rhai = { version = "1", default-features = false, features = ["sync"] }
+
 # HTTP client for the LLM crate. Blocking + rustls keeps us off async-runtime
 # territory (matches the worker-thread pattern the trace dialog uses) and off
 # OpenSSL.
