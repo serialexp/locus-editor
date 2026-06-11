@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "locus-bool"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "i_overlay",
  "locus-geom",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "locus-editor"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "directories",
  "egui",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "locus-geom"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "bytemuck",
  "kurbo 0.11.3",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "locus-llm"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "keyring",
  "log",
@@ -2432,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "locus-ops"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "locus-geom",
  "locus-scene",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "locus-render"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "bytemuck",
  "locus-bool",
@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "locus-scene"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "locus-geom",
  "locus-tess",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "locus-svg"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "locus-bool",
  "locus-geom",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "locus-tess"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "bytemuck",
  "locus-geom",
@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "locus-text"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "fontdb",
  "locus-geom",
@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "locus-tools"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "egui-phosphor",
  "locus-bool",
@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "locus-trace"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "image 0.25.10",
  "locus-geom",
