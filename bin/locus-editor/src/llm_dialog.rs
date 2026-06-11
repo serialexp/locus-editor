@@ -563,10 +563,11 @@ fn apply_chat_result(state: &mut EditorState, renderer: &mut Renderer, result: L
                 dialog.last_error = Some(msg);
                 // Drop the trailing user turn so the user can edit and
                 // resend without the failed attempt sitting in history.
-                if let Some(last) = dialog.conversation.messages.last()
-                    && last.role == Role::User
+                if let Some(removed) = dialog
+                    .conversation
+                    .messages
+                    .pop_if(|last| last.role == Role::User)
                 {
-                    let removed = dialog.conversation.messages.pop().unwrap();
                     dialog.input_buffer = removed.content;
                 }
             }
