@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  APP_NAME: vector-editor
+  APP_NAME: locus-editor
 
 jobs:
   validate-version:
@@ -80,9 +80,7 @@ jobs:
           key: ${{ matrix.name }}
 
       - name: Build release binary (${{ matrix.name }})
-        run: cargo build --release --package vector-editor
-
-      - name: Create tarball
+        run: cargo build --release --package locus-editor
         run: |
           mkdir -p dist
           cp target/release/${{ env.APP_NAME }} dist/
@@ -130,13 +128,13 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --package vector-editor --target ${{ matrix.target }}
+        run: cargo build --release --package locus-editor --target ${{ matrix.target }}
 
       - name: Create app bundle
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          APP_DIR="Vector Editor.app"
+          APP_DIR="Locus.app"
           mkdir -p "$APP_DIR/Contents/MacOS"
           mkdir -p "$APP_DIR/Contents/Resources"
 
@@ -154,11 +152,11 @@ jobs:
           <plist version="1.0">
           <dict>
               <key>CFBundleName</key>
-              <string>Vector Editor</string>
+              <string>Locus</string>
               <key>CFBundleDisplayName</key>
-              <string>Vector Editor</string>
+              <string>Locus</string>
               <key>CFBundleIdentifier</key>
-              <string>com.serialexp.vector-editor</string>
+              <string>com.serialexp.locus-editor</string>
               <key>CFBundleVersion</key>
               <string>${VERSION}</string>
               <key>CFBundleShortVersionString</key>
@@ -166,7 +164,7 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleExecutable</key>
-              <string>vector-editor</string>
+              <string>locus-editor</string>
               <key>CFBundleIconFile</key>
               <string>AppIcon</string>
               <key>LSMinimumSystemVersion</key>
@@ -183,7 +181,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           ARCH=$(echo "${{ matrix.target }}" | cut -d'-' -f1)
-          hdiutil create -volname "Vector Editor" -srcfolder "Vector Editor.app" -ov -format UDZO "${{ env.APP_NAME }}-${VERSION}-macos-${ARCH}.dmg"
+          hdiutil create -volname "Locus" -srcfolder "Locus.app" -ov -format UDZO "${{ env.APP_NAME }}-${VERSION}-macos-${ARCH}.dmg"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -210,9 +208,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --package vector-editor
-
-      - name: Create distribution folder
+        run: cargo build --release --package locus-editor
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist

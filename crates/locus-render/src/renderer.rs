@@ -2154,7 +2154,7 @@ impl Renderer {
                 // Highlight thickness in screen pixels, converted to canvas
                 // units. Sits a hair thicker than the handle lines so it's
                 // unmistakeable but not noisy.
-                let hl_thickness = 3.0 / zoom as f32;
+                let hl_thickness = 3.0 / zoom;
                 let hl_color: [f32; 4] = [0.3, 0.7, 1.0, 0.55];
 
                 // Sample-and-segment: 24 segments gives a smooth curve at
