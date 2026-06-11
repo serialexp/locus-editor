@@ -27,6 +27,7 @@ SIZE_TO_TYPE: dict[int, bytes] = {
     128: b"ic07",
     256: b"ic08",
     512: b"ic09",
+    1024: b"ic10",
 }
 
 

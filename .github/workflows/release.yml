@@ -159,9 +159,28 @@ jobs:
           # Copy binary
           cp target/${{ matrix.target }}/release/${{ env.APP_NAME }} "$APP_DIR/Contents/MacOS/"
 
-          # Copy app icon. CFBundleIconFile below references it by basename
-          # (no extension); the .icns suffix is implied.
-          cp assets/generated/icon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
+          # Build the .icns natively on the runner with Apple's own iconutil
+          # rather than shipping the committed icon.icns. This guarantees a
+          # valid, OS-blessed icon: iconutil + sips always emit 8-bit PNGs in
+          # the exact chunk layout macOS expects. (The committed PNGs are the
+          # per-size sources; sips re-encodes each to 8-bit defensively in case
+          # a future regen reintroduces 16-bit output.)
+          ICONSET="AppIcon.iconset"
+          mkdir -p "$ICONSET"
+          PNG="assets/generated/png"
+          sips -s format png "$PNG/icon-16.png"   --out "$ICONSET/icon_16x16.png"      >/dev/null
+          sips -s format png "$PNG/icon-32.png"   --out "$ICONSET/icon_16x16@2x.png"   >/dev/null
+          sips -s format png "$PNG/icon-32.png"   --out "$ICONSET/icon_32x32.png"      >/dev/null
+          sips -s format png "$PNG/icon-64.png"   --out "$ICONSET/icon_32x32@2x.png"   >/dev/null
+          sips -s format png "$PNG/icon-128.png"  --out "$ICONSET/icon_128x128.png"    >/dev/null
+          sips -s format png "$PNG/icon-256.png"  --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+          sips -s format png "$PNG/icon-256.png"  --out "$ICONSET/icon_256x256.png"    >/dev/null
+          sips -s format png "$PNG/icon-512.png"  --out "$ICONSET/icon_256x256@2x.png" >/dev/null
+          sips -s format png "$PNG/icon-512.png"  --out "$ICONSET/icon_512x512.png"    >/dev/null
+          sips -s format png "$PNG/icon-1024.png" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
+          # CFBundleIconFile below references it by basename (no extension);
+          # the .icns suffix is implied.
+          iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
 
           # Create Info.plist
           cat > "$APP_DIR/Contents/Info.plist" << EOF

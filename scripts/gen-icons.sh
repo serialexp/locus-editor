@@ -65,7 +65,13 @@ rasterize() {
         magick|convert)
             # density × viewBox-units / 72 ≈ output pixels; 768 dpi gives a
             # crisp render at 256 px and downsamples nicely for smaller sizes.
-            "$RASTERIZER" -background none -density 768 "$src" -resize "${size}x${size}" "$dst"
+            #
+            # Force 8-bit RGBA output (PNG32 + -depth 8). ImageMagick's default
+            # Q16 build otherwise writes 16-bit-per-channel PNGs, which macOS's
+            # ICNS/IconServices decoder cannot parse — it renders them as random
+            # binary garbage. 8-bit is also what Windows .ico and Linux icon
+            # themes expect, so we normalise here for every platform.
+            "$RASTERIZER" -background none -density 768 "$src" -resize "${size}x${size}" -depth 8 "PNG32:$dst"
             ;;
     esac
 }
@@ -74,7 +80,7 @@ echo "==> rasterizing PNGs (rasterizer: $RASTERIZER)"
 for size in 16 32 48; do
     rasterize "$SRC_SMALL" "$size" "$PNG_OUT/icon-${size}.png"
 done
-for size in 64 128 256 512; do
+for size in 64 128 256 512 1024; do
     rasterize "$SRC_MAIN" "$size" "$PNG_OUT/icon-${size}.png"
 done
 cp "$PNG_OUT/icon-256.png" "$PNG_OUT/locus-editor.png"
