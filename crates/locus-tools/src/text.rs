@@ -463,8 +463,9 @@ impl TextToolState {
             return false;
         };
         // Locked / hidden nodes are not interactive — text tool can't pick
-        // them up to edit. Same gate as the select tool's hit tests.
-        if !node.is_interactive() {
+        // them up to edit. Cascades through ancestors, so text inside a
+        // locked group/layer is inert too. Same gate as the select tool.
+        if !scene.is_interactive_in_world(node_id) {
             return false;
         }
         let world = scene.world_transform(node_id);
@@ -486,7 +487,7 @@ impl TextToolState {
         // Iterate children in reverse (top-most first).
         for &child_id in root_node.children.iter().rev() {
             let child = scene.get(child_id)?;
-            if !child.is_interactive() {
+            if !scene.is_interactive_in_world(child_id) {
                 continue;
             }
             if matches!(&child.data, NodeData::Text(_))

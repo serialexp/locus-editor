@@ -634,6 +634,46 @@ impl Scene {
         }
     }
 
+    /// True iff `id` or any of its ancestors has `locked == true`.
+    /// Locking cascades: a locked group/layer locks everything inside it,
+    /// so this is the canonical check for "is this node inert to editing?".
+    pub fn is_locked_in_world(&self, id: NodeId) -> bool {
+        let mut current = id;
+        loop {
+            let Some(node) = self.nodes.get(current) else {
+                return false;
+            };
+            if node.locked {
+                return true;
+            }
+            match self.parents.get(current).copied() {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+    }
+
+    /// True iff `id` and every ancestor is visible *and* none is locked.
+    /// This is the canonical gate for canvas interaction (picking, vertex /
+    /// edge editing, snapping): both visibility and locking cascade down the
+    /// tree, so a hidden or locked ancestor makes the whole subtree inert.
+    /// Single-pass equivalent of `is_visible_in_world(id) && !is_locked_in_world(id)`.
+    pub fn is_interactive_in_world(&self, id: NodeId) -> bool {
+        let mut current = id;
+        loop {
+            let Some(node) = self.nodes.get(current) else {
+                return false;
+            };
+            if !node.visible || node.locked {
+                return false;
+            }
+            match self.parents.get(current).copied() {
+                Some(parent) => current = parent,
+                None => return true,
+            }
+        }
+    }
+
     /// Compute the accumulated world transform of a node's *parent chain*,
     /// excluding the node's own transform. Useful for converting a world-space
     /// delta into the local space where the node's transform operates.
@@ -863,6 +903,46 @@ mod tests {
         assert_eq!(root_node.children[1], c);
         assert_eq!(root_node.children[2], a);
         assert_eq!(root_node.children[3], b);
+    }
+
+    #[test]
+    fn locking_cascades_to_descendants() {
+        // root → layer(group) → inner(group) → leaf(path)
+        let mut scene = Scene::new();
+        let root = scene.root();
+        let layer = scene.insert(root, Node::group("layer")).unwrap();
+        let inner = scene.insert(layer, Node::group("inner")).unwrap();
+        let leaf = scene
+            .insert(inner, Node::path("leaf", make_test_path()))
+            .unwrap();
+
+        // Nothing locked: everything interactive, nothing locked-in-world.
+        assert!(!scene.is_locked_in_world(leaf));
+        assert!(scene.is_interactive_in_world(leaf));
+
+        // Lock the top layer: leaf (and inner) inherit the lock even though
+        // their own `locked` flag is false.
+        assert!(scene.set_locked(layer, true));
+        assert!(
+            !scene.get(leaf).unwrap().locked,
+            "leaf's own flag stays false"
+        );
+        assert!(
+            scene.is_locked_in_world(leaf),
+            "locked ancestor locks the leaf"
+        );
+        assert!(scene.is_locked_in_world(inner));
+        assert!(!scene.is_interactive_in_world(leaf));
+
+        // Unlock the layer → leaf interactive again.
+        assert!(scene.set_locked(layer, false));
+        assert!(!scene.is_locked_in_world(leaf));
+        assert!(scene.is_interactive_in_world(leaf));
+
+        // A hidden ancestor also makes the leaf non-interactive (but not locked).
+        scene.set_visible(layer, false);
+        assert!(!scene.is_interactive_in_world(leaf));
+        assert!(!scene.is_locked_in_world(leaf));
     }
 
     #[test]

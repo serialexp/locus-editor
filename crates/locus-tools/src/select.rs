@@ -977,9 +977,10 @@ impl SelectState {
             let Some(node) = scene.get(node_id) else {
                 continue;
             };
-            // Locked nodes are non-interactive: no vertex iteration / edge
-            // hits / object hits land on them. They're still rendered.
-            if !node.is_interactive() {
+            // Non-interactive nodes (hidden/locked, or inside a hidden/locked
+            // ancestor) get no vertex iteration / edge hits / object hits.
+            // They're still rendered.
+            if !scene.is_interactive_in_world(node_id) {
                 continue;
             }
             let NodeData::Path { ref path, .. } = node.data else {
@@ -1094,10 +1095,11 @@ impl SelectState {
             root,
             locus_geom::Affine::IDENTITY,
             &mut |id, node, world| {
-                // Visibility hides the entire subtree; locking only blocks
-                // hits on this node — its children stay interactive (matches
-                // Inkscape's "lock object" semantics).
-                if !node.visible {
+                // Visibility and locking both cascade to the whole subtree:
+                // a hidden or locked group/layer makes everything inside it
+                // inert. Returning false prunes the subtree from the walk, so
+                // locked parents lock their descendants too.
+                if !node.visible || node.locked {
                     return false;
                 }
                 let is_boolean = matches!(
@@ -1107,7 +1109,7 @@ impl SelectState {
                         ..
                     }
                 );
-                if !node.locked && node_hit_at_point(scene, id, &node.data, world, target) {
+                if node_hit_at_point(scene, id, &node.data, world, target) {
                     hits.push(id);
                 }
                 // Boolean groups behave as a single hittable shape — do
@@ -1130,23 +1132,12 @@ impl SelectState {
             root,
             locus_geom::Affine::IDENTITY,
             &mut |id, node, world| {
-                // Visibility hides the entire subtree; locking only blocks
-                // hits on this node — its children stay interactive (matches
-                // Inkscape's "lock object" semantics).
-                if !node.visible {
+                // Visibility and locking both cascade to the whole subtree:
+                // a hidden or locked group/layer makes everything inside it
+                // inert. Returning false prunes the subtree from the walk, so
+                // locked parents lock their descendants too.
+                if !node.visible || node.locked {
                     return false;
-                }
-                if node.locked {
-                    // Don't pick this node, but DO control recursion the
-                    // same way the un-locked path does (so Boolean groups
-                    // remain non-recursable when locked).
-                    return !matches!(
-                        node.data,
-                        NodeData::Group {
-                            kind: GroupKind::Boolean { .. },
-                            ..
-                        }
-                    );
                 }
                 let bounds = node_bounds(scene, id, &node.data, world);
                 if !bounds.is_empty() && bounds.intersects(query) {
@@ -2070,9 +2061,10 @@ impl SelectState {
             let Some(node) = scene.get(node_id) else {
                 continue;
             };
-            // Locked nodes are non-interactive: no vertex iteration / edge
-            // hits / object hits land on them. They're still rendered.
-            if !node.is_interactive() {
+            // Non-interactive nodes (hidden/locked, or inside a hidden/locked
+            // ancestor) get no vertex iteration / edge hits / object hits.
+            // They're still rendered.
+            if !scene.is_interactive_in_world(node_id) {
                 continue;
             }
             let NodeData::Path { ref path, .. } = node.data else {
