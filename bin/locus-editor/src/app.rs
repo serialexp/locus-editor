@@ -1471,12 +1471,13 @@ fn draw_frame(gpu: &mut GpuState, state: &mut EditorState) {
 
     // Snap indicator: encode the most recent snap target (if any) for
     // the renderer's handle layer to draw a small marker at the snap
-    // point. Kind: 0 = vertex, 1 = edge, 2 = grid.
+    // point. Kind: 0 = vertex, 1 = edge, 2 = grid. A line×grid crossing
+    // is drawn with the grid marker since it lands on grid alignment.
     gpu.renderer.snap_indicator = state.last_snap.map(|hit| {
         let kind = match hit.kind {
             crate::snap::SnapKind::Vertex => 0u8,
             crate::snap::SnapKind::Edge => 1u8,
-            crate::snap::SnapKind::Grid => 2u8,
+            crate::snap::SnapKind::EdgeGrid | crate::snap::SnapKind::Grid => 2u8,
         };
         (hit.pos, kind)
     });

@@ -6,10 +6,18 @@
 //! 2. Closest point on a path edge (`edge_enabled`).
 //! 3. Grid (`grid_enabled`).
 //!
-//! All three sources use the same screen-pixel hit radius. The most
-//! specific hit (vertex > edge > grid) wins. The resolved indicator
-//! is returned alongside the snapped position so the renderer can
-//! draw a small marker on the snap target.
+//! Vertex and edge snapping use the same screen-pixel hit radius; the most
+//! specific hit (vertex > edge > grid) wins.
+//!
+//! Edge and grid **compose**: when both are enabled and the cursor is near
+//! an edge, the drag is locked to the edge but quantized *along* it to the
+//! points where the edge crosses a grid line (line×grid intersections),
+//! rather than sliding freely. This keeps grid discipline while tracing
+//! another path. (Only if the edge's segment has no grid crossing near the
+//! cursor does it fall back to the free closest-point projection.)
+//!
+//! The resolved indicator is returned alongside the snapped position so the
+//! renderer can draw a small marker on the snap target.
 
 use locus_geom::{Point, Segment};
 use locus_scene::{NodeData, NodeId, Scene};
@@ -26,6 +34,11 @@ pub(crate) enum SnapKind {
     Vertex,
     /// Snapped to the nearest point on a path edge.
     Edge,
+    /// Snapped to a line×grid intersection — a point that is both on a
+    /// path edge *and* on a grid line. Fires when edge and grid snapping
+    /// are both enabled: the drag stays locked to the edge but is quantized
+    /// along it to the grid crossings.
+    EdgeGrid,
     /// Snapped to the canvas grid.
     Grid,
 }
@@ -106,10 +119,26 @@ impl SnapSettings {
             );
         }
 
-        // 2. Edge snap.
+        // 2. Edge snap. When grid snapping is also on, quantize along the
+        //    edge to the nearest line×grid intersection instead of returning
+        //    the free projection — so tracing another path stays grid-sticky.
         if self.edge_enabled
-            && let Some(p) = closest_edge_point(scene, target, radius, exclude)
+            && let Some(hit) = closest_edge_point(scene, target, radius, exclude)
         {
+            if self.grid_enabled
+                && self.grid_size > 0.0
+                && let Some(cross) =
+                    nearest_crossing_on_poly(&hit.world_poly, self.grid_size, target)
+            {
+                return (
+                    [cross.x, cross.y],
+                    Some(SnapHit {
+                        pos: [cross.x, cross.y],
+                        kind: SnapKind::EdgeGrid,
+                    }),
+                );
+            }
+            let p = hit.point;
             return (
                 [p.x, p.y],
                 Some(SnapHit {
@@ -193,13 +222,25 @@ fn closest_vertex(scene: &Scene, target: Point, radius: f64, exclude: &[NodeId])
     best.map(|(p, _)| p)
 }
 
+/// The winning edge snap: the free closest-point projection plus the
+/// world-space geometry of the segment it landed on, so the caller can
+/// quantize along that segment to grid crossings.
+struct EdgeHit {
+    /// Free closest-point projection onto the edge (world coords).
+    point: Point,
+    /// The winning segment, flattened to world-space points (two points
+    /// for a straight line; a sampled polyline for a curve). Used to find
+    /// line×grid intersections without re-walking the scene.
+    world_poly: Vec<Point>,
+}
+
 fn closest_edge_point(
     scene: &Scene,
     target: Point,
     radius: f64,
     exclude: &[NodeId],
-) -> Option<Point> {
-    let mut best: Option<(Point, f64)> = None;
+) -> Option<EdgeHit> {
+    let mut best: Option<(EdgeHit, f64)> = None;
     let root = scene.root();
     scene.walk_depth_first(
         root,
@@ -226,42 +267,123 @@ fn closest_edge_point(
                 return true;
             };
 
+            let consider = |seg: &Segment, from: Point, best: &mut Option<(EdgeHit, f64)>| {
+                let (t, _, _) = seg.closest_point(from, local_target);
+                let local_pt = seg.eval_at(from, t);
+                let world_pt = if world.is_identity() {
+                    local_pt
+                } else {
+                    world.apply(local_pt)
+                };
+                let d = target.distance(world_pt);
+                if d < radius && best.as_ref().is_none_or(|(_, bd)| d < *bd) {
+                    *best = Some((
+                        EdgeHit {
+                            point: world_pt,
+                            world_poly: flatten_seg_world(seg, from, &world),
+                        },
+                        d,
+                    ));
+                }
+            };
+
             for subpath in &path.subpaths {
                 let mut current = subpath.start;
                 for seg in &subpath.segments {
-                    let (t, _, _) = seg.closest_point(current, local_target);
-                    let local_pt = seg.eval_at(current, t);
-                    let world_pt = if world.is_identity() {
-                        local_pt
-                    } else {
-                        world.apply(local_pt)
-                    };
-                    let d = target.distance(world_pt);
-                    if d < radius && best.as_ref().is_none_or(|(_, bd)| d < *bd) {
-                        best = Some((world_pt, d));
-                    }
+                    consider(seg, current, &mut best);
                     current = seg.endpoint();
                 }
                 // Implicit closing edge for closed subpaths.
                 if subpath.closed && !subpath.segments.is_empty() && current != subpath.start {
                     let closing = Segment::Line { to: subpath.start };
-                    let (t, _, _) = closing.closest_point(current, local_target);
-                    let local_pt = closing.eval_at(current, t);
-                    let world_pt = if world.is_identity() {
-                        local_pt
-                    } else {
-                        world.apply(local_pt)
-                    };
-                    let d = target.distance(world_pt);
-                    if d < radius && best.as_ref().is_none_or(|(_, bd)| d < *bd) {
-                        best = Some((world_pt, d));
-                    }
+                    consider(&closing, current, &mut best);
                 }
             }
             true
         },
     );
+    best.map(|(h, _)| h)
+}
+
+/// Flatten a segment to world-space points: two points for a straight
+/// line, a sampled polyline for a curve. Used to intersect the winning
+/// edge with grid lines.
+fn flatten_seg_world(seg: &Segment, from: Point, world: &locus_geom::Affine) -> Vec<Point> {
+    let to_world = |p: Point| {
+        if world.is_identity() {
+            p
+        } else {
+            world.apply(p)
+        }
+    };
+    match seg {
+        Segment::Line { .. } => vec![to_world(from), to_world(seg.endpoint())],
+        _ => {
+            // Curves: sample uniformly. 24 chords track the grid crossings
+            // closely enough at the snap radius while staying cheap (built
+            // only for the single winning segment).
+            const SAMPLES: usize = 24;
+            (0..=SAMPLES)
+                .map(|i| to_world(seg.eval_at(from, i as f64 / SAMPLES as f64)))
+                .collect()
+        }
+    }
+}
+
+/// Nearest point on a world-space polyline where it crosses a grid line
+/// (`x = k·g` or `y = k·g`), measured to `target`. Returns `None` if no
+/// crossing lies on the polyline near the target.
+fn nearest_crossing_on_poly(poly: &[Point], g: f64, target: Point) -> Option<Point> {
+    let mut best: Option<(Point, f64)> = None;
+    for seg in poly.windows(2) {
+        accumulate_seg_crossings(seg[0], seg[1], g, target, &mut best);
+    }
     best.map(|(p, _)| p)
+}
+
+/// Accumulate the grid-line crossings of a single straight segment `a→b`
+/// into `best` (nearest to `target` wins). Only the grid multiples adjacent
+/// to `target` on each axis are tested — on a straight segment a coordinate
+/// is monotonic in the parameter, so the crossing nearest the cursor sits at
+/// `round(target/g)` ± 1. This is O(1) per segment regardless of grid size.
+fn accumulate_seg_crossings(
+    a: Point,
+    b: Point,
+    g: f64,
+    target: Point,
+    best: &mut Option<(Point, f64)>,
+) {
+    // Parameter (0..=1) is required for the point to lie on the segment.
+    const AXIS_EPS: f64 = 1e-9;
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+
+    let mut ts: [f64; 6] = [f64::NAN; 6];
+    let mut n = 0;
+    if dx.abs() > AXIS_EPS {
+        let k0 = (target.x / g).round() as i64;
+        for k in (k0 - 1)..=(k0 + 1) {
+            ts[n] = (k as f64 * g - a.x) / dx;
+            n += 1;
+        }
+    }
+    if dy.abs() > AXIS_EPS {
+        let k0 = (target.y / g).round() as i64;
+        for k in (k0 - 1)..=(k0 + 1) {
+            ts[n] = (k as f64 * g - a.y) / dy;
+            n += 1;
+        }
+    }
+
+    for &t in &ts[..n] {
+        if (0.0..=1.0).contains(&t) {
+            let p = Point::new(a.x + t * dx, a.y + t * dy);
+            let d = target.distance(p);
+            if best.as_ref().is_none_or(|(_, bd)| d < *bd) {
+                *best = Some((p, d));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +492,105 @@ mod tests {
         let (snapped, hit) = snap.resolve([9.5, 0.5], &scene, 1.0, &[]);
         assert_eq!(hit.unwrap().kind, SnapKind::Vertex);
         assert!((snapped[0] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn edge_and_grid_compose_to_line_grid_crossing() {
+        let mut scene = Scene::new();
+        let parent = scene.root();
+        // Horizontal line at y = 3, well away from any grid point on y.
+        scene
+            .insert(parent, node_with_line([0.0, 3.0], [100.0, 3.0]))
+            .unwrap();
+
+        let snap = SnapSettings {
+            grid_enabled: true,
+            grid_size: 10.0,
+            // Vertex off so endpoints don't interfere; edge + grid compose.
+            vertex_enabled: false,
+            edge_enabled: true,
+        };
+
+        // Cursor at (23, 4): within radius of the line (projection (23,3)).
+        // With grid 10, the line crosses vertical grid lines at x=20 and
+        // x=30. Nearest to the cursor is (20, 3). The line is constant in y,
+        // so there are no horizontal-grid crossings.
+        let (snapped, hit) = snap.resolve([23.0, 4.0], &scene, 1.0, &[]);
+        assert_eq!(hit.unwrap().kind, SnapKind::EdgeGrid);
+        assert!((snapped[0] - 20.0).abs() < 1e-9, "x={}", snapped[0]);
+        assert!((snapped[1] - 3.0).abs() < 1e-9, "y={}", snapped[1]);
+    }
+
+    #[test]
+    fn edge_only_slides_freely_when_grid_disabled() {
+        let mut scene = Scene::new();
+        let parent = scene.root();
+        scene
+            .insert(parent, node_with_line([0.0, 3.0], [100.0, 3.0]))
+            .unwrap();
+
+        // Same geometry, grid OFF: edge snap returns the free projection,
+        // i.e. the cursor slides smoothly along the line.
+        let snap = SnapSettings {
+            grid_enabled: false,
+            grid_size: 10.0,
+            vertex_enabled: false,
+            edge_enabled: true,
+        };
+        let (snapped, hit) = snap.resolve([23.0, 4.0], &scene, 1.0, &[]);
+        assert_eq!(hit.unwrap().kind, SnapKind::Edge);
+        assert!((snapped[0] - 23.0).abs() < 1e-9, "x={}", snapped[0]);
+        assert!((snapped[1] - 3.0).abs() < 1e-9, "y={}", snapped[1]);
+    }
+
+    #[test]
+    fn edge_grid_snaps_to_diagonal_crossing() {
+        let mut scene = Scene::new();
+        let parent = scene.root();
+        // Diagonal line y = x from (0,0) to (100,100).
+        scene
+            .insert(parent, node_with_line([0.0, 0.0], [100.0, 100.0]))
+            .unwrap();
+
+        let snap = SnapSettings {
+            grid_enabled: true,
+            grid_size: 10.0,
+            vertex_enabled: false,
+            edge_enabled: true,
+        };
+
+        // Cursor near (47, 53): projection onto y=x is (50, 50), which is a
+        // grid crossing on both axes (x=50 and y=50). Expect exactly (50,50).
+        let (snapped, hit) = snap.resolve([47.0, 53.0], &scene, 1.0, &[]);
+        assert_eq!(hit.unwrap().kind, SnapKind::EdgeGrid);
+        assert!((snapped[0] - 50.0).abs() < 1e-9, "x={}", snapped[0]);
+        assert!((snapped[1] - 50.0).abs() < 1e-9, "y={}", snapped[1]);
+    }
+
+    #[test]
+    fn edge_grid_falls_back_to_free_point_without_crossing() {
+        let mut scene = Scene::new();
+        let parent = scene.root();
+        // Short horizontal line at y = 3 spanning x ∈ [1, 9]: with grid 10
+        // it crosses no vertical grid line, and y is constant (no horizontal
+        // crossing either), so there is no line×grid intersection on it.
+        scene
+            .insert(parent, node_with_line([1.0, 3.0], [9.0, 3.0]))
+            .unwrap();
+
+        let snap = SnapSettings {
+            grid_enabled: true,
+            grid_size: 10.0,
+            vertex_enabled: false,
+            edge_enabled: true,
+        };
+
+        // Projection is (5, 3); no crossing exists → fall back to the free
+        // edge point rather than yanking off the line.
+        let (snapped, hit) = snap.resolve([5.0, 4.0], &scene, 1.0, &[]);
+        assert_eq!(hit.unwrap().kind, SnapKind::Edge);
+        assert!((snapped[0] - 5.0).abs() < 1e-9, "x={}", snapped[0]);
+        assert!((snapped[1] - 3.0).abs() < 1e-9, "y={}", snapped[1]);
     }
 
     #[test]
